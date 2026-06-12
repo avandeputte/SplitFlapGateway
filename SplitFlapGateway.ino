@@ -180,25 +180,31 @@ static void rtcFormatTime(char* out, size_t outLen) {
     snprintf(out, outLen, "%02u:%02u:%02u", hr, mn, sc);
     return;
   }
-  // setenv/tzset/localtime are NOT thread-safe -- hold timeMutex.
   if (!timeMutex) {
     snprintf(out, outLen, "%02u:%02u:%02u", hr, mn, sc);
     return;
   }
+  // IMPORTANT: TZ is set ONCE in loadConfig()/handleApiConfigSettings()
+  // (boot + on change). Calling setenv() here on every invocation leaks heap
+  // on ESP32 newlib, so we convert stored-UTC to local time without touching TZ.
   xSemaphoreTake(timeMutex, pdMS_TO_TICKS(50));
-  struct tm utcTm;
-  memset(&utcTm, 0, sizeof(utcTm));
-  utcTm.tm_year = yr - 1900; utcTm.tm_mon  = mo - 1;
-  utcTm.tm_mday = dy;        utcTm.tm_hour = hr;
-  utcTm.tm_min  = mn;        utcTm.tm_sec  = sc;
-  utcTm.tm_isdst = 0;
-  setenv("TZ", "UTC0", 1); tzset();
-  time_t utcEpoch = mktime(&utcTm);
-  setenv("TZ", gPosixTZ, 1); tzset();
-  struct tm* lt = localtime(&utcEpoch);
+  // Compute the UTC epoch manually (days-since-epoch algorithm).
+  // This avoids timegm() (not in ESP32 newlib) and mktime()+setenv (leaks).
+  static const int cumDays[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  long y = yr;
+  long days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
+  days += cumDays[(mo - 1) % 12];
+  // Add leap day if past Feb in a leap year
+  bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+  if (leap && mo > 2) days += 1;
+  days += (dy - 1);
+  time_t utcEpoch = (time_t)days * 86400L + (long)hr * 3600L + (long)mn * 60L + sc;
+  // localtime_r applies the already-set TZ environment (set once at boot)
+  struct tm lt;
+  localtime_r(&utcEpoch, &lt);
   snprintf(out, outLen, "%04d-%02d-%02d %02d:%02d:%02d",
-           lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
-           lt->tm_hour, lt->tm_min, lt->tm_sec);
+           lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+           lt.tm_hour, lt.tm_min, lt.tm_sec);
   xSemaphoreGive(timeMutex);
 }
 
@@ -864,23 +870,24 @@ static void mqttEnqueue(const char* topic, const char* payload, size_t len) {
 
 void mqttPublishMsg(const RS485Msg& m) {
   if (!mqtt.connected()) return;
+  // Build ASCII representation of frame (no heap allocation)
+  char ascii[MSG_MAX_BYTES + 1]; size_t ai = 0;
+  for (size_t ii = 0; ii < m.len && ai < sizeof(ascii)-1; ii++) {
+    uint8_t b = m.data[ii];
+    if      (b == '\n' || b == '\r') { /* skip */ }
+    else if (b >= 32 && b <= 126)    { ascii[ai++] = (char)b; }
+    else                             { ascii[ai++] = '.'; }
+  }
+  ascii[ai] = 0;
+  // Build JSON with snprintf -- avoids JsonDocument heap allocation in hot path
   char buf[MQTT_BUF_SIZE];
-  JsonDocument doc;
-  doc["ts"]  = m.timestamp;
-  doc["wt"]  = m.wallTime;
-    char ascii[MSG_MAX_BYTES + 1]; size_t ai = 0;
-    for (size_t ii = 0; ii < m.len && ai < sizeof(ascii)-1; ii++) {
-      uint8_t b = m.data[ii];
-      if      (b == '\n' || b == '\r') { /* skip */ }
-      else if (b >= 32 && b <= 126)    { ascii[ai++] = (char)b; }
-      else                             { ascii[ai++] = '.'; }
-    }
-    ascii[ai] = 0;
-    doc["command"] = ascii;
-  size_t n = serializeJson(doc, buf, sizeof(buf));
-  { char _t[80];
-    snprintf(_t,sizeof(_t),"%s/%s",cfg.mqttPrefix,m.dir=='R'?"rx":"tx");
-    mqttEnqueue(_t, buf, n); }
+  size_t n = (size_t)snprintf(buf, sizeof(buf),
+    "{\"ts\":%lu,\"wt\":\"%s\",\"command\":\"%s\"}",
+    m.timestamp, m.wallTime, ascii);
+  if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+  char _t[80];
+  snprintf(_t, sizeof(_t), "%s/%s", cfg.mqttPrefix, m.dir=='R'?"rx":"tx");
+  mqttEnqueue(_t, buf, n);
 }
 
 void mqttPublishSFEvent(const char* event, const char* payload) {
@@ -891,21 +898,18 @@ void mqttPublishSFEvent(const char* event, const char* payload) {
 
 static void mqttPublishStatus() {
   if (!mqtt.connected()) return;
-  char buf[320];
   char timeBuf[24];
   rtcFormatTime(timeBuf, sizeof(timeBuf));
-  JsonDocument doc;
-  doc["uptime"]    = millis() / 1000;
-  doc["rx"]        = rxCount;
-  doc["tx"]        = txCount;
-  doc["modules"]   = sfModuleCount;
-  doc["time"]      = timeBuf;
-  doc["ntpSynced"] = ntpSynced;
-  doc["heap"]      = ESP.getFreeHeap();
-  size_t n = serializeJson(doc, buf, sizeof(buf));
-  { char _t[80];
-    snprintf(_t,sizeof(_t),"%s/status",cfg.mqttPrefix);
-    mqttEnqueue(_t, buf, n); }
+  char buf[320];
+  size_t n = (size_t)snprintf(buf, sizeof(buf),
+    "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"modules\":%d,"
+    "\"time\":\"%s\",\"ntpSynced\":%s,\"heap\":%u}",
+    millis()/1000, rxCount, txCount, sfModuleCount,
+    timeBuf, ntpSynced?"true":"false", ESP.getFreeHeap());
+  if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+  char _t[80];
+  snprintf(_t, sizeof(_t), "%s/status", cfg.mqttPrefix);
+  mqttEnqueue(_t, buf, n);
 }
 
 // MQTT incoming message handler
@@ -1037,6 +1041,9 @@ static void sendJsonError(int code, const char* msg) {
 // -- GET /  (main dashboard)
 void handleRoot() {
   wdgWebMs = millis();  // streaming response can take a while
+  // Cap per-write blocking so a stalled browser cannot wedge taskWeb.
+  // If the client stops ACKing, writes fail fast instead of hanging.
+  server.client().setTimeout(3000);  // 3s per socket operation
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   server.sendContent("<!DOCTYPE html><html lang=\"en\"><head>");
@@ -1180,7 +1187,7 @@ void handleRoot() {
   server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?\"ID: <span class='mid'>\"+m.id+\"</span>\":\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b> (idx \"+m.flapIndex+\")\":\"\";var badge=m.dump?\"<span style='font-size:.7rem;color:var(--grn);margin-left:4px'>&#10003; EEPROM</span>\":\"\";h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+idStr+badge+\"<br><span class='mc'>SN: \"+m.sn+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+(m.fwVersion?\"<br><span class='mc'>FW: v\"+m.fwVersion+\"</span>\":\"\")+\"</div>\";});g.innerHTML=h;g.querySelectorAll(\".mod\").forEach(function(el){el.addEventListener(\"click\",function(){openModModal(parseInt(this.dataset.mid));});});}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
   server.sendContent("loadModules();setInterval(loadModules,5000);");
   server.sendContent("function loadUnprovisioned(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var el=document.getElementById(\"unprovList\");var up=arr.filter(function(m){return !m.provisioned;});if(!up.length){el.innerHTML=\"<p style=\\\"color:var(--dim)\\\">No unprovisioned modules seen yet.</p>\";return;}var h=\"\";up.forEach(function(m){h+=\"<div style=\\\"display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap\\\">\"+\"<code style=\\\"color:var(--ylw);flex:1;min-width:160px\\\">\"+m.sn+\"</code>\"+\"<button class=\\\"sec\\\" style=\\\"margin:0;padding:4px 10px;font-size:.78rem\\\" onclick=\\\"doHomeSN('\"+m.sn+\"')\\\" title=\\\"Home this module to identify it\\\">Home</button>\"+\"</div>\";});el.innerHTML=h;}).catch(function(){});}");
-  server.sendContent("setInterval(loadUnprovisioned,3000);loadUnprovisioned();");
+  server.sendContent("setInterval(loadUnprovisioned,10000);loadUnprovisioned();");
   server.sendContent("function qSendChar(){var id=parseInt(document.getElementById(\"qId\").value);var ch=document.getElementById(\"qChar\").value;apiFlapCmd(\"/api/flap/char\",{id:id,\"char\":ch}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Sent\":\"Error: \"+j.error;});}");
   server.sendContent("function qHome(){var id=parseInt(document.getElementById(\"qId\").value);apiFlapCmd(\"/api/flap/home\",{id:id}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Homing\":\"Error: \"+j.error;});}");
   server.sendContent("function qCalibrate(){var id=parseInt(document.getElementById(\"qId\").value);apiFlapCmd(\"/api/flap/calibrate\",{id:id}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Calibrating\":\"Error: \"+j.error;});}");
@@ -1470,24 +1477,23 @@ void handleApiHomeBySN() {
 
 void handleApiStatus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  JsonDocument doc;
-  doc["uptime"]  = millis() / 1000;
-  doc["rx"]      = rxCount;
-  doc["tx"]      = txCount;
-  doc["baud"]    = cfg.rs485Baud;
-  doc["wifi"]    = (WiFi.status() == WL_CONNECTED);
-  { char _ip[16], _ap[16];
-    strlcpy(_ip, WiFi.localIP().toString().c_str(),  sizeof(_ip));
-    strlcpy(_ap, WiFi.softAPIP().toString().c_str(), sizeof(_ap));
-    doc["ip"]   = _ip; doc["apip"] = _ap; }
-  doc["heap"]    = ESP.getFreeHeap();
-  doc["mqtt"]    = mqtt.connected();
-  doc["modules"] = sfModuleCount;
+  // Use snprintf to avoid JsonDocument heap allocation (called every 3s by browser)
   char rtcBuf[24]; rtcFormatTime(rtcBuf, sizeof(rtcBuf));
-  doc["time"] = rtcBuf;
-  doc["ntpSynced"] = ntpSynced;
+  IPAddress lip = WiFi.localIP(), aip = WiFi.softAPIP();
   char out[320];
-  serializeJson(doc, out, sizeof(out));
+  snprintf(out, sizeof(out),
+    "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
+    "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
+    "\"heap\":%u,\"mqtt\":%s,\"modules\":%d,"
+    "\"time\":\"%s\",\"ntpSynced\":%s}",
+    millis()/1000, rxCount, txCount, cfg.rs485Baud,
+    (WiFi.status()==WL_CONNECTED)?"true":"false",
+    lip[0],lip[1],lip[2],lip[3],
+    aip[0],aip[1],aip[2],aip[3],
+    ESP.getFreeHeap(),
+    mqtt.connected()?"true":"false",
+    sfModuleCount, rtcBuf,
+    ntpSynced?"true":"false");
   server.send(200, "application/json", out);
 }
 
@@ -2204,9 +2210,28 @@ void taskRTC(void* pv) {
 }
 
 void taskWeb(void* pv) {
+  unsigned long clientSince = 0;   // millis() when current client first seen
   while (true) {
+    wdgWebMs = millis();      // touch BEFORE handling (covers in-handler stalls)
     server.handleClient();
-    wdgWebMs = millis();
+
+    // Proactively close any client that lingers connected for too long.
+    // The ESP32 WebServer keeps a half-open connection in HC_WAIT_READ for
+    // up to HTTP_MAX_DATA_WAIT; a browser (notably Chrome/Safari) that opens
+    // a speculative socket and never completes the request can otherwise
+    // wedge handleClient() and stall the web task -> "Web=0" watchdog reboot.
+    WiFiClient c = server.client();
+    if (c && c.connected()) {
+      if (clientSince == 0) clientSince = millis();
+      else if (millis() - clientSince > 8000UL) {   // 8s hard cap per connection
+        c.stop();                                    // force-close the stale socket
+        clientSince = 0;
+      }
+    } else {
+      clientSince = 0;   // no client connected -- reset the timer
+    }
+
+    wdgWebMs = millis();      // touch AFTER handling
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
@@ -2343,7 +2368,7 @@ void loop() {
                   (int)(WiFi.status()==WL_CONNECTED), (int)mqtt.connected());
     // Detect stalled tasks (must update wdg timestamp at least every 30s)
     bool ok485 = (wdgRS485Ms == 0 || now - wdgRS485Ms < 30000UL);
-    bool okWeb  = (wdgWebMs  == 0 || now - wdgWebMs  < 90000UL);  // 90s: web can block during large page sends
+    bool okWeb  = (wdgWebMs  == 0 || now - wdgWebMs  < 120000UL); // 120s: generous margin for slow clients
     bool okNet  = (wdgNetMs  == 0 || now - wdgNetMs  < 30000UL);
     if (!ok485 || !okWeb || !okNet) {
       printf("[WDG] STALL: RS485=%d Web=%d Net=%d -- rebooting\n",
