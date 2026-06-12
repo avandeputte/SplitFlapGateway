@@ -1,0 +1,794 @@
+openapi: 3.1.0
+info:
+  title: Split-Flap Gateway API
+  version: "2.0"
+  description: |
+    REST API for the ESP32-S3 Split-Flap Gateway firmware.
+
+    **Base URL:** `http://<gateway-ip>` — replace with the IP shown in the
+    gateway status badge, or use `http://192.168.4.1` when connected to the
+    AP fallback network.
+
+    All `POST` endpoints accept and return `application/json`.
+    All endpoints include `Access-Control-Allow-Origin: *`.
+
+servers:
+  - url: http://192.168.4.1
+    description: AP fallback (default)
+  - url: http://{ip}
+    description: Station IP (after WiFi connect)
+    variables:
+      ip:
+        default: "192.168.1.100"
+        description: Gateway IP address
+
+tags:
+  - name: Bus
+    description: Raw RS-485 bus access
+  - name: Modules
+    description: Split-flap module display control
+  - name: Advanced
+    description: Low-level module configuration commands
+  - name: Provision
+    description: Module provisioning and identity management
+  - name: Status
+    description: System status and diagnostics
+  - name: Config
+    description: Persistent configuration
+  - name: OTA
+    description: Over-the-air firmware update
+
+paths:
+
+  # ── RS-485 Bus ──────────────────────────────────────────────────
+
+  /api/rs485/messages:
+    get:
+      tags: [Bus]
+      summary: Drain buffered bus frames
+      description: Returns all frames since the last call (up to 64). Each call drains the buffer.
+      responses:
+        "200":
+          description: Array of bus frames (may be empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BusFrame"
+
+  /api/rs485/send:
+    post:
+      tags: [Bus]
+      summary: Send a raw ASCII frame to the bus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data]
+              properties:
+                data:
+                  type: string
+                  description: ASCII frame to transmit, must end with `\n`
+            examples:
+              home_all:
+                value: { data: "m*h\n" }
+              version_all:
+                value: { data: "m*v\n" }
+              show_char:
+                value: { data: "m5-A\n" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ── Module display control ──────────────────────────────────────
+
+  /api/flap/modules:
+    get:
+      tags: [Modules]
+      summary: List all known modules
+      responses:
+        "200":
+          description: Array of module objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Module"
+
+  /api/flap/char:
+    post:
+      tags: [Modules]
+      summary: Show a character on a module
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, char]
+              properties:
+                id:
+                  type: integer
+                  description: Module ID (0–254), or -1 to broadcast to all
+                char:
+                  type: string
+                  maxLength: 1
+            example: { id: 5, char: "A" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/flap/index:
+    post:
+      tags: [Modules]
+      summary: Show a flap by index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, index]
+              properties:
+                id:
+                  type: integer
+                index:
+                  type: integer
+                  minimum: 0
+                  maximum: 63
+            example: { id: 5, index: 1 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/flap/text:
+    post:
+      tags: [Modules]
+      summary: Send a text string across sequential modules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, start]
+              properties:
+                text:
+                  type: string
+                start:
+                  type: integer
+                  description: ID of the first module
+            example: { text: "HELLO", start: 0 }
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  chars: { type: integer }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/flap/home:
+    post:
+      tags: [Modules]
+      summary: Home one or all modules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: integer
+                  description: Module ID, or -1 to home all
+            examples:
+              single: { value: { id: 5 } }
+              all:    { value: { id: -1 } }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/version:
+    post:
+      tags: [Modules]
+      summary: Query firmware version (synchronous — waits up to 500ms)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, minimum: 0, maximum: 254 }
+            example: { id: 5 }
+      responses:
+        "200":
+          description: Version response or timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncReply"
+              examples:
+                success:
+                  value: { ok: true, id: 5, ver: "12", sn: "AABBCCDD", stale: false, lastSeen: 45231 }
+                stale:
+                  value: { ok: true, id: 5, ver: "12", sn: "AABBCCDD", stale: true, lastSeen: 38000 }
+                timeout:
+                  value: { ok: false, error: "no response from module" }
+
+  /api/flap/dump:
+    post:
+      tags: [Modules]
+      summary: Fetch EEPROM configuration (synchronous — waits up to 1s)
+      description: |
+        Sends the dump command and waits up to 500ms for a reply.
+        For firmware v15+, tries `mXD<sn>` first; falls back to `m<id>d` if no response (up to another 500ms).
+        Returns cached data with `stale: true` on timeout if available.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, minimum: 0, maximum: 254 }
+            example: { id: 5 }
+      responses:
+        "200":
+          description: EEPROM dump or timeout
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SyncReply"
+                  - type: object
+                    properties:
+                      dump:
+                        type: string
+                        description: Raw EEPROM string — `homeOffset:totalSteps:0=pos,1=pos,...`
+                        example: "42:4096:0=210,1=320,2=430"
+              examples:
+                success:
+                  value: { ok: true, id: 5, sn: "AABBCCDD", dump: "42:4096:0=210,1=320", stale: false }
+                stale:
+                  value: { ok: true, id: 5, sn: "AABBCCDD", dump: "42:4096:0=210,1=320", stale: true }
+                timeout:
+                  value: { ok: false, error: "no response from module" }
+
+  # ── Advanced module commands ─────────────────────────────────────
+
+  /api/flap/calibrate:
+    post:
+      tags: [Advanced]
+      summary: Calibrate steps per revolution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer }
+            example: { id: 5 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/homeoffset:
+    post:
+      tags: [Advanced]
+      summary: Set home offset (steps past Hall trigger to flap 0)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, steps]
+              properties:
+                id:    { type: integer }
+                steps: { type: integer }
+            example: { id: 5, steps: 42 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/totalsteps:
+    post:
+      tags: [Advanced]
+      summary: Set total steps per revolution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, steps]
+              properties:
+                id:    { type: integer }
+                steps: { type: integer }
+            example: { id: 5, steps: 4096 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/nudge:
+    post:
+      tags: [Advanced]
+      summary: Nudge forward n steps (also adds to home offset)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, steps]
+              properties:
+                id:    { type: integer }
+                steps: { type: integer }
+            example: { id: 5, steps: 10 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/goto:
+    post:
+      tags: [Advanced]
+      summary: Go to raw step position
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, step]
+              properties:
+                id:   { type: integer }
+                step: { type: integer, minimum: 0 }
+            example: { id: 5, step: 100 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/writepos:
+    post:
+      tags: [Advanced]
+      summary: Write calibrated step position for a flap index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, idx, pos]
+              properties:
+                id:  { type: integer }
+                idx: { type: integer, minimum: 0, maximum: 63 }
+                pos: { type: integer, minimum: 0 }
+            example: { id: 5, idx: 1, pos: 210 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/autohome:
+    post:
+      tags: [Advanced]
+      summary: Set auto-home flag (home on boot vs restore saved position)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, enable]
+              properties:
+                id:     { type: integer }
+                enable: { type: integer, enum: [0, 1] }
+            example: { id: 5, enable: 1 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/erase:
+    post:
+      tags: [Advanced]
+      summary: Erase calibrated flap position map
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer }
+            example: { id: 5 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/factoryreset:
+    post:
+      tags: [Advanced]
+      summary: Factory reset EEPROM (preserves module ID)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer }
+            example: { id: 5 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  # ── Provisioning ─────────────────────────────────────────────────
+
+  /api/flap/provision:
+    post:
+      tags: [Provision]
+      summary: Assign an ID to an unprovisioned module by serial number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn, id]
+              properties:
+                sn: { type: string, example: "AABBCCDD11223344" }
+                id: { type: integer, minimum: 0, maximum: 254 }
+            example: { sn: "AABBCCDD11223344", id: 5 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/deprovision:
+    post:
+      tags: [Provision]
+      summary: Reset module to unprovisioned state
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, description: "Module ID, or -1 for all" }
+            examples:
+              single: { value: { id: 5 } }
+              all:    { value: { id: -1 } }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/homebysn:
+    post:
+      tags: [Provision]
+      summary: Home a module by serial number (to identify it physically)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn]
+              properties:
+                sn: { type: string, example: "AABBCCDD11223344" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/dumpbysn:
+    post:
+      tags: [Provision]
+      summary: Dump EEPROM by serial number (firmware v15+)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn]
+              properties:
+                sn: { type: string, example: "AABBCCDD11223344" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/factoryresetbysn:
+    post:
+      tags: [Provision]
+      summary: Factory reset EEPROM by serial number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn]
+              properties:
+                sn: { type: string, example: "AABBCCDD11223344" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/flap/restorebysn:
+    post:
+      tags: [Provision]
+      summary: Restore EEPROM to a module by serial number
+      description: |
+        Sends `mXW<sn>:<homeOffset>:<totalSteps>:<map>\n`.
+        Module ID is always preserved; all other calibration fields and the
+        flap position map are overwritten. Map entries not present are cleared.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn, homeOffset, totalSteps]
+              properties:
+                sn:          { type: string, example: "AABBCCDD11223344" }
+                homeOffset:  { type: integer, example: 42 }
+                totalSteps:  { type: integer, example: 4096 }
+                map:
+                  type: string
+                  description: Comma-separated `idx=steps` pairs
+                  example: "0=210,1=320,2=430"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  # ── Status / Config ──────────────────────────────────────────────
+
+  /api/status:
+    get:
+      tags: [Status]
+      summary: System status
+      responses:
+        "200":
+          description: Current system status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+
+  /api/config:
+    get:
+      tags: [Config]
+      summary: Get current configuration (passwords excluded)
+      responses:
+        "200":
+          description: Current configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Config"
+
+  /api/config/wifi:
+    post:
+      tags: [Config]
+      summary: Save WiFi credentials and reconnect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ssid, pass]
+              properties:
+                ssid: { type: string, example: "MyNetwork" }
+                pass: { type: string, example: "mypassword" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/config/mqtt:
+    post:
+      tags: [Config]
+      summary: Save MQTT broker settings and reconnect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host, port, prefix]
+              properties:
+                host:   { type: string, example: "192.168.1.50" }
+                port:   { type: integer, default: 1883 }
+                user:   { type: string, example: "" }
+                pass:   { type: string, example: "" }
+                prefix: { type: string, default: "splitflap" }
+            example: { host: "192.168.1.50", port: 1883, user: "", pass: "", prefix: "splitflap" }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  /api/config/settings:
+    post:
+      tags: [Config]
+      summary: Save timezone, serial debug, or OTA password
+      description: Send only the fields you want to change. Each takes effect immediately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                posixTZ:     { type: string, example: "EST5EDT,M3.2.0,M11.1.0" }
+                serialDebug: { type: boolean, example: true }
+                otaPassword: { type: string, example: "mysecret" }
+            examples:
+              timezone:
+                value:
+                  posixTZ: "EST5EDT,M3.2.0,M11.1.0"
+              debug_on:
+                value:
+                  serialDebug: true
+              ota_password:
+                value:
+                  otaPassword: "mysecret"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+  # ── OTA ─────────────────────────────────────────────────────────
+
+  /ota:
+    get:
+      tags: [OTA]
+      summary: Browser-based firmware upload page
+      description: Returns an HTML page with a file picker for uploading a compiled `.bin` file.
+      responses:
+        "200":
+          description: HTML upload page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/ota/upload:
+    post:
+      tags: [OTA]
+      summary: Upload compiled firmware binary
+      description: |
+        Accepts a raw binary POST body (the compiled `.bin` file).
+        The gateway reboots automatically on success.
+        Obtain the binary via Arduino IDE **Sketch → Export Compiled Binary**.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Upload successful — gateway rebooting
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "OK"
+        "500":
+          description: Update failed
+          content:
+            text/plain:
+              schema:
+                type: string
+
+# ── Reusable components ──────────────────────────────────────────
+
+components:
+  responses:
+    Ok:
+      description: Success
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              ok:
+                type: boolean
+                example: true
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              ok:    { type: boolean, example: false }
+              error: { type: string, example: "id required" }
+
+  schemas:
+    BusFrame:
+      type: object
+      properties:
+        ts:      { type: integer, description: "Milliseconds since boot", example: 12345 }
+        wt:      { type: string,  description: "Local wall-clock timestamp", example: "2026-06-10 14:32:01" }
+        dir:     { type: string,  enum: [R, T], description: "R=received, T=transmitted" }
+        command: { type: string,  description: "Frame content (trailing newline stripped)", example: "m5-A" }
+        len:     { type: integer, description: "Original byte length including newline", example: 5 }
+
+    Module:
+      type: object
+      properties:
+        id:          { type: integer, description: "Module ID (255 = unprovisioned slot)", example: 5 }
+        sn:          { type: string,  description: "Serial number hex string", example: "AABBCCDD11223344" }
+        provisioned: { type: boolean, example: true }
+        flapIndex:   { type: integer, description: "Last known flap index (-1 = unknown)", example: 1 }
+        flapChar:    { type: string,  description: "Last known displayed character", example: "A" }
+        fwVersion:   { type: string,  description: "Firmware version string", example: "12" }
+        lastSeen:    { type: integer, description: "millis() of last activity", example: 45000 }
+        dump:        { type: string,  description: "Cached EEPROM dump (present only if fetched)", example: "42:4096:0=210,1=320" }
+        dumpTs:      { type: integer, description: "millis() when dump was last fetched", example: 45100 }
+
+    SyncReply:
+      type: object
+      description: Response from a synchronous wait-for-reply endpoint
+      properties:
+        ok:       { type: boolean }
+        id:       { type: integer, description: "Module ID" }
+        sn:       { type: string,  description: "Serial number" }
+        stale:    { type: boolean, description: "true if data is from cache (module did not respond to this request)" }
+        lastSeen: { type: integer, description: "millis() of last module activity" }
+        error:    { type: string,  description: "Present only when ok is false" }
+
+    Status:
+      type: object
+      properties:
+        uptime:    { type: integer, description: "Seconds since boot", example: 3842 }
+        rx:        { type: integer, description: "Frames received since boot", example: 124 }
+        tx:        { type: integer, description: "Frames transmitted since boot", example: 37 }
+        baud:      { type: integer, example: 9600 }
+        wifi:      { type: boolean, example: true }
+        ip:        { type: string,  example: "192.168.1.105" }
+        apip:      { type: string,  example: "192.168.4.1" }
+        heap:      { type: integer, description: "Free heap bytes", example: 187432 }
+        mqtt:      { type: boolean, example: true }
+        modules:   { type: integer, example: 6 }
+        time:      { type: string,  description: "Local RTC time", example: "2026-06-10 14:32:01" }
+        ntpSynced: { type: boolean, example: true }
+
+    Config:
+      type: object
+      properties:
+        wSSID:        { type: string,  example: "MyNetwork" }
+        mqHost:       { type: string,  example: "192.168.1.50" }
+        mqPort:       { type: integer, example: 1883 }
+        mqUser:       { type: string,  example: "" }
+        mqPfx:        { type: string,  example: "splitflap" }
+        baud:         { type: integer, example: 9600 }
+        dataBits:     { type: integer, example: 8 }
+        parity:       { type: integer, description: "0=None 1=Even 2=Odd", example: 0 }
+        stopBits:     { type: integer, example: 1 }
+        posixTZ:      { type: string,  example: "EST5EDT,M3.2.0,M11.1.0" }
+        serialDebug:  { type: boolean, example: false }
+        otaPasswordSet: { type: boolean, description: "true if an OTA password is configured", example: false }
