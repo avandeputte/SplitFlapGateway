@@ -65,8 +65,9 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 ## Features
 
 - **Web UI** — single-page dashboard accessible from any browser
-- **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules
-- **EEPROM inspector** — click any module card to fetch and display its full EEPROM configuration
+- **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 200)
+- **Sticky module list** — the known-module registry persists across reboots in flash; entries not seen for 6 hours are pruned automatically
+- **EEPROM inspector** — click any module card to fetch and display its EEPROM configuration on demand
 - **Real-time bus monitor** — live RS-485 traffic with protocol decoding and local timestamps
 - **NTP time sync** — RTC backed by PCF85063; syncs from `pool.ntp.org` on WiFi connect, persists through power loss
 - **DST-aware timezone** — POSIX TZ string support covering 20 regions, takes effect immediately
@@ -195,12 +196,40 @@ Navigate to the gateway's IP address in any browser.
 
 | Tab | Description |
 |---|---|
-| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. Click any module to inspect its full EEPROM configuration. **↻ Identify All** broadcasts `m*v` to trigger all modules to report their version and serial number. |
+| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Click any module to fetch and inspect its EEPROM configuration (fetched fresh each time). **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
 | **Display** | Send a text string across sequential modules by start ID, or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Bus Monitor** | Live RS-485 traffic with protocol-decoded descriptions and local-time timestamps |
 | **Settings** | WiFi credentials, MQTT broker, timezone, serial debug toggle, OTA firmware update |
 | **Status** | Uptime, frame counters, IP addresses, heap, MQTT state, RTC time, NTP sync |
+
+---
+
+## Module List Persistence
+
+The known-module list is **sticky**: it survives reboots and power cycles so the
+dashboard isn't empty after a restart.
+
+- Stored as a small file (`/modules.dat`) in the FATFS partition that already
+  exists in the default partition scheme — no custom partition table or special
+  configuration is needed.
+- Only durable fields are saved (ID, serial number, provisioned flag, firmware
+  version, and a last-seen wall-clock timestamp). Transient display state and
+  EEPROM dumps are not persisted.
+- Entries not seen for **6 hours** are pruned automatically (checked at boot and
+  once a minute). The 6-hour window uses the battery-backed RTC clock, so it
+  measures real elapsed time across reboots.
+- Saves are written only when the list actually changes (a module appears, is
+  provisioned, or is deprovisioned) and are debounced to limit flash wear.
+- The **↻ Identify All** button (or `POST /api/flap/identify`) wipes both the
+  in-memory list and the saved file, then broadcasts `m*v` to rebuild from
+  scratch.
+
+> [!NOTE]
+> On the **first boot after flashing**, the firmware formats the FATFS partition
+> (a one-time operation that adds a few seconds to boot — you'll see a
+> `formatting now` message on the serial console). Every subsequent boot mounts
+> instantly.
 
 ---
 
@@ -283,7 +312,8 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `POST` | `/api/flap/text` | `{"text":"HELLO","start":0}` | Send text across sequential modules |
 | `POST` | `/api/flap/home` | `{"id":5}` | Home module (`id:-1` = all) |
 | `POST` | `/api/flap/version` | `{"id":5}` | Query version — waits up to 500ms, returns `{ok,id,ver,sn,stale,lastSeen}` |
-| `POST` | `/api/flap/dump` | `{"id":5}` | Fetch EEPROM — waits up to 500ms (1s if SN fallback needed), returns `{ok,id,sn,dump,stale}` |
+| `POST` | `/api/flap/dump` | `{"id":5}` | Fetch EEPROM fresh — waits up to 500ms (1s if SN fallback needed), returns `{ok,id,sn,dump}` |
+| `POST` | `/api/flap/identify` | — | Clear the list (memory + saved) and broadcast `m*v` to re-discover all modules |
 
 ### Advanced Module Commands
 
@@ -314,11 +344,10 @@ All `POST` endpoints accept `Content-Type: application/json`.
 
 ```json
 { "ok": true,  "id": 5, "ver": "12", "sn": "AABBCCDD", "stale": false, "lastSeen": 45231 }
-{ "ok": true,  "id": 5, "ver": "12", "sn": "AABBCCDD", "stale": true,  "lastSeen": 38000 }
 { "ok": false, "error": "no response from module" }
 ```
 
-`stale: true` means the module didn't respond to this request but cached data is returned. `lastSeen` is milliseconds since boot of the most recent module activity.
+`/api/flap/dump` returns data fetched fresh from the module each call (no cache). On timeout it returns `{ "ok": false, ... }`. The `stale` field is always `false` and retained only for response-shape compatibility. `/api/flap/version` includes `lastSeen`, the milliseconds-since-boot of the most recent module activity.
 
 ### Status and Configuration
 
@@ -328,6 +357,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `GET` | `/api/config` | — | Current configuration (passwords excluded) |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
+| `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
 | `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"otaPassword":"..."}` | Timezone, serial debug, or OTA password |
 
 ### OTA Firmware Update

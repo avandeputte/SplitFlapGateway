@@ -50,6 +50,7 @@
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <Update.h>
+#include <FFat.h>
 
 // Early-declared debug flag so DBG() works before cfg is constructed.
 // Kept in sync with cfg.serialDebug in loadConfig() and handleApiConfigSettings().
@@ -187,7 +188,14 @@ static void rtcFormatTime(char* out, size_t outLen) {
   // IMPORTANT: TZ is set ONCE in loadConfig()/handleApiConfigSettings()
   // (boot + on change). Calling setenv() here on every invocation leaks heap
   // on ESP32 newlib, so we convert stored-UTC to local time without touching TZ.
-  xSemaphoreTake(timeMutex, pdMS_TO_TICKS(50));
+  // Only proceed under the mutex if we actually acquired it -- giving a mutex
+  // we don't own corrupts its state and can permanently wedge other tasks.
+  if (xSemaphoreTake(timeMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+    // Could not get the lock in time -- fall back to a TZ-free HH:MM:SS so the
+    // caller still gets something and we never give an unowned mutex.
+    snprintf(out, outLen, "%02u:%02u:%02u", hr, mn, sc);
+    return;
+  }
   // Compute the UTC epoch manually (days-since-epoch algorithm).
   // This avoids timegm() (not in ESP32 newlib) and mktime()+setenv (leaks).
   static const int cumDays[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
@@ -206,6 +214,23 @@ static void rtcFormatTime(char* out, size_t outLen) {
            lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
            lt.tm_hour, lt.tm_min, lt.tm_sec);
   xSemaphoreGive(timeMutex);
+}
+
+// Return current UTC wall-clock epoch from the RTC, or 0 if RTC not valid.
+// Used for module last-seen tracking that must survive reboots (millis() resets).
+static unsigned long rtcEpochNow() {
+  if (!rtcNow.valid) return 0;
+  uint16_t yr = rtcNow.year;   uint8_t mo = rtcNow.month;
+  uint8_t  dy = rtcNow.day;    uint8_t hr = rtcNow.hour;
+  uint8_t  mn = rtcNow.minute; uint8_t sc = rtcNow.second;
+  static const int cumDays[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  long y = yr;
+  long days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
+  days += cumDays[(mo - 1) % 12];
+  bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+  if (leap && mo > 2) days += 1;
+  days += (dy - 1);
+  return (unsigned long)((long)days * 86400L + (long)hr * 3600L + (long)mn * 60L + sc);
 }
 
 /* ----------------------------------------------------------
@@ -227,6 +252,8 @@ static volatile int          mqttQTail     = 0;
 static SemaphoreHandle_t     mqttQMutex    = NULL;
 static StaticSemaphore_t     mqttQMutexBuf;
 #define STATUS_INTERVAL_MS   10000UL
+#define MODULE_STALE_SECS    21600UL   // 6h: prune modules not seen in this long
+#define MODULE_SAVE_DEBOUNCE_MS 5000UL // coalesce NVS writes
 
 /* ----------------------------------------------------------
    Split-flap character set (must match module firmware)
@@ -237,7 +264,7 @@ static const char FLAP_CHARS[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+
 /* ----------------------------------------------------------
    Module registry  (tracks known modules on the bus)
 ---------------------------------------------------------- */
-#define MAX_MODULES  64
+#define MAX_MODULES         200   // supports up to ~200 modules
 
 struct SFModule {
   uint8_t  id;               // 0-254; 255 = slot empty
@@ -246,9 +273,8 @@ struct SFModule {
   int      flapIndex;        // last known flap index (-1 = unknown)
   char     flapChar;         // last known displayed char (0 = unknown)
   char     fwVersion[8];     // firmware version string
-  char     dumpData[MSG_MAX_BYTES]; // last EEPROM dump (raw content after 'd:')
-  unsigned long dumpTs;      // millis() when dumpData was last updated (0 = never)
-  unsigned long lastSeen;    // millis() of last activity
+  unsigned long lastSeen;    // millis() of last activity (resets on reboot)
+  unsigned long lastSeenEpoch; // RTC wall-clock epoch of last activity (survives reboot)
 };
 
 static SFModule sfModules[MAX_MODULES];
@@ -258,7 +284,16 @@ static StaticSemaphore_t sfMutexBuf;
 static SFModule* sfFindById(uint8_t id);
 static SFModule* sfFindBySN(const char* sn);
 static SFModule* sfUpsert(uint8_t id, const char* sn);
+static inline void sfTouch(SFModule* m);
 static int      sfModuleCount = 0;
+// Shared single-slot capture for the most recent EEPROM dump response.
+// Replaces the per-module dumpData cache (saves 256 bytes * MAX_MODULES of RAM).
+// handleApiDump records the id it is waiting for, then polls for a match.
+static volatile int           sfDumpWaitId   = -1;   // module id handleApiDump is waiting on
+static char                   sfDumpCapture[MSG_MAX_BYTES] = "";  // raw dump after 'd:'
+static volatile unsigned long sfDumpCaptureTs = 0;   // millis() when captured (0=none)
+static volatile bool          sfModulesDirty   = false;  // pending NVS save
+static volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
 static bool          ntpSynced   = false; // declared early; also set in taskNetwork
 
 /* ----------------------------------------------------------
@@ -493,6 +528,7 @@ static SFModule* sfFindBySN(const char* sn) {
 // Add or update a module entry
 static SFModule* sfUpsert(uint8_t id, const char* sn) {
   SFModule* m = (id != 255) ? sfFindById(id) : sfFindBySN(sn);
+  bool isNew = false;
   if (!m) {
     if (sfModuleCount >= MAX_MODULES) return NULL;
     m = &sfModules[sfModuleCount++];
@@ -500,10 +536,185 @@ static SFModule* sfUpsert(uint8_t id, const char* sn) {
     m->id = id;
     m->flapIndex = -1;
     m->flapChar  = 0;
+    isNew = true;
   }
   if (sn && sn[0]) strlcpy(m->serialNum, sn, sizeof(m->serialNum));
   m->lastSeen = millis();
+  unsigned long ep = rtcEpochNow();
+  if (ep) m->lastSeenEpoch = ep;
+  if (isNew) sfModulesDirty = true;  // new module -> persist
   return m;
+}
+
+// ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Sticky module persistence (FATFS file "/modules.dat")
+// Persists known modules across reboots; prunes entries older than
+// MODULE_STALE_SECS based on RTC wall-clock epoch. Only durable fields
+// are stored (id, serial, provisioned, fwVersion, lastSeenEpoch) -- the
+// transient display state is NOT persisted.
+//
+// Stored in the FATFS partition (already present in the default
+// "16M Flash (3MB APP/9.9MB FATFS)" scheme) -- no custom partition needed.
+// File format: a 4-byte magic+count header followed by N PersistedModule
+// records written as raw bytes.
+// ------------------------------------------------------------------
+#define MODULES_FILE     "/modules.dat"
+#define MODULES_MAGIC    0x53464731UL   // "SFG1"
+
+struct PersistedModule {
+  uint8_t       id;
+  char          serialNum[21];
+  bool          provisioned;
+  char          fwVersion[8];
+  unsigned long lastSeenEpoch;
+};
+
+struct ModulesFileHeader {
+  unsigned long magic;   // MODULES_MAGIC
+  int           count;   // number of PersistedModule records following
+};
+
+static bool sfFsReady = false;   // set true once FFat is mounted
+
+// Mount the FATFS partition. Format on first use if needed.
+static void sfFsInit() {
+  // Try to mount WITHOUT auto-format first (fast path on every normal boot).
+  if (FFat.begin(false)) {
+    sfFsReady = true;
+    DBG("[MOD] FATFS mounted (%lu KB free)\n",
+        (unsigned long)(FFat.freeBytes() / 1024));
+    return;
+  }
+  // First boot after flashing: the partition is unformatted. Formatting a
+  // ~10MB partition is a long blocking flash operation -- log it clearly so
+  // the delay is expected, and so the watchdog boot grace period covers it.
+  printf("[MOD] FATFS not formatted -- formatting now (one-time, may take a while)...\n");
+  if (FFat.begin(true)) {       // true = format if mount fails
+    sfFsReady = true;
+    printf("[MOD] FATFS formatted and mounted (%lu KB free)\n",
+           (unsigned long)(FFat.freeBytes() / 1024));
+  } else {
+    sfFsReady = false;
+    printf("[MOD] FATFS mount/format failed -- module persistence disabled\n");
+  }
+}
+
+// Save the current registry to the FATFS file.
+static void sfModulesSave() {
+  if (!sfFsReady) return;
+  // Build a compact array of durable records under sfMutex.
+  static PersistedModule recs[MAX_MODULES];  // static: avoid large stack frame
+  int n = 0;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {
+    const SFModule& m = sfModules[i];
+    recs[n].id            = m.id;
+    strlcpy(recs[n].serialNum, m.serialNum, sizeof(recs[n].serialNum));
+    recs[n].provisioned   = m.provisioned;
+    strlcpy(recs[n].fwVersion, m.fwVersion, sizeof(recs[n].fwVersion));
+    recs[n].lastSeenEpoch = m.lastSeenEpoch;
+    n++;
+  }
+  if (sfMutex) xSemaphoreGive(sfMutex);
+
+  // Write to a temp file then rename, so a crash mid-write can't corrupt
+  // the existing good copy.
+  File f = FFat.open(MODULES_FILE ".tmp", "w");
+  if (!f) { DBG("[MOD] open for write failed\n"); return; }
+  ModulesFileHeader hdr = { MODULES_MAGIC, n };
+  f.write((const uint8_t*)&hdr, sizeof(hdr));
+  if (n > 0) f.write((const uint8_t*)recs, n * sizeof(PersistedModule));
+  f.close();
+  FFat.remove(MODULES_FILE);
+  FFat.rename(MODULES_FILE ".tmp", MODULES_FILE);
+  DBG("[MOD] Saved %d modules to FATFS\n", n);
+}
+
+// Load persisted modules from the FATFS file at boot, pruning stale entries.
+static void sfModulesLoad() {
+  if (!sfFsReady) return;
+  if (!FFat.exists(MODULES_FILE)) { DBG("[MOD] no saved module file\n"); return; }
+  File f = FFat.open(MODULES_FILE, "r");
+  if (!f) { DBG("[MOD] open for read failed\n"); return; }
+
+  ModulesFileHeader hdr;
+  if (f.read((uint8_t*)&hdr, sizeof(hdr)) != sizeof(hdr) ||
+      hdr.magic != MODULES_MAGIC || hdr.count <= 0 || hdr.count > MAX_MODULES) {
+    DBG("[MOD] bad/empty module file -- skipping\n");
+    f.close();
+    return;
+  }
+  static PersistedModule recs[MAX_MODULES];
+  size_t want = (size_t)hdr.count * sizeof(PersistedModule);
+  size_t got  = f.read((uint8_t*)recs, want);
+  f.close();
+  if (got != want) {
+    DBG("[MOD] file size mismatch (%u != %u) -- skipping\n",
+        (unsigned)got, (unsigned)want);
+    return;
+  }
+
+  unsigned long nowEp = rtcEpochNow();  // 0 if RTC not yet valid
+  int loaded = 0, pruned = 0;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  for (int i = 0; i < hdr.count && sfModuleCount < MAX_MODULES; i++) {
+    // Prune entries older than MODULE_STALE_SECS (only when we have a
+    // valid clock AND a recorded epoch to compare against).
+    if (nowEp && recs[i].lastSeenEpoch &&
+        nowEp > recs[i].lastSeenEpoch &&
+        (nowEp - recs[i].lastSeenEpoch) > MODULE_STALE_SECS) {
+      pruned++;
+      continue;
+    }
+    SFModule* m = &sfModules[sfModuleCount++];
+    memset(m, 0, sizeof(SFModule));
+    m->id            = recs[i].id;
+    strlcpy(m->serialNum, recs[i].serialNum, sizeof(m->serialNum));
+    m->provisioned   = recs[i].provisioned;
+    strlcpy(m->fwVersion, recs[i].fwVersion, sizeof(m->fwVersion));
+    m->lastSeenEpoch = recs[i].lastSeenEpoch;
+    m->flapIndex     = -1;
+    m->flapChar      = 0;
+    m->lastSeen      = 0;   // not seen yet this boot
+    loaded++;
+  }
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  DBG("[MOD] Loaded %d modules from FATFS (%d pruned as stale)\n", loaded, pruned);
+}
+
+// Wipe both the in-memory registry and the persisted file.
+static void sfModulesClear() {
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  sfModuleCount = 0;
+  memset(sfModules, 0, sizeof(sfModules));
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  if (sfFsReady) FFat.remove(MODULES_FILE);
+  sfModulesDirty = false;
+  DBG("[MOD] Registry cleared (memory + FATFS)\n");
+}
+
+// Prune in-memory entries not seen for MODULE_STALE_SECS. Called periodically.
+static void sfModulesPruneStale() {
+  unsigned long nowEp = rtcEpochNow();
+  if (!nowEp) return;  // no valid clock yet
+  bool changed = false;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  for (int i = 0; i < sfModuleCount; ) {
+    SFModule& m = sfModules[i];
+    if (m.lastSeenEpoch && nowEp > m.lastSeenEpoch &&
+        (nowEp - m.lastSeenEpoch) > MODULE_STALE_SECS) {
+      // Remove by shifting the tail down
+      for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+      sfModuleCount--;
+      memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
+      changed = true;
+    } else {
+      i++;
+    }
+  }
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  if (changed) sfModulesDirty = true;
 }
 
 // Return index in FLAP_CHARS for a character, or -1
@@ -672,6 +883,7 @@ void sfDeprovision(int addr) {
     }
   }
   xSemaphoreGive(sfMutex);
+  sfModulesDirty = true;   // persist the removal
 }
 
 void sfProvision(const char* sn, int newId) {
@@ -723,6 +935,15 @@ void sfSendText(int startAddr, const char* text, bool blankUnused) {
 
 void mqttPublishSFEvent(const char* event, const char* payload);  // forward
 
+
+// Update a module's activity timestamps (millis + RTC epoch for persistence).
+static inline void sfTouch(SFModule* m) {
+  if (!m) return;
+  m->lastSeen = millis();
+  unsigned long ep = rtcEpochNow();
+  if (ep) m->lastSeenEpoch = ep;
+}
+
 void sfParseResponse(const uint8_t* data, size_t len) {
   if (len < 2 || data[0] != 'm') return;
 
@@ -745,7 +966,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       if (m) m->provisioned = false;
       DBG("[SF] Unprovisioned adv: %s\n", sn);
     }
-    if (m) m->lastSeen = millis();
+    if (m) sfTouch(m);
     xSemaphoreGive(sfMutex);
     mqttPublishSFEvent("adv", sn);
     return;
@@ -763,7 +984,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       xSemaphoreTake(sfMutex, portMAX_DELAY);
       SFModule* m = sfFindBySN(sn);
       if (!m) m = sfUpsert((uint8_t)newId, sn);
-      if (m) { m->id = (uint8_t)newId; m->provisioned = true; m->lastSeen = millis(); }
+      if (m) { m->id = (uint8_t)newId; m->provisioned = true; sfTouch(m); sfModulesDirty = true; }
       xSemaphoreGive(sfMutex);
       char payload[64];
       snprintf(payload, sizeof(payload), "{\"sn\":\"%s\",\"id\":%d}", sn, newId);
@@ -783,7 +1004,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
 
   xSemaphoreTake(sfMutex, portMAX_DELAY);
   SFModule* m = sfUpsert(id, NULL);
-  if (m) { m->provisioned = true; m->lastSeen = millis(); }
+  if (m) { m->provisioned = true; sfTouch(m); }
   xSemaphoreGive(sfMutex);
 
   if (!m) return;
@@ -828,15 +1049,18 @@ void sfParseResponse(const uint8_t* data, size_t len) {
   // EEPROM dump: m<id>d:<homeOffset>:<totalSteps>:<map>
   else if (cmd == 'd' && *p == ':') {
     DBG("[SF] Module %d dump: %s\n", id, p + 1);
-    // Cache in module registry for /api/flap/dump
-    strlcpy(m->dumpData, p + 1, sizeof(m->dumpData));
-    // Strip trailing newline
-    size_t dl = strlen(m->dumpData);
-    while (dl > 0 && (m->dumpData[dl-1] == '\n' || m->dumpData[dl-1] == '\r'))
-      m->dumpData[--dl] = 0;
-    m->dumpTs = millis();
+    // Capture into the shared single-slot buffer IF a dump request is
+    // waiting for this module id (set by handleApiDump). No per-module cache.
+    char clean[MSG_MAX_BYTES];
+    strlcpy(clean, p + 1, sizeof(clean));
+    size_t dl = strlen(clean);
+    while (dl > 0 && (clean[dl-1] == '\n' || clean[dl-1] == '\r')) clean[--dl] = 0;
+    if (sfDumpWaitId == (int)id) {
+      strlcpy(sfDumpCapture, clean, sizeof(sfDumpCapture));
+      sfDumpCaptureTs = millis();
+    }
     char payload[MSG_MAX_BYTES];
-    snprintf(payload, sizeof(payload), "{\"id\":%d,\"dump\":\"%s\"}", id, m->dumpData);
+    snprintf(payload, sizeof(payload), "{\"id\":%d,\"dump\":\"%s\"}", id, clean);
     mqttPublishSFEvent("dump", payload);
   }
 }
@@ -1183,8 +1407,8 @@ void handleRoot() {
   server.sendContent("function doSend(){var data=document.getElementById(\"sdata\").value.trim();if(!data){document.getElementById(\"sr\").textContent=\"Nothing to send.\";return;}fetch(\"/api/rs485/send\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({data:data})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"sr\").textContent=j.ok?\"Sent \"+j.bytes+\" bytes\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"sr\").textContent=\"Error: \"+e;});}");
   server.sendContent("function apiFlapCmd(path,body){return fetch(path,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(body)}).then(function(r){return r.json();});}");
   server.sendContent("var _currentModId=-1;function parseDump(raw){if(!raw)return{error:\"No data\"};var parts=raw.split(\":\");if(parts.length<2)return{error:\"Invalid format\",raw:raw};var r={homeOffset:parseInt(parts[0]),totalSteps:parseInt(parts[1]),map:{}};if(parts[2])parts[2].split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\")r.map[parseInt(kv[0])]=parseInt(kv[1]);});return r;}function renderDump(d){if(!d||!d.ok)return\"<p style=\\\"color:var(--hi)\\\">\"+(d&&d.error?d.error:\"No data\")+\"</p>\";var p=parseDump(d.dump||\"\");if(p.error)return\"<p style=\\\"color:var(--hi)\\\">\"+p.error+\"</p>\";function row(k,v){return\"<div class=\\\"mfield\\\"><span class=\\\"mk\\\">\"+k+\" : </span><span class=\\\"mv\\\">\"+v+\"</span></div>\";}var html=\"\"+row(\"Module ID\",d.id)+row(\"Serial Number\",d.sn)+row(\"Home Offset\",p.homeOffset+\" steps\")+row(\"Steps / Rev\",p.totalSteps);var keys=Object.keys(p.map);html+=row(\"Calibrated\",keys.length+\" / 64 flaps\");if(keys.length){html+=\"<div class=\\\"mmap\\\">\";keys.forEach(function(k){html+=\"[\"+k+\"]=\"+p.map[k]+\" \";});html+=\"</div>\";}html+=row(\"Raw EEPROM\",\"<span style=\\\"word-break:break-all;color:var(--dim)\\\">\"+d.dump+\"</span>\");return html;}function fetchDump(id){document.getElementById(\"modModalBody\").innerHTML=\"<p style=\\\"color:var(--dim)\\\">Fetching EEPROM from module #\"+id+\"...</p>\";document.getElementById(\"modModalStatus\").textContent=\"\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){document.getElementById(\"modModalBody\").innerHTML=renderDump(d);document.getElementById(\"modModalStatus\").textContent=d.stale?\"Cached data -- click Refresh for latest\":\"Fresh from module\";}).catch(function(e){document.getElementById(\"modModalBody\").innerHTML=\"<p style=\\\"color:var(--hi)\\\">Error: \"+e+\"</p>\";});}function openModModal(id){_currentModId=id;document.getElementById(\"modModalTitle\").textContent=\"Module #\"+id+\" - EEPROM\";var mo=document.getElementById(\"modModal\");mo.style.display=\"flex\";fetchDump(id);}function refreshDump(){if(_currentModId>=0)fetchDump(_currentModId);}function closeModal(){document.getElementById(\"modModal\").style.display=\"none\";_currentModId=-1;}");
-  server.sendContent("function refreshModules(){var el=document.getElementById(\"refreshR\");el.textContent=\"Identifying...\";fetch(\"/api/rs485/send\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({data:\"m*v\\n\"})}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"Version query sent to all modules -- refreshing in 2s\":\"Error: \"+j.error;if(j.ok)setTimeout(function(){loadModules();el.textContent=\"\";},2000);}).catch(function(e){el.textContent=\"Error: \"+e;});}");
-  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?\"ID: <span class='mid'>\"+m.id+\"</span>\":\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b> (idx \"+m.flapIndex+\")\":\"\";var badge=m.dump?\"<span style='font-size:.7rem;color:var(--grn);margin-left:4px'>&#10003; EEPROM</span>\":\"\";h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+idStr+badge+\"<br><span class='mc'>SN: \"+m.sn+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+(m.fwVersion?\"<br><span class='mc'>FW: v\"+m.fwVersion+\"</span>\":\"\")+\"</div>\";});g.innerHTML=h;g.querySelectorAll(\".mod\").forEach(function(el){el.addEventListener(\"click\",function(){openModModal(parseInt(this.dataset.mid));});});}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
+  server.sendContent("function refreshModules(){var el=document.getElementById(\"refreshR\");el.textContent=\"Identifying...\";fetch(\"/api/flap/identify\",{method:\"POST\"}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"List cleared, identifying all modules -- refreshing in 2s\":\"Error: \"+j.error;if(j.ok)setTimeout(function(){loadModules();},2000);setTimeout(function(){loadModules();el.textContent=\"\";},7000);}).catch(function(e){el.textContent=\"Error: \"+e;});}");
+  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?\"ID: <span class='mid'>\"+m.id+\"</span>\":\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b> (idx \"+m.flapIndex+\")\":\"\";var badge=\"\";h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+idStr+badge+\"<br><span class='mc'>SN: \"+m.sn+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+(m.fwVersion?\"<br><span class='mc'>FW: v\"+m.fwVersion+\"</span>\":\"\")+\"</div>\";});g.innerHTML=h;g.querySelectorAll(\".mod\").forEach(function(el){el.addEventListener(\"click\",function(){openModModal(parseInt(this.dataset.mid));});});}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
   server.sendContent("loadModules();setInterval(loadModules,5000);");
   server.sendContent("function loadUnprovisioned(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var el=document.getElementById(\"unprovList\");var up=arr.filter(function(m){return !m.provisioned;});if(!up.length){el.innerHTML=\"<p style=\\\"color:var(--dim)\\\">No unprovisioned modules seen yet.</p>\";return;}var h=\"\";up.forEach(function(m){h+=\"<div style=\\\"display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap\\\">\"+\"<code style=\\\"color:var(--ylw);flex:1;min-width:160px\\\">\"+m.sn+\"</code>\"+\"<button class=\\\"sec\\\" style=\\\"margin:0;padding:4px 10px;font-size:.78rem\\\" onclick=\\\"doHomeSN('\"+m.sn+\"')\\\" title=\\\"Home this module to identify it\\\">Home</button>\"+\"</div>\";});el.innerHTML=h;}).catch(function(){});}");
   server.sendContent("setInterval(loadUnprovisioned,10000);loadUnprovisioned();");
@@ -1253,16 +1477,6 @@ void handleApiModules() {
     out += '"';
     out += ",\"fwVersion\":\""; out += m.fwVersion; out += '"';
     out += ",\"lastSeen\":"; out += m.lastSeen;
-    if (m.dumpTs > 0) {
-      out += ",\"dump\":";
-      out += '"';
-      for (const char* dp = m.dumpData; *dp; dp++) {
-        if (*dp == '"' || *dp == '\\') out += '\\';
-        out += *dp;
-      }
-      out += '"';
-      out += ",\"dumpTs\":"; out += m.dumpTs;
-    }
     out += '}';
   }
   out += ']';
@@ -1971,13 +2185,11 @@ void handleApiDump() {
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
   DBG("[API] dump module %d\n", id);
 
-  unsigned long tsBefore = 0;
   char sn[21] = "";
   char fwVer[8] = "";
   xSemaphoreTake(sfMutex, portMAX_DELAY);
   SFModule* m = sfFindById((uint8_t)id);
   if (m) {
-    tsBefore = m->dumpTs;
     strlcpy(sn,    m->serialNum, sizeof(sn));
     strlcpy(fwVer, m->fwVersion, sizeof(fwVer));
   }
@@ -1987,9 +2199,12 @@ void handleApiDump() {
   const char* verStr = (fwVer[0] == 'v' || fwVer[0] == 'V') ? fwVer + 1 : fwVer;
   int fwVerNum = atoi(verStr);
 
-  // Try mXD<sn> first for fw >= 15; it is more reliable for provisioned modules.
-  // Fall back to m<id>d if the SN-based command gets no response (fw < 15,
-  // or module not yet advertising, or SN not yet known).
+  // Arm the shared dump capture slot for this id, then send the request.
+  sfDumpCapture[0] = 0;
+  sfDumpCaptureTs  = 0;
+  sfDumpWaitId     = id;
+
+  // Try mXD<sn> first for fw >= 15; fall back to m<id>d otherwise.
   bool triedSN = false;
   if (fwVerNum >= 15 && sn[0]) {
     DBG("[API] dump module %d via SN %s (fw=%d)\n", id, sn, fwVerNum);
@@ -2000,24 +2215,21 @@ void handleApiDump() {
     char buf[16]; snprintf(buf, sizeof(buf), "m%dd\n", id); rs485SendStr(buf);
   }
 
-  // Wait up to 500 ms for fresh response
+  // Wait up to 500 ms for a fresh response (captured by sfParseResponse).
   char rawDump[MSG_MAX_BYTES] = "";
   bool gotReply = false;
   unsigned long deadline = millis() + 500;
   while (millis() < deadline) {
     wdgWebMs = millis();
     vTaskDelay(pdMS_TO_TICKS(10));
-    xSemaphoreTake(sfMutex, portMAX_DELAY);
-    SFModule* mx = sfFindById((uint8_t)id);
-    if (mx && mx->dumpTs != tsBefore && mx->dumpData[0]) {
-      strlcpy(rawDump, mx->dumpData, sizeof(rawDump));
+    if (sfDumpCaptureTs != 0) {
+      strlcpy(rawDump, sfDumpCapture, sizeof(rawDump));
       gotReply = true;
+      break;
     }
-    xSemaphoreGive(sfMutex);
-    if (gotReply) break;
   }
 
-  // SN-based command got no response -- fall back to ID-based
+  // SN-based command got no response -- fall back to ID-based.
   if (!gotReply && triedSN) {
     DBG("[API] SN dump timed out, retrying module %d via ID\n", id);
     char buf[16]; snprintf(buf, sizeof(buf), "m%dd\n", id); rs485SendStr(buf);
@@ -2025,54 +2237,43 @@ void handleApiDump() {
     while (millis() < deadline) {
       wdgWebMs = millis();
       vTaskDelay(pdMS_TO_TICKS(10));
-      xSemaphoreTake(sfMutex, portMAX_DELAY);
-      SFModule* mx = sfFindById((uint8_t)id);
-      if (mx && mx->dumpTs != tsBefore && mx->dumpData[0]) {
-        strlcpy(rawDump, mx->dumpData, sizeof(rawDump));
+      if (sfDumpCaptureTs != 0) {
+        strlcpy(rawDump, sfDumpCapture, sizeof(rawDump));
         gotReply = true;
+        break;
       }
-      xSemaphoreGive(sfMutex);
-      if (gotReply) break;
     }
   }
 
-  // Build JSON reply using String to avoid large stack-allocated escape buffer
-  auto sendDumpReply = [&](const char* rawStr, const char* snStr, bool stale) {
+  sfDumpWaitId = -1;  // disarm capture
+
+  if (gotReply) {
+    // Build JSON reply (escape the dump string for JSON safety)
     String reply = "{\"ok\":true,\"id\":";
     reply += id;
-    reply += ",\"sn\":\""; reply += snStr; reply += "\",";
+    reply += ",\"sn\":\""; reply += sn; reply += "\",";
     reply += "\"dump\":";
     reply += '"';
-    for (const char* p2 = rawStr; *p2; p2++) {
+    for (const char* p2 = rawDump; *p2; p2++) {
       if (*p2 == '"' || *p2 == '\\') reply += '\\';
       reply += *p2;
     }
-    reply += "\",\"stale\":";
-    reply += stale ? "true" : "false";
-    reply += "}";
+    reply += "\",\"stale\":false}";
     server.send(200, "application/json", reply);
-    reply = "";  // free immediately
-  };
-
-  if (gotReply) {
-    sendDumpReply(rawDump, sn, false);
+    reply = "";
   } else {
-    // Fall back to stale cached dump
-    char cachedDump[MSG_MAX_BYTES] = ""; char cachedSn[21] = "";
-    xSemaphoreTake(sfMutex, portMAX_DELAY);
-    SFModule* mc = sfFindById((uint8_t)id);
-    if (mc && mc->dumpData[0]) {
-      strlcpy(cachedDump, mc->dumpData, sizeof(cachedDump));
-      strlcpy(cachedSn, mc->serialNum, sizeof(cachedSn));
-    }
-    xSemaphoreGive(sfMutex);
-    if (cachedDump[0]) {
-      sendDumpReply(cachedDump, cachedSn, true);
-    } else {
-      server.send(200, "application/json",
-        "{\"ok\":false,\"error\":\"no response from module\"}");
-    }
+    server.send(200, "application/json",
+      "{\"ok\":false,\"error\":\"no response from module\"}");
   }
+}
+
+void handleApiIdentify() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  DBG("[API] identify all -- clearing registry and broadcasting m*v\n");
+  // Wipe both the in-memory list and the persisted copy, then re-discover.
+  sfModulesClear();
+  rs485SendStr("m*v\n");
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void webInit() {
@@ -2083,6 +2284,8 @@ void webInit() {
   server.on("/api/rs485/send",       HTTP_POST,    handleApiSend);
   server.on("/api/rs485/send",       HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/modules",     HTTP_GET,     handleApiModules);
+  server.on("/api/flap/identify",    HTTP_POST,    handleApiIdentify);
+  server.on("/api/flap/identify",    HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/char",        HTTP_POST,    handleApiChar);
   server.on("/api/flap/char",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/index",       HTTP_POST,    handleApiIndex);
@@ -2160,6 +2363,12 @@ void taskRS485(void* pv) {
       int b = rs485.read();
       if (b < 0) break;
       uint8_t c = (uint8_t)b;
+
+      // Touch the watchdog inside the byte loop too: a sustained burst of
+      // bus traffic (each completed frame triggers rtcFormatTime + MQTT +
+      // parse) could otherwise keep us in this inner loop past the 30s
+      // RS485 watchdog threshold and trigger a false stall reboot.
+      wdgRS485Ms = millis();
 
       // If we see an 'm' and the buffer already has content that doesn't
       // start with 'm', discard the stale partial frame and start fresh.
@@ -2295,6 +2504,23 @@ void taskNetwork(void* pv) {
       lastStatusMs = millis();
       mqttPublishStatus();
     }
+
+    // Persist the module registry if it changed (debounced to limit NVS wear).
+    if (sfModulesDirty) {
+      if (sfModulesDirtyMs == 0) sfModulesDirtyMs = millis();
+      if (millis() - sfModulesDirtyMs > MODULE_SAVE_DEBOUNCE_MS) {
+        sfModulesSave();
+        sfModulesDirty   = false;
+        sfModulesDirtyMs = 0;
+      }
+    }
+    // Periodically prune stale modules (once a minute is plenty).
+    static unsigned long lastPruneMs = 0;
+    if (millis() - lastPruneMs > 60000UL) {
+      lastPruneMs = millis();
+      sfModulesPruneStale();
+    }
+
     wdgNetMs = millis();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -2328,6 +2554,12 @@ void setup() {
   // 3. I2C + RTC (must be before WiFi so timestamps work from boot)
   rtcHwInit();
   rtcRead(); // load whatever time is stored in RTC chip
+
+  // Restore sticky module list from the FATFS file (prunes entries older
+  // than 6h). Mount the filesystem first; done after rtcRead() so
+  // rtcEpochNow() can evaluate staleness.
+  sfFsInit();
+  sfModulesLoad();
 
   // 4. RS485
   rs485Begin();
@@ -2366,15 +2598,26 @@ void loop() {
     printf("[WDG] up=%lus heap=%u rx=%lu tx=%lu wifi=%d mqtt=%d\n",
                   now/1000, ESP.getFreeHeap(), rxCount, txCount,
                   (int)(WiFi.status()==WL_CONNECTED), (int)mqtt.connected());
-    // Detect stalled tasks (must update wdg timestamp at least every 30s)
-    bool ok485 = (wdgRS485Ms == 0 || now - wdgRS485Ms < 30000UL);
-    bool okWeb  = (wdgWebMs  == 0 || now - wdgWebMs  < 120000UL); // 120s: generous margin for slow clients
-    bool okNet  = (wdgNetMs  == 0 || now - wdgNetMs  < 30000UL);
-    if (!ok485 || !okWeb || !okNet) {
-      printf("[WDG] STALL: RS485=%d Web=%d Net=%d -- rebooting\n",
-                    ok485, okWeb, okNet);
-      delay(200);
-      ESP.restart();
+
+    // Boot grace period: skip stall detection for the first 60s. The first
+    // boot after flashing formats the FATFS partition (a long blocking flash
+    // operation), and WiFi/MQTT bring-up can briefly skew task scheduling.
+    // Rebooting during this window would be a false positive.
+    if (now < 60000UL) {
+      // still arm the low-heap emergency check below, but skip stall logic
+    } else {
+      // Detect stalled tasks. A heartbeat in the future (wdg > now) can only
+      // come from a transient timing skew during boot -- treat it as healthy
+      // rather than letting the unsigned subtraction underflow to a huge value.
+      bool ok485 = (wdgRS485Ms == 0 || wdgRS485Ms > now || now - wdgRS485Ms < 30000UL);
+      bool okWeb  = (wdgWebMs  == 0 || wdgWebMs  > now || now - wdgWebMs  < 120000UL);
+      bool okNet  = (wdgNetMs  == 0 || wdgNetMs  > now || now - wdgNetMs  < 30000UL);
+      if (!ok485 || !okWeb || !okNet) {
+        printf("[WDG] STALL: RS485=%d Web=%d Net=%d -- rebooting\n",
+                      ok485, okWeb, okNet);
+        delay(200);
+        ESP.restart();
+      }
     }
     // Emergency reboot if heap falls critically low (< 20KB)
     if (ESP.getFreeHeap() < 20000) {

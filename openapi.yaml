@@ -101,6 +101,19 @@ paths:
                 items:
                   $ref: "#/components/schemas/Module"
 
+  /api/flap/identify:
+    post:
+      tags: [Modules]
+      summary: Clear the module list and re-discover all modules
+      description: |
+        Wipes both the in-memory registry and the persisted module file, then
+        broadcasts `m*v` so every module re-announces its version and serial
+        number. This is the "Identify All" action in the web UI. Allow a few
+        seconds for all modules to respond before reading `/api/flap/modules`.
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
   /api/flap/char:
     post:
       tags: [Modules]
@@ -240,7 +253,8 @@ paths:
       description: |
         Sends the dump command and waits up to 500ms for a reply.
         For firmware v15+, tries `mXD<sn>` first; falls back to `m<id>d` if no response (up to another 500ms).
-        Returns cached data with `stale: true` on timeout if available.
+        Data is fetched fresh each call (no cache). Returns `ok:false` on timeout.
+        The `stale` field is always `false` and retained only for response-shape compatibility.
       requestBody:
         required: true
         content:
@@ -629,6 +643,27 @@ paths:
         "200":
           $ref: "#/components/responses/Ok"
 
+  /api/config/rs485:
+    post:
+      tags: [Config]
+      summary: Save RS-485 bus settings
+      description: Updates the serial bus parameters. Takes effect on the next bus reinitialisation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                baud:     { type: integer, default: 9600, example: 9600 }
+                dataBits: { type: integer, default: 8, example: 8 }
+                parity:   { type: integer, description: "0=None 1=Even 2=Odd", default: 0, example: 0 }
+                stopBits: { type: integer, default: 1, example: 1 }
+            example: { baud: 9600, dataBits: 8, parity: 0, stopBits: 1 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
   /api/config/settings:
     post:
       tags: [Config]
@@ -746,9 +781,7 @@ components:
         flapIndex:   { type: integer, description: "Last known flap index (-1 = unknown)", example: 1 }
         flapChar:    { type: string,  description: "Last known displayed character", example: "A" }
         fwVersion:   { type: string,  description: "Firmware version string", example: "12" }
-        lastSeen:    { type: integer, description: "millis() of last activity", example: 45000 }
-        dump:        { type: string,  description: "Cached EEPROM dump (present only if fetched)", example: "42:4096:0=210,1=320" }
-        dumpTs:      { type: integer, description: "millis() when dump was last fetched", example: 45100 }
+        lastSeen:    { type: integer, description: "millis() of last activity (0 if not seen since boot; restored entries start at 0)", example: 45000 }
 
     SyncReply:
       type: object
