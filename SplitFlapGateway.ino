@@ -112,6 +112,8 @@ struct GwConfig {
   char          ntpServer[64]; // NTP server hostname (default pool.ntp.org)
   bool          serialDebug;   // enable verbose serial output
   char          otaPassword[32]; // OTA update password (blank = no auth)
+  uint8_t       gridRows;      // visual display wall: rows (>=1)
+  uint8_t       gridCols;      // visual display wall: columns (>=1)
 };
 GwConfig cfg;
 // Mutex protecting setenv/tzset/localtime (not thread-safe in newlib)
@@ -359,6 +361,8 @@ void cfgSetDefaults() {
   strlcpy(cfg.mqttPrefix, DEFAULT_MQTT_PREFIX, sizeof(cfg.mqttPrefix));
   strlcpy(cfg.posixTZ, "UTC0", sizeof(cfg.posixTZ));
   strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
+  cfg.gridRows = 1;
+  cfg.gridCols = 16;
   cfg.serialDebug = false;
   gSerialDebug    = false;
   strlcpy(cfg.otaPassword, "", sizeof(cfg.otaPassword));
@@ -382,6 +386,10 @@ void loadConfig() {
   cfg.rs485StopBits   = prefs.getUChar("sbits",   1);
   strlcpy(cfg.posixTZ, prefs.getString("tz", "UTC0").c_str(), sizeof(cfg.posixTZ));
   strlcpy(cfg.ntpServer, prefs.getString("ntp", DEFAULT_NTP_SERVER).c_str(), sizeof(cfg.ntpServer));
+  cfg.gridRows = (uint8_t)prefs.getInt("gRows", 1);
+  cfg.gridCols = (uint8_t)prefs.getInt("gCols", 16);
+  if (cfg.gridRows < 1) cfg.gridRows = 1;
+  if (cfg.gridCols < 1) cfg.gridCols = 1;
   cfg.serialDebug = prefs.getBool("dbgSerial", false);
   gSerialDebug    = cfg.serialDebug;
   strlcpy(cfg.otaPassword, prefs.getString("otaPass", "").c_str(), sizeof(cfg.otaPassword));
@@ -395,6 +403,8 @@ void saveConfig() {
   prefs.begin("splitflap", false);
   prefs.putString("wSSID",  cfg.wifiSSID);
   prefs.putString("ntp",    cfg.ntpServer);
+  prefs.putInt   ("gRows",  cfg.gridRows);
+  prefs.putInt   ("gCols",  cfg.gridCols);
   prefs.putString("wPASS",  cfg.wifiPass);
   prefs.putString("mqHost", cfg.mqttHost);
   prefs.putInt   ("mqPort", cfg.mqttPort);
@@ -532,6 +542,81 @@ void rs485Begin() {
   DBG("[RS485] baud=%lu\n", cfg.rs485Baud);
 }
 
+// Inspect an outbound frame and update per-module display tracking. This runs
+// for EVERY transmitted frame (called from rs485Send), so a well-formed display
+// command sent through a raw path -- the Bus Monitor "Send Frame" box, the
+// /api/rs485/send endpoint, or the MQTT splitflap/send topic -- updates tracking
+// exactly like the high-level helpers do. Recognized forms:
+//   m<id>-<char>  / m*-<char>   show character (broadcast with '*')
+//   m<id>+<idx>   / m*+<idx>    show flap index (char becomes unknown)
+//   m<id>h        / m*h         home (char becomes unknown)
+// Anything else (provisioning mX..., version/dump/tuning commands, responses)
+// is ignored. addr -1 means broadcast. Takes sfMutex internally; never call
+// while already holding it.
+static void sfTrackFromFrame(const uint8_t* data, size_t len) {
+  // Minimum "m" + addr + cmd = 3 chars (e.g. "m*h"). Must start with 'm'.
+  if (len < 3 || data[0] != 'm') return;
+  // The provisioning/by-serial frames all use a literal 'X' as the address
+  // token (mXadv, mXack, mXI, mXH, mXD, mXW, mXF). Those never change a known
+  // module's displayed character, so skip them outright.
+  if (data[1] == 'X') return;
+
+  size_t i = 1;
+  int addr;
+  if (data[i] == '*') {            // broadcast
+    addr = -1;
+    i++;
+  } else if (data[i] >= '0' && data[i] <= '9') {
+    long v = 0;
+    while (i < len && data[i] >= '0' && data[i] <= '9') {
+      v = v * 10 + (data[i] - '0');
+      i++;
+      if (v > 254) return;         // out of valid id range -> not a display cmd
+    }
+    addr = (int)v;
+  } else {
+    return;                        // not an address we recognize
+  }
+  if (i >= len) return;
+  char cmd = (char)data[i];
+
+  if (cmd == '-') {                // show character: next byte is the char
+    if (i + 1 >= len) return;
+    char c = (char)data[i + 1];
+    if (c < 0x20 || c > 0x7E) return;
+    sfTrackChar(addr, c);
+  } else if (cmd == '+') {         // show index: record index, char unknown
+    long idx = 0;
+    size_t j = i + 1;
+    if (j >= len || data[j] < '0' || data[j] > '9') return;  // need a number
+    while (j < len && data[j] >= '0' && data[j] <= '9') {
+      idx = idx * 10 + (data[j] - '0');
+      j++;
+      if (idx > 63) { idx = -1; break; }   // out of flap range -> unknown
+    }
+    if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (addr < 0) {
+        for (int k = 0; k < sfModuleCount; k++) {
+          if (sfModules[k].provisioned) {
+            sfModules[k].flapIndex = (int)idx;
+            sfModules[k].flapChar  = 0;
+          }
+        }
+      } else {
+        SFModule* m = sfFindById((uint8_t)addr);
+        if (m) { m->flapIndex = (int)idx; m->flapChar = 0; }
+      }
+      xSemaphoreGive(sfMutex);
+    }
+  } else if (cmd == 'h' &&         // home: char becomes unknown.
+             (i + 1 >= len || data[i + 1] == '\n' || data[i + 1] == '\r')) {
+    // Guard against false matches: 'h' must be the whole command, not a prefix
+    // of something else. (There is no other 'h...' display command, but this
+    // keeps the matcher strict.)
+    sfTrackChar(addr, 0);
+  }
+}
+
 void rs485Send(const uint8_t* data, size_t len) {
   if (!len || len > TX_MAX_BYTES) return;
   // Collision avoidance on the half-duplex bus: if modules are mid-response
@@ -550,6 +635,10 @@ void rs485Send(const uint8_t* data, size_t len) {
   rs485.write(data, len);
   rs485.flush();
   txCount++;
+  // Update per-module display tracking from this frame. Doing it here -- the
+  // single point every outbound frame passes through -- means raw sends are
+  // tracked exactly like the high-level helpers, with no per-path duplication.
+  sfTrackFromFrame(data, len);
   // Log the transmitted frame (strip trailing newline for readability).
   // Cap the debug buffer at MSG_MAX_BYTES; long frames are truncated in the log.
   { char dbg[MSG_MAX_BYTES];
@@ -808,6 +897,34 @@ static void sfModulesPruneStale() {
 // The gateway does NOT translate the character to a flap index -- the module
 // firmware does that itself. We only ensure it is a printable ASCII byte and
 // uppercase it (the flap set is uppercase), then send m<id>-<char> verbatim.
+// Record the character a module is now displaying. addr<0 means a broadcast
+// was sent, so every known module shows the same character -- update them all.
+// Pass c=0 to mark the displayed character as unknown (e.g. after a home, when
+// the module has left its previous flap but we can't name the new one without
+// the module's flap table). flapIndex is cleared because the gateway tracks the
+// character, not the index, on the char path. Caller must already hold sfMutex.
+static void sfTrackCharLocked(int addr, char c) {
+  if (addr < 0) {
+    for (int i = 0; i < sfModuleCount; i++) {
+      if (sfModules[i].provisioned) {
+        sfModules[i].flapChar  = c;
+        sfModules[i].flapIndex = -1;
+      }
+    }
+  } else {
+    SFModule* m = sfFindById((uint8_t)addr);
+    if (m) { m->flapChar = c; m->flapIndex = -1; }
+  }
+}
+
+// Mutex-wrapping convenience for callers that are not already holding sfMutex.
+static void sfTrackChar(int addr, char c) {
+  if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    sfTrackCharLocked(addr, c);
+    xSemaphoreGive(sfMutex);
+  }
+}
+
 void sfSendChar(int addr, char c) {
   if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');  // normalize to uppercase
   if (c < 0x20 || c > 0x7E) return;                     // reject non-printable / non-ASCII
@@ -817,11 +934,8 @@ void sfSendChar(int addr, char c) {
   else
     snprintf(buf, sizeof(buf), "m%d-%c\n", addr, c);
   rs485SendStr(buf);
-  // Update local state (display char only; the index is the module's concern)
-  if (addr >= 0) {
-    SFModule* m = sfFindById((uint8_t)addr);
-    if (m) { m->flapChar = c; m->flapIndex = -1; }
-  }
+  // Display tracking is handled centrally in rs485Send via sfTrackFromFrame,
+  // so every path (including raw frame sends) is covered uniformly.
 }
 
 // Display by flap index.  addr=-1 = broadcast.
@@ -832,13 +946,7 @@ void sfSendIndex(int addr, int idx) {
   else
     snprintf(buf, sizeof(buf), "m%d+%d\n", addr, idx);
   rs485SendStr(buf);
-  if (addr >= 0) {
-    SFModule* m = sfFindById((uint8_t)addr);
-    if (m) {
-      m->flapIndex = idx;
-      m->flapChar  = 0;   // unknown without the module's own char table
-    }
-  }
+  // Display tracking handled centrally in rs485Send via sfTrackFromFrame.
 }
 
 void sfHomeOffset(int addr, int steps) {
@@ -911,6 +1019,8 @@ void sfHome(int addr) {
   if (addr < 0) snprintf(buf, sizeof(buf), "m*h\n");
   else          snprintf(buf, sizeof(buf), "m%dh\n", addr);
   rs485SendStr(buf);
+  // Display tracking handled centrally in rs485Send via sfTrackFromFrame
+  // (home -> displayed character becomes unknown).
 }
 
 // Calibrate one module or all
@@ -1479,6 +1589,12 @@ void handleRoot() {
   server.sendContent(".sgh{color:var(--dim);font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;margin:0 0 8px 2px}");
   server.sendContent(".stat .v.vok{color:var(--grn)}.stat .v.vwarn{color:var(--ylw)}.stat .v.vbad{color:var(--hi)}");
   server.sendContent(".mod{background:#0d1b2a;border-radius:6px;padding:8px 8px 30px 8px;border:1px solid var(--acc);font-size:.8rem;position:relative}");
+  server.sendContent(".wall{display:inline-block;background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:14px;overflow-x:auto;max-width:100%}");
+  server.sendContent(".wallrow{display:flex;gap:6px;justify-content:center}.wallrow+.wallrow{margin-top:6px}");
+  server.sendContent(".flap{position:relative;width:46px;height:62px;background:#0a0a0a;border-radius:5px;box-shadow:inset 0 0 0 1px #2a2a2a;display:flex;align-items:center;justify-content:center;font-family:'Courier New',monospace;font-weight:700;font-size:2rem;color:#f5f5f5;flex:0 0 auto}");
+  server.sendContent(".flap::before{content:'';position:absolute;left:0;right:0;top:50%;height:1px;background:#000;box-shadow:0 1px 0 #1f1f1f;z-index:1}");
+  server.sendContent(".flap.empty{background:#141414;color:#333;box-shadow:inset 0 0 0 1px #222}.flap.unknown{color:#555}");
+  server.sendContent(".wallwrap{text-align:center}.wallmeta{font-size:.76rem;color:var(--dim);margin-top:8px}");
   server.sendContent(".verbadge{font-size:.55em;font-weight:normal;color:var(--dim);vertical-align:middle;border:1px solid var(--acc);border-radius:10px;padding:1px 7px;margin-left:6px}");
   server.sendContent(".micons{position:absolute;bottom:6px;right:6px;display:flex;gap:8px}");
   server.sendContent(".micon{cursor:pointer;font-size:1rem;line-height:1;opacity:.78;background:none;border:none;padding:2px}.micon:hover{opacity:1}.micon.del{color:var(--hi)}");
@@ -1512,7 +1628,8 @@ void handleRoot() {
   server.sendContent("<button class=\"dbtn\" onclick=\"delAction('deprovision')\">De-provision<small>Sends Reset (R): the module forgets its assigned ID and returns to advertising for re-provisioning.</small></button>");
   server.sendContent("<div id=\"delModalStatus\" style=\"margin-top:10px;font-size:.8rem;color:var(--ylw)\"></div></div></div>");
   server.sendContent("</div>");  // close pane-modules
-  server.sendContent("<div id=\"pane-display\" class=\"pane\"><div class=\"card\"><h2>Send Text to Display</h2>");
+  server.sendContent("<div id=\"pane-display\" class=\"pane\"><div class=\"card\"><h2>Live Display</h2><div class=\"wallwrap\"><div id=\"wall\" class=\"wall\"></div><div class=\"wallmeta\" id=\"wallMeta\">Loading...</div></div></div>");
+  server.sendContent("<div class=\"card\"><h2>Send Text to Display</h2>");
   server.sendContent("<label>Text</label><input id=\"dispText\" type=\"text\" placeholder=\"HELLO WORLD\" style=\"text-transform:uppercase\">");
   server.sendContent("<label>Start Module ID</label><input id=\"dispStart\" type=\"number\" value=\"0\" min=\"0\" max=\"253\">");
   server.sendContent("<button onclick=\"sendText()\">Send to Display</button><div id=\"dr\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
@@ -1584,6 +1701,7 @@ void handleRoot() {
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("<div id=\"tzR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div>");
   server.sendContent("</div>");
+  server.sendContent("<div class=\"card\"><h2>Display Layout</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">How the modules are physically arranged, for the Live Display on the Display tab. Modules map left-to-right, top-to-bottom by ID (module 0 = top-left).</p><div class=\"row\"><div><label>Rows</label><input id=\"gRows\" type=\"number\" value=\"1\" min=\"1\" max=\"64\"></div><div><label>Columns</label><input id=\"gCols\" type=\"number\" value=\"16\" min=\"1\" max=\"64\"></div></div><button onclick=\"saveGrid()\">Save Layout</button><div id=\"gridR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("<div class=\"card\"><h2>Serial Debug</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Enable verbose serial output on the native USB serial port (115200 baud). Shows every RX/TX frame, MQTT events, and module activity.</p><label style=\"display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--txt)\"><input type=\"checkbox\" id=\"dbgChk\" style=\"width:auto\">Enable Serial Debug Output</label><button onclick=\"saveDebug()\" style=\"margin-top:10px\">Save</button><div id=\"dbgR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("<div class=\"card\"><h2>OTA Firmware Update</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Upload new firmware directly from your browser ? no USB cable or Arduino IDE required.</p><a href=\"/ota\" target=\"_blank\" style=\"display:inline-block;margin-bottom:12px;padding:7px 16px;background:var(--hi);color:#fff;border-radius:4px;text-decoration:none;font-size:.9rem\">Open Firmware Updater &rarr;</a><label style=\"margin-top:8px\">OTA Password</label><input id=\"otaPw\" type=\"password\" placeholder=\"Leave blank for no password\"><p style=\"font-size:.77rem;color:var(--dim);margin-top:4px\">Protects ArduinoOTA (IDE/command-line) uploads. The web updater above is always accessible.</p><button onclick=\"saveOTA()\" style=\"margin-top:6px\">Save OTA Password</button><div id=\"otaR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("</div>");
@@ -1609,7 +1727,11 @@ void handleRoot() {
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ntp\">-</div><div class=\"k\">NTP Sync</div></div>");
   server.sendContent("</div></div></div>");
   server.sendContent("<script>");
-  server.sendContent("function show(id,el){document.querySelectorAll(\".pane\").forEach(function(p){p.classList.remove(\"on\");});document.querySelectorAll(\"nav a\").forEach(function(a){a.classList.remove(\"on\");});document.getElementById(\"pane-\"+id).classList.add(\"on\");el.classList.add(\"on\");}");
+  server.sendContent("function show(id,el){document.querySelectorAll(\".pane\").forEach(function(p){p.classList.remove(\"on\");});document.querySelectorAll(\"nav a\").forEach(function(a){a.classList.remove(\"on\");});document.getElementById(\"pane-\"+id).classList.add(\"on\");el.classList.add(\"on\");if(id===\"display\"){startWall();}else{stopWall();}}");
+  server.sendContent("var _wallTimer=null;function buildWall(s){var w=document.getElementById(\"wall\");if(!w)return;var cells=s.cells||[];var html=\"\";var idx=0;for(var r=0;r<s.rows;r++){html+=\"<div class='wallrow'>\";for(var c=0;c<s.cols;c++){var v=(idx<cells.length)?cells[idx]:null;var cls=\"flap\",disp=\"\";if(v===null){cls+=\" empty\";disp=\"\";}else if(v===\"?\"){cls+=\" unknown\";disp=\"?\";}else{disp=v===\" \"?\"&nbsp;\":v;}html+=\"<div class='\"+cls+\"'>\"+disp+\"</div>\";idx++;}html+=\"</div>\";}w.innerHTML=html;var known=cells.filter(function(x){return x!==null;}).length;document.getElementById(\"wallMeta\").textContent=s.rows+\" x \"+s.cols+\" grid - \"+known+\" module(s) mapped\";}");
+  server.sendContent("function refreshWall(){fetch(\"/api/display/state\").then(function(r){return r.json();}).then(buildWall).catch(function(){var m=document.getElementById(\"wallMeta\");if(m)m.textContent=\"Could not load display state\";});}");
+  server.sendContent("function startWall(){refreshWall();if(_wallTimer)clearInterval(_wallTimer);_wallTimer=setInterval(function(){if(document.getElementById(\"pane-display\").classList.contains(\"on\"))refreshWall();},1500);}");
+  server.sendContent("function stopWall(){if(_wallTimer){clearInterval(_wallTimer);_wallTimer=null;}}");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("var FC=\" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\";");
   server.sendContent("function sfDecode(raw){var s=raw.replace(/[\\r\\n]+$/,\"\");if(s.length<2||s[0]!==\"m\")return \"\";if(s[1]===\"X\"){if(s.indexOf(\"mXadv:\")==0)return \"ADV  unprovisioned SN: \"+s.slice(6);if(s.indexOf(\"mXack:\")==0){var r=s.slice(6),ci=r.lastIndexOf(\":\");return ci>=0?\"ACK  SN \"+r.slice(0,ci)+\" -> ID \"+r.slice(ci+1):\"ACK \"+r;}if(s[2]===\"I\"){var ci2=s.indexOf(\":\",3);return ci2>=0?\"PROVISION  SN \"+s.slice(3,ci2)+\" -> ID \"+s.slice(ci2+1):\"PROVISION \"+s.slice(3);}if(s[2]===\"H\")return \"PROVISION  home SN \"+s.slice(3);if(s[2]===\"D\")return \"DUMP       SN \"+s.slice(3);if(s[2]===\"F\")return \"FACTORY RST SN \"+s.slice(3);if(s[2]===\"W\")return \"RESTORE    \"+s.slice(3);return \"PROVISIONING \"+s.slice(2);}var p=1,id=\"\",bc=false;while(p<s.length&&(s[p]===\"*\"||s[p]>=\"0\"&&s[p]<=\"9\")){if(s[p]===\"*\")bc=true;else id+=s[p];p++;}var who=bc?\"ALL\":\"#\"+id;if(p>=s.length)return who+\" (incomplete)\";var cmd=s[p],rest=s.slice(p+1);if(cmd===\"-\"){var fi=FC.indexOf(rest[0]||\"\");var sfx=fi>=0?\" (idx \"+fi+\")\":\"\";return \"SHOW CHAR    \"+who+\" -> [\"+(rest[0]||\"?\")+\"]\"+sfx;}if(cmd===\"+\"){var n=parseInt(rest);var ch=isNaN(n)?\"?\":(FC[n]||\"?\");return \"SHOW INDEX   \"+who+\" -> \"+n+\" [\"+ch+\"]\";}if(cmd===\"h\")return \"HOME         \"+who;if(cmd===\"c\")return rest?\"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\":\"CALIBRATE    \"+who;if(cmd===\"o\")return \"HOME OFFSET  \"+who+\" = \"+rest+\" steps\";if(cmd===\"t\")return \"TOTAL STEPS  \"+who+\" = \"+rest;if(cmd===\"s\")return \"NUDGE        \"+who+\" \"+rest+\" steps\";if(cmd===\"g\")return \"GOTO STEP    \"+who+\" -> step \"+rest;if(cmd===\"w\"){var wci=rest.indexOf(\":\");return wci>=0?\"WRITE POS    \"+who+\" idx \"+rest.slice(0,wci)+\" -> \"+rest.slice(wci+1)+\" steps\":\"WRITE POS    \"+who+\" \"+rest;}if(cmd===\"i\")return \"SET ID       \"+who+\" -> ID \"+rest;if(cmd===\"a\")return \"AUTO-HOME    \"+who+(rest===\"1\"?\" ON\":\" OFF\");if(cmd===\"d\")return rest&&rest[0]===\":\"?\"DUMP RESP    \"+who+\" \"+rest.slice(1):\"DUMP?        \"+who;if(cmd===\"e\")return \"ERASE MAP    \"+who;if(cmd===\":\")return \"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\";if(cmd===\"v\"){if(rest&&rest[0]===\":\"){var vp=rest.slice(1).split(\":\");var vs=\"VERSION RESP \"+who+\" fw:\"+vp[0];if(vp.length>1&&vp[1]!==\"\")vs+=\" id:\"+vp[1];if(vp.length>2&&vp[2]!==\"\")vs+=\" sn:\"+vp[2];return vs;}return \"VERSION?     \"+who;}if(cmd===\"R\")return \"RESET PROV   \"+who;if(cmd===\"F\")return \"FACTORY RST  \"+who;return \"CMD [\"+cmd+\"] \"+who+(rest?\" \"+rest:\"\");}");
@@ -1641,11 +1763,12 @@ void handleRoot() {
   server.sendContent("function testMqtt(){var el=document.getElementById(\"mr\");el.textContent=\"Testing...\";fetch(\"/api/mqtt/test\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({host:document.getElementById(\"mqH\").value,port:parseInt(document.getElementById(\"mqP\").value)||1883,user:document.getElementById(\"mqU\").value,pass:document.getElementById(\"mqPw\").value})}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"Broker OK - connected and authenticated\":\"Failed: \"+(j.detail||j.error||\"unknown\");}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function saveMqtt(){fetch(\"/api/config/mqtt\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({host:document.getElementById(\"mqH\").value,port:parseInt(document.getElementById(\"mqP\").value),user:document.getElementById(\"mqU\").value,pass:document.getElementById(\"mqPw\").value,prefix:document.getElementById(\"mqPfx\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"mr\").textContent=j.ok?\"MQTT saved - reconnecting...\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"mr\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveTz(){var sel=document.getElementById(\"tzSel\");var ntp=document.getElementById(\"ntpSrv\").value.trim();fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({posixTZ:sel.value,ntpServer:ntp})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"tzR\").textContent=j.ok?\"Time settings saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"tzR\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function saveGrid(){var rows=parseInt(document.getElementById(\"gRows\").value)||1;var cols=parseInt(document.getElementById(\"gCols\").value)||1;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({gridRows:rows,gridCols:cols})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"gridR\").textContent=j.ok?\"Layout saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"gridR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveOTA(){fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({otaPassword:document.getElementById(\"otaPw\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"otaR\").textContent=j.ok?\"OTA password saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"otaR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveDebug(){var v=document.getElementById(\"dbgChk\").checked;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({serialDebug:v})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"dbgR\").textContent=j.ok?(v?\"Debug enabled\":\"Debug disabled\"):\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"dbgR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function setMaintUI(on){var chk=document.getElementById(\"maintChk\");if(chk)chk.checked=!!on;var lbl=document.querySelector(\".maint-toggle\");if(lbl)lbl.classList.toggle(\"active\",!!on);document.body.classList.toggle(\"maint-on\",!!on);}function toggleMaint(){var chk=document.getElementById(\"maintChk\");var on=chk.checked;fetch(\"/api/maintenance\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:on})}).then(function(r){return r.json();}).then(function(j){setMaintUI(j.on);}).catch(function(){chk.checked=!on;setMaintUI(!on);});}");
   server.sendContent("function pollStatus(){fetch(\"/api/status\").then(function(r){return r.json();}).then(function(s){var up=s.uptime,ud=Math.floor(up/86400),uh=Math.floor(up%86400/3600),um=Math.floor(up%3600/60),us=up%60;document.getElementById(\"s-up\").textContent=(ud?ud+\"d \":\"\")+(uh||ud?uh+\"h \":\"\")+um+\"m \"+us+\"s\";document.getElementById(\"s-rx\").textContent=s.rx;document.getElementById(\"s-tx\").textContent=s.tx;document.getElementById(\"s-ip\").textContent=s.ip;document.getElementById(\"s-ap\").textContent=s.apip;var hp=document.getElementById(\"s-hp\");hp.textContent=Math.round(s.heap/1024)+\" KB\";hp.className=\"v \"+(s.heap>=40000?\"vok\":(s.heap>=25000?\"vwarn\":\"vbad\"));var mq=document.getElementById(\"s-mq\");mq.textContent=s.mqtt?\"Connected\":\"Off\";mq.className=\"v \"+(s.mqtt?\"vok\":\"\");document.getElementById(\"s-mod\").textContent=s.modules;if(s.minheap){var mh=document.getElementById(\"s-mh\");mh.textContent=Math.round(s.minheap/1024)+\" KB\";mh.className=\"v \"+(s.minheap>=40000?\"vok\":(s.minheap>=25000?\"vwarn\":\"vbad\"));}if(s.stk){var sm=null,sn=\"\";for(var k in s.stk){if(sm===null||s.stk[k]<sm){sm=s.stk[k];sn=k;}}var st=document.getElementById(\"s-stk\");st.textContent=sm+\" B (\"+sn+\")\";st.className=\"v \"+(sm>=800?\"vok\":(sm>=400?\"vwarn\":\"vbad\"));}if(document.getElementById(\"s-rtc\"))document.getElementById(\"s-rtc\").textContent=s.time||\"--\";var ntp=document.getElementById(\"s-ntp\");if(ntp){ntp.textContent=s.ntpSynced?\"Synced\":\"Pending\";ntp.className=\"v \"+(s.ntpSynced?\"vok\":\"vwarn\");}var b=document.getElementById(\"badge\");b.textContent=s.wifi?\"WiFi: \"+s.ip:\"AP only\";b.className=s.wifi?\"ok\":\"\";if(typeof s.maint!==\"undefined\")setMaintUI(s.maint);}).catch(function(){});}setInterval(pollStatus,3000);pollStatus();");
-  server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}});");
+  server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}if(c.gridRows){document.getElementById(\"gRows\").value=c.gridRows;}if(c.gridCols){document.getElementById(\"gCols\").value=c.gridCols;}});");
   server.sendContent("</script></body></html>");
   server.sendContent("");
   server.sendContent("");
@@ -1698,6 +1821,51 @@ void handleApiModules() {
   }
   out += ']';
   xSemaphoreGive(sfMutex);
+  server.send(200, "application/json", out);
+}
+
+// GET /api/display/state -- the data behind the visual "display wall". Returns
+// the configured grid dimensions plus the character each cell is showing. Cells
+// are addressed by module ID mapped left-to-right, top-to-bottom (cell index =
+// row*cols + col == module id), matching how text is distributed across modules.
+// A cell shows: the tracked character if known, "?" if the module exists but its
+// char is unknown (e.g. after a home or index-set), or null if no module has
+// that id. Kept small so the UI can poll it cheaply.
+void handleApiDisplayState() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int rows = cfg.gridRows < 1 ? 1 : cfg.gridRows;
+  int cols = cfg.gridCols < 1 ? 1 : cfg.gridCols;
+  int cells = rows * cols;
+  // cellChar: 0 = no module at this id, 1 = module present but char unknown,
+  // otherwise the printable character. Filled under the mutex, JSON built after.
+  static char cellChar[64 * 64];   // matches the 64x64 grid cap enforced in settings
+  if (cells > (int)sizeof(cellChar)) cells = sizeof(cellChar);
+  memset(cellChar, 0, cells);
+  xSemaphoreTake(sfMutex, portMAX_DELAY);
+  for (int i = 0; i < sfModuleCount; i++) {
+    const SFModule& m = sfModules[i];
+    if (!m.provisioned) continue;
+    if (m.id < cells) {
+      char c = m.flapChar;
+      cellChar[m.id] = (c >= 32 && c <= 126) ? c : 1;  // 1 = known module, char unknown
+    }
+  }
+  xSemaphoreGive(sfMutex);
+
+  String out;
+  out.reserve(cells * 6 + 64);
+  out = "{\"rows\":"; out += rows;
+  out += ",\"cols\":"; out += cols;
+  out += ",\"cells\":[";
+  for (int i = 0; i < cells; i++) {
+    if (i) out += ',';
+    char c = cellChar[i];
+    if (c == 0)            out += "null";              // no module at this id
+    else if (c == 1)       out += "\"?\"";             // module present, char unknown
+    else if (c == '"' || c == '\\') { out += '"'; out += '\\'; out += c; out += '"'; }
+    else { out += '"'; out += c; out += '"'; }
+  }
+  out += "]}";
   server.send(200, "application/json", out);
 }
 
@@ -1958,6 +2126,8 @@ void handleApiConfigGet() {
   doc["stopBits"] = cfg.rs485StopBits;
   doc["posixTZ"]    = cfg.posixTZ;
   doc["ntpServer"]  = cfg.ntpServer;
+  doc["gridRows"]   = cfg.gridRows;
+  doc["gridCols"]   = cfg.gridCols;
   doc["serialDebug"]   = cfg.serialDebug;
   doc["otaPasswordSet"] = (strlen(cfg.otaPassword) > 0);
   char out[640];
@@ -2074,6 +2244,17 @@ void handleApiConfigSettings() {
     if (!cfg.ntpServer[0]) strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
     ntpSynced = false;   // re-sync against the new server on next network tick
     DBG("[CFG] NTP server set to %s\n", cfg.ntpServer);
+  }
+  if (doc["gridRows"].is<int>() || doc["gridCols"].is<int>()) {
+    int gr = doc["gridRows"] | cfg.gridRows;
+    int gc = doc["gridCols"] | cfg.gridCols;
+    if (gr < 1)   gr = 1;
+    if (gr > 64)  gr = 64;   // sane upper bounds for the visual wall
+    if (gc < 1)   gc = 1;
+    if (gc > 64)  gc = 64;
+    cfg.gridRows = (uint8_t)gr;
+    cfg.gridCols = (uint8_t)gc;
+    DBG("[CFG] Display grid set to %dx%d (rows x cols)\n", gr, gc);
   }
   bool baudChanged = (newBaud != cfg.rs485Baud);
   cfg.rs485Baud = newBaud;
@@ -2621,6 +2802,7 @@ void webInit() {
   server.on("/api/rs485/send",       HTTP_POST,    handleApiSend);
   server.on("/api/rs485/send",       HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/modules",     HTTP_GET,     handleApiModules);
+  server.on("/api/display/state",    HTTP_GET,     handleApiDisplayState);
   server.on("/api/flap/identify",    HTTP_POST,    handleApiIdentify);
   server.on("/api/flap/identify",    HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/char",        HTTP_POST,    handleApiChar);
