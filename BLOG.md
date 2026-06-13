@@ -60,20 +60,26 @@ The gateway exposes the bus through three interfaces simultaneously:
 
 ---
 
-<a href="screenshots/SplitFlapGateway4.png"><img src="screenshots/SplitFlapGateway4.png" width="380" alt="Modules tab — known modules with IDs, serial numbers and firmware versions"></a>  
-*Modules tab — all known modules at a glance, with quick commands for homing, calibrating and querying version*
+<a href="screenshots/modules.png"><img src="screenshots/modules.png" width="380" alt="Modules tab — known modules with IDs, serial numbers and firmware versions"></a>  
+*Modules tab — every known module at a glance. Each card has icons to home it, inspect its EEPROM, or run a destructive action*
 
-<a href="screenshots/SplitFlapGateway5.png"><img src="screenshots/SplitFlapGateway5.png" width="380" alt="Bus Monitor — live RS-485 traffic with decoded descriptions"></a>  
-*Bus Monitor — live RS-485 traffic with human-readable protocol decoding and local timestamps*
+<a href="screenshots/modules_info.png"><img src="screenshots/modules_info.png" width="380" alt="Module info dialog with parsed EEPROM calibration"></a>  
+*Module info — all known data for a module plus its EEPROM read fresh from the bus and parsed into home offset, steps-per-rev, and the calibrated flap map*
 
-<a href="screenshots/SplitFlapGateway3.png"><img src="screenshots/SplitFlapGateway3.png" width="380" alt="Provision tab — discover unprovisioned modules and assign IDs"></a>  
-*Provision tab — unprovisioned modules appear automatically; home them to identify which physical tile they are, then assign an ID*
+<a href="screenshots/bus_monitor.png"><img src="screenshots/bus_monitor.png" width="380" alt="Bus Monitor — live RS-485 traffic with decoded descriptions"></a>  
+*Bus Monitor — live RS-485 traffic with human-readable protocol decoding and browser-local timestamps; pause, download, and auto-scroll controls*
 
-<a href="screenshots/SplitFlapGateway2.png"><img src="screenshots/SplitFlapGateway2.png" width="380" alt="Settings tab — WiFi, MQTT and timezone configuration"></a>  
-*Settings tab — configure WiFi credentials, MQTT broker, and timezone; all saved to flash*
+<a href="screenshots/provision.png"><img src="screenshots/provision.png" width="380" alt="Provision tab — discover unprovisioned modules and assign IDs"></a>  
+*Provision tab — unprovisioned modules appear automatically; home one to identify which physical tile it is, then assign an ID*
 
-<a href="screenshots/SplitFlapGateway1.png"><img src="screenshots/SplitFlapGateway1.png" width="380" alt="Status tab — uptime, heap, IP addresses, NTP and RTC time"></a>  
-*Status tab — system health at a glance: uptime, free heap, frame counters, MQTT state, and RTC time*
+<a href="screenshots/display.png"><img src="screenshots/display.png" width="380" alt="Display tab — send text, a single character, or a flap index"></a>  
+*Display tab — push a whole string across sequential modules, send one character, or address a specific flap by index*
+
+<a href="screenshots/settings.png"><img src="screenshots/settings.png" width="380" alt="Settings tab — WiFi, MQTT, timezone and NTP configuration"></a>  
+*Settings tab — WiFi, MQTT broker (with a connection tester), timezone, NTP server, and OTA firmware update; all saved to flash*
+
+<a href="screenshots/status.png"><img src="screenshots/status.png" width="380" alt="Status tab — grouped health metrics"></a>  
+*Status tab — system health grouped into Network, System Health, RS-485 Bus, and Clock, with color-coded heap and stack indicators*
 
 ---
 

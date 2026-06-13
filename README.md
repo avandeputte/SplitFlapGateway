@@ -1,5 +1,7 @@
 # Split-Flap Gateway
 
+**Firmware version: 1.0**
+
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem.
 
@@ -65,14 +67,20 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 ## Features
 
 - **Web UI** — single-page dashboard accessible from any browser
-- **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 200)
+- **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 255: IDs 0-254)
 - **Sticky module list** — the known-module registry persists across reboots in flash; entries not seen for 6 hours are pruned automatically
-- **EEPROM inspector** — click any module card to fetch and display its EEPROM configuration on demand
+- **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
+- **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs
+- **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
+- **Health metrics** — the Status tab shows minimum-ever free heap and per-task stack high-water marks, surfacing memory pressure before it causes a crash
+- **Diagnostic boot/telemetry log** — on boot the gateway prints its reset reason (POWERON / PANIC / TASK_WDT / BROWNOUT, etc.) and a chip/heap snapshot; the periodic `[WDG]` line reports heap, min-ever heap, largest free block, heap-fragmentation %, per-task stack watermarks, RX/TX/parse-reject counters, WiFi RSSI, and MQTT state
+- **mDNS** — the web UI is reachable at `http://splitflap-gw.local` (no IP lookup needed)
+- **Maintenance mode** — a header toggle that makes the gateway ignore all externally-originated MQTT commands (the web UI keeps working), so calibration and backup work isn't disturbed by home-automation traffic; always resets to off on reboot
 - **Real-time bus monitor** — live RS-485 traffic with protocol decoding and local timestamps
-- **NTP time sync** — RTC backed by PCF85063; syncs from `pool.ntp.org` on WiFi connect, persists through power loss
+- **NTP time sync** — RTC backed by PCF85063; syncs on WiFi connect and persists through power loss. The NTP server is configurable in Settings (default `pool.ntp.org`)
 - **DST-aware timezone** — POSIX TZ string support covering 20 regions, takes effect immediately
 - **MQTT integration** — publishes bus frames and module events; subscribes to control topics
-- **REST API** — full JSON API with 31 endpoints for programmatic control (OpenAPI spec included)
+- **REST API** — full JSON API for programmatic control (OpenAPI spec included)
 - **OTA updates** — flash new firmware over WiFi from a browser or Arduino IDE; no USB cable required after first flash
 - **AP fallback** — creates its own access point when WiFi is unavailable
 - **Configurable serial debug** — verbose logging toggled from the web UI Settings tab
@@ -154,24 +162,38 @@ The firmware outputs diagnostic messages at **115200 baud** via the native USB C
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway
+[Boot] Split-Flap Gateway v1.0
+[Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
+[MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
 [MQTT] Connecting to broker:1883...
-[WDG] up=30s heap=187432 rx=0 tx=0 wifi=1 mqtt=1
+[WDG] up=30s heap=187432 min=171008 maxblk=110580 frag=41% stk(485/web/net/ota/rtc)=3120/5240/2980/2400/900 rx=12 tx=9 rej=0 wifi=1 rssi=-58 mqtt=1 mods=11
 ```
+
+The boot line's `reset=` field is the first thing to check after an unexpected reboot:
+
+| reset reason | meaning |
+|---|---|
+| `POWERON` | normal power-up |
+| `SW` | software reset (e.g. after an OTA flash or config change) |
+| `PANIC` | firmware crash (stack overflow, null deref, assert) — check the backtrace above it |
+| `TASK_WDT` / `INT_WDT` | a task or interrupt blocked too long |
+| `BROWNOUT` | supply voltage dipped — a power problem, not firmware |
+
+The periodic `[WDG]` fields: `heap` (free now), `min` (lowest free heap ever — catches transient dips), `maxblk` (largest allocatable block), `frag` (heap fragmentation %; a high value with adequate `heap` warns of fragmentation before an allocation fails), `stk(...)` (per-task minimum-ever free stack in bytes — a value trending toward 0 predicts a stack-overflow crash), `rx`/`tx` (bus frame counters), `rej` (corrupt/garbled frames rejected at parse — a rising count signals bus collisions or wiring noise), `rssi` (WiFi signal), and `mqtt` (broker connected). A stall reboot logs which task stalled and its age; a low-heap reboot logs the heap value.
 
 **Debug messages** (enable in Settings → Serial Debug):
 ```
 [RX] m5v:12:5:AABBCCDD  (2026-06-10 14:32:01)
 [TX] m5-A
 [MQTT->BUS] m9h
-[API] show char 'A' on module 5
+[NTP] Syncing (UTC) via pool.ntp.org...
+[SF] rejecting corrupt version response for module 5 (sn:...)
 [API] home module 9
 [API] provision SN AABBCCDD -> ID 5
-[CFG] WiFi SSID set to 'MyNetwork'
 [CFG] MQTT broker set to 192.168.1.50:1883  prefix=splitflap
+[CFG] NTP server set to time.google.com
 [CFG] Timezone set to EST5EDT,M3.2.0,M11.1.0
-[CFG] Serial debug enabled
 ```
 
 ---
@@ -194,14 +216,28 @@ Connect to the AP, open the web UI, go to **Settings → WiFi**, enter your netw
 
 Navigate to the gateway's IP address in any browser.
 
+<p align="center">
+<a href="screenshots/modules.png"><img src="screenshots/modules.png" width="260" alt="Modules tab"></a>
+<a href="screenshots/modules_info.png"><img src="screenshots/modules_info.png" width="260" alt="Module info dialog with parsed EEPROM"></a>
+<a href="screenshots/modules_manage.png"><img src="screenshots/modules_manage.png" width="260" alt="Module destructive-actions dialog"></a>
+<a href="screenshots/display.png"><img src="screenshots/display.png" width="260" alt="Display tab"></a>
+<a href="screenshots/provision.png"><img src="screenshots/provision.png" width="260" alt="Provision tab"></a>
+<a href="screenshots/bus_monitor.png"><img src="screenshots/bus_monitor.png" width="260" alt="Bus Monitor tab"></a>
+<a href="screenshots/settings.png"><img src="screenshots/settings.png" width="260" alt="Settings tab"></a>
+<a href="screenshots/backups.png"><img src="screenshots/backups.png" width="260" alt="Backup tab"></a>
+<a href="screenshots/status.png"><img src="screenshots/status.png" width="260" alt="Status tab"></a>
+</p>
+
+
 | Tab | Description |
 |---|---|
-| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Click any module to fetch and inspect its EEPROM configuration (fetched fresh each time). **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
-| **Display** | Send a text string across sequential modules by start ID, or send a specific flap index to a module |
+| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog with all known module data plus a parsed view of its EEPROM — home offset, steps/rev, and the calibrated flap map), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
+| **Display** | Send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
-| **Bus Monitor** | Live RS-485 traffic with protocol-decoded descriptions and local-time timestamps |
-| **Settings** | WiFi credentials, MQTT broker, timezone, serial debug toggle, OTA firmware update |
-| **Status** | Uptime, frame counters, IP addresses, heap, MQTT state, RTC time, NTP sync |
+| **Backup** | Download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
+| **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. |
+| **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, serial debug toggle, OTA firmware update |
+| **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
 
 ---
 
@@ -276,6 +312,8 @@ All bus frames are newline-terminated ASCII starting with `m`.
 | `mXack:<serialNumber>:<assignedId>\n` | Provisioning acknowledgement |
 
 ### Character set (64 flaps, index 0–63)
+
+The split-flap character set is owned by the **module firmware**, not the gateway. When you send `m<id>-<char>`, the gateway transmits the character byte verbatim (after uppercasing it and rejecting non-printable/non-ASCII bytes); the module maps it to the correct flap index itself. The gateway only deals in flap indices when you explicitly send `m<id>+<index>`. The table below is the module's flap order, provided for reference when interpreting EEPROM dumps:
 
 ```
  0  SPACE    1  A    2  B    3  C    4  D    5  E    6  F    7  G
@@ -353,7 +391,10 @@ All `POST` endpoints accept `Content-Type: application/json`.
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
-| `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap |
+| `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap, maintenance flag |
+| `GET` | `/api/maintenance` | — | Returns `{ok,on}` — current maintenance-mode state |
+| `POST` | `/api/mqtt/test` | `{"host":"...","port":1883,"user":"...","pass":"..."}` (all optional, defaults to saved config) | Test broker reachability + credentials without touching the live connection |
+| `POST` | `/api/maintenance` | `{"on":true}` | Enable/disable maintenance mode (ignores external MQTT commands) |
 | `GET` | `/api/config` | — | Current configuration (passwords excluded) |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
@@ -400,7 +441,7 @@ Default topic prefix: **`splitflap`** (configurable in Settings → MQTT).
 |---|---|---|
 | `splitflap/rx` | `{"ts":...,"wt":"...","command":"m5-A"}` | Frame received from bus |
 | `splitflap/tx` | `{"ts":...,"wt":"...","command":"m5-A"}` | Frame transmitted to bus |
-| `splitflap/status` | `{"uptime":...,"rx":...,"tx":...,"modules":...,"time":"...","ntpSynced":true,"heap":...}` | Periodic heartbeat |
+| `splitflap/status` | `{"uptime":...,"rx":...,"tx":...,"modules":...,"time":"...","ntpSynced":true,"heap":...}` | Heartbeat, published once per minute |
 | `splitflap/flap/adv` | `"AABBCCDD..."` | Unprovisioned module advertisement |
 | `splitflap/flap/ack` | `{"id":5,"sn":"..."}` | Provisioning acknowledgement |
 | `splitflap/flap/version` | `{"id":5,"ver":"12","reportedId":5,"sn":"..."}` | Version response |
@@ -418,9 +459,11 @@ Default topic prefix: **`splitflap`** (configurable in Settings → MQTT).
 
 ---
 
-## Timezone Configuration
+## Time Configuration
 
-Select your region in **Settings → Timezone** and click **Save Timezone**. Takes effect immediately — no reboot required.
+Select your region in **Settings → Timezone**, optionally set a custom **NTP Server**, and click **Save Time Settings**. Both take effect immediately — no reboot required; the clock re-syncs against the configured server on the next network tick.
+
+The **NTP server** defaults to `pool.ntp.org`. You can point it at a LAN time server (e.g. your router) or an alternative public pool (e.g. `time.google.com`, `time.cloudflare.com`) if you prefer. Leaving the field blank restores the default.
 
 | Region | POSIX TZ string |
 |---|---|
