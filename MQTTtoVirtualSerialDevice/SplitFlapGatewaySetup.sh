@@ -54,6 +54,17 @@ if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
     exit 1
 fi
 
+# This installer performs a system-wide install (system paths, a root-owned
+# systemd service, root-owned files) and therefore must run as root.
+if [ "$(id -u)" -ne 0 ]; then
+    printf "${RED}ERROR:${RST} This installer must be run as root.\n" >&2
+    printf "Re-run it with sudo, for example:\n" >&2
+    printf "  sudo bash SplitFlapGatewaySetup.sh\n" >&2
+    printf "or, for the one-line install:\n" >&2
+    printf "  curl -fsSL <url> | sudo bash\n" >&2
+    exit 1
+fi
+
 ask() {
     # ask <VAR> <prompt> <default>
     local var="$1" prompt="$2" default="$3"
@@ -207,20 +218,20 @@ locate_or_download_bridge() {
 # ---------------------------------------------------------------------------
 clear
 hdr "Split-Flap Gateway -- Bridge Service Setup"
+echo "  This is a system-wide installer and must be run as root (use sudo)."
+echo "  Everything is installed to system paths and owned by root."
+echo
 echo "  This script will:"
 echo "    1. Install Python 3 and pip if they are missing"
-echo "    2. Install sfgw_serial_bridge.py to a directory you choose"
+echo "    2. Install sfgw_serial_bridge.py to a system directory (/opt/sfgw)"
 echo "    3. Optionally install and configure an MQTT broker (Mosquitto),"
 echo "       including an optional username/password and auto-start on boot"
 echo "    4. Install paho-mqtt if not already present"
-echo "    5. Write a config file with your MQTT settings"
-echo "    6. Create and enable a systemd service"
+echo "    5. Write /etc/sfgw-bridge.conf with your MQTT settings"
+echo "    6. Create and enable a root-owned systemd service"
 echo "    7. Tell you exactly what to enter on the gateway's Settings page"
-echo "    8. Optionally install the splitflap-os web app and point it at the"
-echo "       virtual serial port (network setup skipped via --skip-network)"
-echo
-echo "  Run with sudo if you want to install system-wide."
-echo "  No sudo needed for a user-level install."
+echo "    8. Optionally install the splitflap-os web app (to /opt/splitflap-os)"
+echo "       and point it at the virtual serial port (network setup skipped)"
 echo
 if ! ask_yn "Continue?" y; then
     echo "Aborted."; exit 0
@@ -488,32 +499,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Install location
+# Install location (fixed system path -- no prompt)
 # ---------------------------------------------------------------------------
 hdr "Installation directory"
-echo "  Common choices:"
-echo "    /usr/local/bin          -- system-wide (needs sudo)"
-echo "    /opt/sfgw               -- dedicated directory (needs sudo)"
-echo "    $HOME/sfgw          -- user home (no sudo)"
-echo
-# When running as root (e.g. via sudo), default to a system-wide location;
-# otherwise default to the user's home so no sudo is needed.
-if [ "$EUID" -eq 0 ]; then
-    DEFAULT_INSTALL_DIR="/usr/local/bin"
+# Prefer /opt/sfgw when /opt exists (FHS location for add-on software);
+# otherwise fall back to /usr/local/bin. Always a system path, owned by root.
+if [ -d /opt ]; then
+    INSTALL_DIR="/opt/sfgw"
 else
-    DEFAULT_INSTALL_DIR="$HOME/sfgw"
+    INSTALL_DIR="/usr/local/bin"
 fi
-ask INSTALL_DIR "Install directory" "$DEFAULT_INSTALL_DIR"
-INSTALL_DIR="${INSTALL_DIR%/}"
 
 if [ ! -d "$INSTALL_DIR" ]; then
     mkdir -p "$INSTALL_DIR" || die "Cannot create $INSTALL_DIR"
-    ok "Created $INSTALL_DIR"
 fi
+chown root:root "$INSTALL_DIR" 2>/dev/null || true
+ok "Install directory: $INSTALL_DIR"
 
 BRIDGE_DEST="${INSTALL_DIR}/sfgw_serial_bridge.py"
 cp "$BRIDGE_SRC" "$BRIDGE_DEST"
-chmod +x "$BRIDGE_DEST"
+chown root:root "$BRIDGE_DEST" 2>/dev/null || true
+chmod 755 "$BRIDGE_DEST"
 ok "Installed bridge script: $BRIDGE_DEST"
 
 # Verify the installed script accepts --config
@@ -557,32 +563,21 @@ else
 fi
 
 hdr "Virtual serial port"
-ask LINK_PATH "Symlink path for virtual port" "/tmp/ttyVSF0"
+# Fixed default path -- no prompt.
+LINK_PATH="/tmp/ttyVSF0"
+ok "Virtual serial port: $LINK_PATH"
 
 VERBOSE="false"
 if ask_yn "Enable verbose logging (prints each frame)?" n; then
     VERBOSE="true"
 fi
 
-# Decide config file location
-if [[ "$INSTALL_DIR" == "$HOME"* ]]; then
-    CFG_DIR="$HOME/.config/sfgw-bridge"
-    CFG_FILE="$CFG_DIR/config.ini"
-    SYSTEMD_DIR="$HOME/.config/systemd/user"
-    SYSTEMD_USER_FLAG="--user"
-    SYSTEMD_WANTED_BY="default.target"
-    RUN_AS_USER="$USER"
-else
-    CFG_DIR="/etc"
-    CFG_FILE="/etc/sfgw-bridge.conf"
-    SYSTEMD_DIR="/etc/systemd/system"
-    SYSTEMD_USER_FLAG=""
-    SYSTEMD_WANTED_BY="multi-user.target"
-    # For a system service, run as the human who invoked sudo (if any) rather
-    # than root, so the bridge has a normal user's permissions. Fall back to
-    # the current user when not under sudo.
-    RUN_AS_USER="${SUDO_USER:-$USER}"
-fi
+# System-wide, root-owned locations (this installer is root-only).
+CFG_DIR="/etc"
+CFG_FILE="/etc/sfgw-bridge.conf"
+SYSTEMD_DIR="/etc/systemd/system"
+SYSTEMD_WANTED_BY="multi-user.target"
+RUN_AS_USER="root"
 
 mkdir -p "$CFG_DIR"
 cat > "$CFG_FILE" << CFGEOF
@@ -597,8 +592,18 @@ password = ${MQTT_PASS}
 link    = ${LINK_PATH}
 verbose = ${VERBOSE}
 CFGEOF
+chown root:root "$CFG_FILE" 2>/dev/null || true
 chmod 600 "$CFG_FILE"   # protect credentials
 ok "Config file written: $CFG_FILE"
+
+# ---------------------------------------------------------------------------
+# Serial port access
+# ---------------------------------------------------------------------------
+# The service runs as root, which can open any serial device regardless of the
+# dialout/uucp group, so no group membership changes are needed. (The bridge's
+# virtual PTY is also root-owned.)
+hdr "Serial port access"
+ok "Service runs as root -- full access to serial devices, no group changes needed"
 
 # ---------------------------------------------------------------------------
 # systemd service
@@ -609,17 +614,6 @@ SERVICE_NAME="sfgw-bridge"
 SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 mkdir -p "$SYSTEMD_DIR"
 
-# A user service (systemctl --user) must NOT contain a User= directive -- it
-# already runs as the invoking user, and including User= makes systemd reject
-# the unit ("control process exited with error code"). Only set User= for a
-# system-level service. The trailing newline is embedded so that, when omitted,
-# no blank line is left in the unit file.
-if [ "$SYSTEMD_USER_FLAG" = "--user" ]; then
-    SVC_USER_LINE=""
-else
-    SVC_USER_LINE="User=${RUN_AS_USER}"$'\n'
-fi
-
 cat > "$SERVICE_FILE" << SVCEOF
 [Unit]
 Description=Split-Flap Gateway RS485 Serial Bridge
@@ -629,7 +623,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-${SVC_USER_LINE}ExecStart=${PYTHON} ${BRIDGE_DEST} --config ${CFG_FILE}
+User=root
+ExecStart=${PYTHON} ${BRIDGE_DEST} --config ${CFG_FILE}
 Restart=on-failure
 RestartSec=10
 # Give the virtual port time to settle before dependent services start
@@ -646,6 +641,8 @@ SyslogIdentifier=sfgw-bridge
 WantedBy=${SYSTEMD_WANTED_BY}
 SVCEOF
 
+chown root:root "$SERVICE_FILE" 2>/dev/null || true
+chmod 644 "$SERVICE_FILE"
 ok "Service file written: $SERVICE_FILE"
 
 # ---------------------------------------------------------------------------
@@ -653,73 +650,30 @@ ok "Service file written: $SERVICE_FILE"
 # ---------------------------------------------------------------------------
 hdr "Enabling and starting service"
 
-if [ "$SYSTEMD_USER_FLAG" = "--user" ]; then
-    # User-level service
-    systemctl --user daemon-reload
-    systemctl --user enable "$SERVICE_NAME"
-    # A --user service only runs while the user has an active login session
-    # unless "lingering" is enabled. Enable it so the bridge starts at boot.
-    if command -v loginctl &>/dev/null; then
-        if loginctl enable-linger "$USER" 2>/dev/null; then
-            ok "Enabled lingering so the service starts at boot"
-        else
-            warn "Could not enable lingering (needs sudo). To start at boot, run:"
-            warn "    sudo loginctl enable-linger $USER"
-        fi
-    fi
-    if ask_yn "Start the service now?" y; then
-        systemctl --user start "$SERVICE_NAME"
-        sleep 2
-        if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-            ok "Service is running"
-        else
-            warn "Service did not start cleanly. Recent log output:"
-            echo
-            systemctl --user status "$SERVICE_NAME" --no-pager -l 2>&1 | sed 's/^/    /' | head -n 20 || true
-            journalctl --user -u "$SERVICE_NAME" -n 20 --no-pager 2>&1 | sed 's/^/    /' || true
-            echo
-            echo "  Full logs:  journalctl --user -u $SERVICE_NAME -n 40"
-        fi
-    fi
-    echo
-    info "Service management commands:"
-    info "  systemctl --user status  $SERVICE_NAME"
-    info "  systemctl --user stop    $SERVICE_NAME"
-    info "  systemctl --user start   $SERVICE_NAME"
-    info "  systemctl --user restart $SERVICE_NAME"
-    info "  journalctl --user -u $SERVICE_NAME -f"
-else
-    # System-level service
-    if [ "$EUID" -ne 0 ]; then
-        warn "Not running as root -- using sudo for systemctl commands"
-        SUDO="sudo"
+# Always a system service running as root.
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+if ask_yn "Start the service now?" y; then
+    systemctl start "$SERVICE_NAME"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "Service is running"
     else
-        SUDO=""
+        warn "Service did not start cleanly. Recent log output:"
+        echo
+        systemctl status "$SERVICE_NAME" --no-pager -l 2>&1 | sed 's/^/    /' | head -n 20 || true
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>&1 | sed 's/^/    /' || true
+        echo
+        echo "  Full logs:  journalctl -u $SERVICE_NAME -n 40"
     fi
-    $SUDO systemctl daemon-reload
-    $SUDO systemctl enable "$SERVICE_NAME"
-    if ask_yn "Start the service now?" y; then
-        $SUDO systemctl start "$SERVICE_NAME"
-        sleep 2
-        if $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
-            ok "Service is running"
-        else
-            warn "Service did not start cleanly. Recent log output:"
-            echo
-            $SUDO systemctl status "$SERVICE_NAME" --no-pager -l 2>&1 | sed 's/^/    /' | head -n 20 || true
-            $SUDO journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>&1 | sed 's/^/    /' || true
-            echo
-            echo "  Full logs:  journalctl -u $SERVICE_NAME -n 40"
-        fi
-    fi
-    echo
-    info "Service management commands:"
-    info "  systemctl status  $SERVICE_NAME"
-    info "  systemctl stop    $SERVICE_NAME"
-    info "  systemctl start   $SERVICE_NAME"
-    info "  systemctl restart $SERVICE_NAME"
-    info "  journalctl -u $SERVICE_NAME -f"
 fi
+echo
+info "Service management commands:"
+info "  systemctl status  $SERVICE_NAME"
+info "  systemctl stop    $SERVICE_NAME"
+info "  systemctl start   $SERVICE_NAME"
+info "  systemctl restart $SERVICE_NAME"
+info "  journalctl -u $SERVICE_NAME -f"
 
 # ---------------------------------------------------------------------------
 # Optional: download and install the splitflap-os web application
@@ -755,9 +709,13 @@ if ask_yn "Download and install splitflap-os now?" n; then
     if ! command -v git &>/dev/null; then
         warn "git still not available -- skipping splitflap-os install."
     else
-        ask SFOS_PARENT "Directory to install splitflap-os into" "$HOME"
-        SFOS_PARENT="${SFOS_PARENT%/}"
-        SFOS_DIR="${SFOS_PARENT}/splitflap-os"
+        # Fixed system location (prefer /opt), root-owned, no prompt.
+        if [ -d /opt ]; then
+            SFOS_DIR="/opt/splitflap-os"
+        else
+            SFOS_DIR="/usr/local/splitflap-os"
+        fi
+        info "Installing splitflap-os to $SFOS_DIR"
 
         clone_ok=""
         if [ -d "$SFOS_DIR/.git" ]; then
@@ -774,7 +732,8 @@ if ask_yn "Download and install splitflap-os now?" n; then
         fi
 
         if [ -n "$clone_ok" ]; then
-            ok "splitflap-os downloaded to $SFOS_DIR"
+            chown -R root:root "$SFOS_DIR" 2>/dev/null || true
+            ok "splitflap-os downloaded to $SFOS_DIR (root-owned)"
 
             # Configure server/settings.json to use the bridge's virtual port
             # BEFORE running the installer, so the app starts already pointed at
@@ -815,11 +774,13 @@ PYEOF
             # Run the installer with --skip-network.
             if [ -f "$SFOS_DIR/setup/install.sh" ]; then
                 echo
-                info "Running the splitflap-os installer (sudo, --skip-network)..."
-                need_sudo
-                if ( cd "$SFOS_DIR" && $SUDO bash setup/install.sh --skip-network ); then
+                info "Running the splitflap-os installer (--skip-network)..."
+                if ( cd "$SFOS_DIR" && bash setup/install.sh --skip-network ); then
                     ok "splitflap-os installed"
                     SFOS_INSTALLED="yes"
+                    # Keep everything root-owned even if the installer created
+                    # files as another user.
+                    chown -R root:root "$SFOS_DIR" 2>/dev/null || true
                     # The installer may regenerate settings.json; re-apply our
                     # serial_port afterwards to be safe.
                     "$PYTHON" - "$SFOS_SETTINGS" "$LINK_PATH" << 'PYEOF' || true
@@ -844,7 +805,7 @@ PYEOF
                 else
                     warn "The splitflap-os installer reported an error."
                     warn "You can re-run it manually:"
-                    warn "    cd $SFOS_DIR && sudo bash setup/install.sh --skip-network"
+                    warn "    cd $SFOS_DIR && bash setup/install.sh --skip-network"
                 fi
             else
                 warn "setup/install.sh not found in the cloned repo."
