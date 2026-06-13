@@ -455,7 +455,14 @@ echo "    /usr/local/bin          -- system-wide (needs sudo)"
 echo "    /opt/sfgw               -- dedicated directory (needs sudo)"
 echo "    $HOME/sfgw          -- user home (no sudo)"
 echo
-ask INSTALL_DIR "Install directory" "$HOME/sfgw"
+# When running as root (e.g. via sudo), default to a system-wide location;
+# otherwise default to the user's home so no sudo is needed.
+if [ "$EUID" -eq 0 ]; then
+    DEFAULT_INSTALL_DIR="/usr/local/bin"
+else
+    DEFAULT_INSTALL_DIR="$HOME/sfgw"
+fi
+ask INSTALL_DIR "Install directory" "$DEFAULT_INSTALL_DIR"
 INSTALL_DIR="${INSTALL_DIR%/}"
 
 if [ ! -d "$INSTALL_DIR" ]; then
@@ -522,13 +529,18 @@ if [[ "$INSTALL_DIR" == "$HOME"* ]]; then
     CFG_FILE="$CFG_DIR/config.ini"
     SYSTEMD_DIR="$HOME/.config/systemd/user"
     SYSTEMD_USER_FLAG="--user"
+    SYSTEMD_WANTED_BY="default.target"
     RUN_AS_USER="$USER"
 else
     CFG_DIR="/etc"
     CFG_FILE="/etc/sfgw-bridge.conf"
     SYSTEMD_DIR="/etc/systemd/system"
     SYSTEMD_USER_FLAG=""
-    RUN_AS_USER="$USER"
+    SYSTEMD_WANTED_BY="multi-user.target"
+    # For a system service, run as the human who invoked sudo (if any) rather
+    # than root, so the bridge has a normal user's permissions. Fall back to
+    # the current user when not under sudo.
+    RUN_AS_USER="${SUDO_USER:-$USER}"
 fi
 
 mkdir -p "$CFG_DIR"
@@ -556,17 +568,27 @@ SERVICE_NAME="sfgw-bridge"
 SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 mkdir -p "$SYSTEMD_DIR"
 
+# A user service (systemctl --user) must NOT contain a User= directive -- it
+# already runs as the invoking user, and including User= makes systemd reject
+# the unit ("control process exited with error code"). Only set User= for a
+# system-level service. The trailing newline is embedded so that, when omitted,
+# no blank line is left in the unit file.
+if [ "$SYSTEMD_USER_FLAG" = "--user" ]; then
+    SVC_USER_LINE=""
+else
+    SVC_USER_LINE="User=${RUN_AS_USER}"$'\n'
+fi
+
 cat > "$SERVICE_FILE" << SVCEOF
 [Unit]
 Description=Split-Flap Gateway RS485 Serial Bridge
-Documentation=https://github.com/your-repo/split-flap-gateway
+Documentation=https://github.com/avandeputte/SplitFlapGateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=${RUN_AS_USER}
-ExecStart=${PYTHON} ${BRIDGE_DEST} --config ${CFG_FILE}
+${SVC_USER_LINE}ExecStart=${PYTHON} ${BRIDGE_DEST} --config ${CFG_FILE}
 Restart=on-failure
 RestartSec=10
 # Give the virtual port time to settle before dependent services start
@@ -580,7 +602,7 @@ StandardError=journal
 SyslogIdentifier=sfgw-bridge
 
 [Install]
-WantedBy=default.target
+WantedBy=${SYSTEMD_WANTED_BY}
 SVCEOF
 
 ok "Service file written: $SERVICE_FILE"
@@ -594,16 +616,28 @@ if [ "$SYSTEMD_USER_FLAG" = "--user" ]; then
     # User-level service
     systemctl --user daemon-reload
     systemctl --user enable "$SERVICE_NAME"
+    # A --user service only runs while the user has an active login session
+    # unless "lingering" is enabled. Enable it so the bridge starts at boot.
+    if command -v loginctl &>/dev/null; then
+        if loginctl enable-linger "$USER" 2>/dev/null; then
+            ok "Enabled lingering so the service starts at boot"
+        else
+            warn "Could not enable lingering (needs sudo). To start at boot, run:"
+            warn "    sudo loginctl enable-linger $USER"
+        fi
+    fi
     if ask_yn "Start the service now?" y; then
         systemctl --user start "$SERVICE_NAME"
         sleep 2
         if systemctl --user is-active --quiet "$SERVICE_NAME"; then
             ok "Service is running"
         else
-            warn "Service did not start cleanly"
+            warn "Service did not start cleanly. Recent log output:"
             echo
-            echo "  Check logs with:"
-            echo "    journalctl --user -u $SERVICE_NAME -n 40"
+            systemctl --user status "$SERVICE_NAME" --no-pager -l 2>&1 | sed 's/^/    /' | head -n 20 || true
+            journalctl --user -u "$SERVICE_NAME" -n 20 --no-pager 2>&1 | sed 's/^/    /' || true
+            echo
+            echo "  Full logs:  journalctl --user -u $SERVICE_NAME -n 40"
         fi
     fi
     echo
@@ -629,10 +663,12 @@ else
         if $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
             ok "Service is running"
         else
-            warn "Service did not start cleanly"
+            warn "Service did not start cleanly. Recent log output:"
             echo
-            echo "  Check logs with:"
-            echo "    journalctl -u $SERVICE_NAME -n 40"
+            $SUDO systemctl status "$SERVICE_NAME" --no-pager -l 2>&1 | sed 's/^/    /' | head -n 20 || true
+            $SUDO journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>&1 | sed 's/^/    /' || true
+            echo
+            echo "  Full logs:  journalctl -u $SERVICE_NAME -n 40"
         fi
     fi
     echo
