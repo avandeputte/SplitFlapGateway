@@ -51,10 +51,16 @@
 #include <ArduinoOTA.h>
 #include <Update.h>
 #include <FFat.h>
+#include <ESPmDNS.h>
 
 // Early-declared debug flag so DBG() works before cfg is constructed.
 // Kept in sync with cfg.serialDebug in loadConfig() and handleApiConfigSettings().
 static volatile bool gSerialDebug = false;
+// Maintenance mode: when true, external commands arriving via MQTT are ignored
+// and not relayed to the RS-485 bus. The web UI / REST API (the gateway itself)
+// continue to work normally. Always OFF at boot -- never persisted -- so a
+// reboot is a guaranteed return to normal operation.
+static volatile bool gMaintenanceMode = false;
 #define DBG(...) do { if (gSerialDebug) printf(__VA_ARGS__); } while(0)
 
 /* ----------------------------------------------------------
@@ -74,7 +80,7 @@ static volatile bool gSerialDebug = false;
 #define PCF85063_SEC_REG  0x04
 #define PCF85063_CTRL1    0x00
 #define RTC_YEAR_OFFSET   2000  // PCF85063 reg 6 is 0-99 = 2000-2099
-#define NTP_SERVER        "pool.ntp.org"
+#define DEFAULT_NTP_SERVER "pool.ntp.org"   // overridable via Settings
 #define NTP_TIMEOUT_MS    8000UL
 
 struct RtcTime {
@@ -85,14 +91,42 @@ struct RtcTime {
 static volatile RtcTime rtcNow = {2000,1,1,0,0,0,false};
 // POSIX TZ string -- declared here (before cfg) so rtcFormatTime can use it.
 static char gPosixTZ[64] = "UTC0";
+
+// Runtime configuration. Declared here (well before its first use in
+// rtcNTPSync) because several time/RTC helpers above the main config section
+// need cfg.ntpServer / cfg.posixTZ. Defaults and persistence live further down
+// in cfgSetDefaults() / loadConfig() / saveConfig().
+struct GwConfig {
+  char          wifiSSID[64];
+  char          wifiPass[64];
+  char          mqttHost[64];
+  int           mqttPort;
+  char          mqttUser[64];
+  char          mqttPass[64];
+  char          mqttPrefix[32];
+  unsigned long rs485Baud;
+  uint8_t       rs485DataBits;
+  uint8_t       rs485Parity;
+  uint8_t       rs485StopBits;
+  char          posixTZ[64];   // POSIX TZ string e.g. "EST5EDT,M3.2.0,M11.1.0"
+  char          ntpServer[64]; // NTP server hostname (default pool.ntp.org)
+  bool          serialDebug;   // enable verbose serial output
+  char          otaPassword[32]; // OTA update password (blank = no auth)
+};
+GwConfig cfg;
 // Mutex protecting setenv/tzset/localtime (not thread-safe in newlib)
 static SemaphoreHandle_t     timeMutex     = NULL;
 static StaticSemaphore_t     timeMutexBuf;
 // Watchdog timestamps -- each task writes millis() here every iteration
 static volatile unsigned long wdgRS485Ms   = 0;
+static volatile unsigned long gLastRxMs    = 0;  // millis() of last byte received on the bus
 static int                    mqttFailCount = 0;  // consecutive MQTT connect failures
 static volatile unsigned long wdgNetMs     = 0;
 static volatile unsigned long wdgWebMs     = 0;
+// Task handles -- used for uxTaskGetStackHighWaterMark on the Status page so
+// stack pressure is visible BEFORE it becomes a canary crash.
+static TaskHandle_t hTaskRTC = NULL, hTaskRS485 = NULL, hTaskOTA = NULL,
+                    hTaskWeb = NULL, hTaskNet = NULL;
 // MQTT outbound queue -- RS485/web tasks enqueue; network task publishes
 
 static uint8_t rtcDecToBcd(int v)     { return (uint8_t)((v/10*16)+(v%10)); }
@@ -149,8 +183,9 @@ static void rtcWriteUnix(time_t t) {
 // We never pass a tz offset to configTime -- that avoids mktime/gmtime
 // double-offset bugs entirely.
 static bool rtcNTPSync() {
-  DBG("[NTP] Syncing (UTC)...\n");
-  configTime(0, 0, NTP_SERVER);  // always fetch UTC
+  const char* ntpSrv = cfg.ntpServer[0] ? cfg.ntpServer : DEFAULT_NTP_SERVER;
+  DBG("[NTP] Syncing (UTC) via %s...\n", ntpSrv);
+  configTime(0, 0, ntpSrv);  // always fetch UTC
   struct tm info;
   unsigned long start = millis();
   while (!getLocalTime(&info, 200)) {
@@ -241,9 +276,21 @@ static unsigned long rtcEpochNow() {
 #define DEFAULT_BAUD         9600UL
 #define DEFAULT_MQTT_PORT    1883
 #define DEFAULT_MQTT_PREFIX  "splitflap"
+#define FW_VERSION           "1.0"   // gateway firmware version (UI + boot log)
 #define MSG_RING_SIZE        64
 #define MSG_MAX_BYTES        256
-#define MQTT_BUF_SIZE        512
+// Outbound frames may be longer than the 256-byte monitor-ring entry size --
+// a full 64-flap restore command (mXW<sn>:<offset>:<steps>:<map>) can reach
+// ~620 bytes. TX_MAX_BYTES bounds what rs485Send will transmit; the monitor
+// ring still stores only the first MSG_MAX_BYTES for display.
+#define TX_MAX_BYTES         768
+// Half-duplex collision avoidance: before transmitting, wait until the bus has
+// been quiet for TX_BUS_GUARD_MS (so we never stomp on an in-flight module
+// response train), capped at TX_BUS_WAIT_CAP_MS so a noisy bus can't block
+// transmit forever. 12ms ~= 12 byte-times at 9600 baud.
+#define TX_BUS_GUARD_MS      12
+#define TX_BUS_WAIT_CAP_MS   400
+#define MQTT_BUF_SIZE       768   // holds a full restore command via MQTT
 #define MQTT_Q_SIZE 32
 struct MqttQItem { char topic[48]; char payload[MQTT_BUF_SIZE]; size_t len; };
 static MqttQItem             mqttQueue[MQTT_Q_SIZE];
@@ -251,20 +298,20 @@ static volatile int          mqttQHead     = 0;
 static volatile int          mqttQTail     = 0;
 static SemaphoreHandle_t     mqttQMutex    = NULL;
 static StaticSemaphore_t     mqttQMutexBuf;
-#define STATUS_INTERVAL_MS   10000UL
+#define STATUS_INTERVAL_MS   60000UL   // MQTT status publish cadence (1/min)
 #define MODULE_STALE_SECS    21600UL   // 6h: prune modules not seen in this long
 #define MODULE_SAVE_DEBOUNCE_MS 5000UL // coalesce NVS writes
 
 /* ----------------------------------------------------------
-   Split-flap character set (must match module firmware)
----------------------------------------------------------- */
-static const char FLAP_CHARS[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw";
-#define FLAP_CHAR_COUNT  64   // length of FLAP_CHARS
-
-/* ----------------------------------------------------------
    Module registry  (tracks known modules on the bus)
 ---------------------------------------------------------- */
-#define MAX_MODULES         200   // supports up to ~200 modules
+// Supports module IDs 0-254 (255 modules). id==255 is reserved as the
+// empty-slot / unprovisioned sentinel, so the array needs one slot per usable
+// ID. Frame buffers (MSG_MAX_BYTES / TX_MAX_BYTES / MQTT_BUF_SIZE) are sized by
+// the 64-flap dump/restore MAP, not by module count -- a frame targets a single
+// module -- so they are unaffected by this bound. 3-digit IDs (vs 2) add ~1
+// byte to a handful of commands, still far inside TX_MAX_BYTES.
+#define MAX_MODULES         255   // module IDs 0-254
 
 struct SFModule {
   uint8_t  id;               // 0-254; 255 = slot empty
@@ -290,7 +337,7 @@ static int      sfModuleCount = 0;
 // Replaces the per-module dumpData cache (saves 256 bytes * MAX_MODULES of RAM).
 // handleApiDump records the id it is waiting for, then polls for a match.
 static volatile int           sfDumpWaitId   = -1;   // module id handleApiDump is waiting on
-static char                   sfDumpCapture[MSG_MAX_BYTES] = "";  // raw dump after 'd:'
+static char                   sfDumpCapture[TX_MAX_BYTES] = "";  // raw dump after 'd:'
 static volatile unsigned long sfDumpCaptureTs = 0;   // millis() when captured (0=none)
 static volatile bool          sfModulesDirty   = false;  // pending NVS save
 static volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
@@ -299,24 +346,6 @@ static bool          ntpSynced   = false; // declared early; also set in taskNet
 /* ----------------------------------------------------------
    Persistent configuration stored in NVS
 ---------------------------------------------------------- */
-struct GwConfig {
-  char          wifiSSID[64];
-  char          wifiPass[64];
-  char          mqttHost[64];
-  int           mqttPort;
-  char          mqttUser[64];
-  char          mqttPass[64];
-  char          mqttPrefix[32];
-  unsigned long rs485Baud;
-  uint8_t       rs485DataBits;
-  uint8_t       rs485Parity;
-  uint8_t       rs485StopBits;
-  char          posixTZ[64];   // POSIX TZ string e.g. "EST5EDT,M3.2.0,M11.1.0"
-  bool          serialDebug;   // enable verbose serial output
-  char          otaPassword[32]; // OTA update password (blank = no auth)
-};
-
-GwConfig cfg;
 Preferences prefs;
 
 
@@ -329,6 +358,7 @@ void cfgSetDefaults() {
   cfg.rs485StopBits = 1;
   strlcpy(cfg.mqttPrefix, DEFAULT_MQTT_PREFIX, sizeof(cfg.mqttPrefix));
   strlcpy(cfg.posixTZ, "UTC0", sizeof(cfg.posixTZ));
+  strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
   cfg.serialDebug = false;
   gSerialDebug    = false;
   strlcpy(cfg.otaPassword, "", sizeof(cfg.otaPassword));
@@ -351,6 +381,7 @@ void loadConfig() {
   cfg.rs485Parity     = prefs.getUChar("parity",  0);
   cfg.rs485StopBits   = prefs.getUChar("sbits",   1);
   strlcpy(cfg.posixTZ, prefs.getString("tz", "UTC0").c_str(), sizeof(cfg.posixTZ));
+  strlcpy(cfg.ntpServer, prefs.getString("ntp", DEFAULT_NTP_SERVER).c_str(), sizeof(cfg.ntpServer));
   cfg.serialDebug = prefs.getBool("dbgSerial", false);
   gSerialDebug    = cfg.serialDebug;
   strlcpy(cfg.otaPassword, prefs.getString("otaPass", "").c_str(), sizeof(cfg.otaPassword));
@@ -363,6 +394,7 @@ void loadConfig() {
 void saveConfig() {
   prefs.begin("splitflap", false);
   prefs.putString("wSSID",  cfg.wifiSSID);
+  prefs.putString("ntp",    cfg.ntpServer);
   prefs.putString("wPASS",  cfg.wifiPass);
   prefs.putString("mqHost", cfg.mqttHost);
   prefs.putInt   ("mqPort", cfg.mqttPort);
@@ -387,11 +419,15 @@ struct RS485Msg {
   char          dir;
   uint8_t       data[MSG_MAX_BYTES];
   size_t        len;
-  char          wallTime[24];
+  char          wallTime[24];   // gateway-TZ string (MQTT / serial debug)
+  unsigned long epoch;          // UTC epoch at capture (0 if RTC not valid);
+                                // the web UI renders this in the BROWSER's
+                                // local timezone -- no gateway TZ config needed
 };
 
 // Explicit prototypes - must appear after struct, before function bodies,
 // to prevent the Arduino IDE preprocessor inserting them above the struct.
+bool sfValidSN(const char* sn);
 void ringPush(const RS485Msg& m);
 String ringDrain();
 void mqttPublishMsg(const RS485Msg& m);
@@ -418,7 +454,11 @@ String ringDrain() {
   xSemaphoreGive(msgMutex);
 
   String out;
-  out.reserve(512);  // pre-allocate to reduce realloc churn
+  // Reserve for the actual pending count (~330 bytes/message worst case:
+  // 256 escaped chars + JSON overhead). A fixed 512 caused repeated reallocs
+  // after a burst filled the ring (up to 64 messages = ~21KB).
+  int pending = (head - msgPollCursor + MSG_RING_SIZE) % MSG_RING_SIZE;
+  out.reserve((size_t)pending * 330 + 16);
   out = "[";
   bool first = true;
   int i = msgPollCursor;
@@ -438,6 +478,7 @@ String ringDrain() {
     }
     ascii[ai] = 0;
     out += "{\"ts\":";      out += m.timestamp;
+    out += ",\"ep\":";      out += m.epoch;
     out += ",\"wt\":\"";    out += m.wallTime;  out += '"';
     out += ",\"dir\":\"";   out += m.dir;       out += '"';
     out += ",\"command\":\""; out += ascii;       out += '"';
@@ -456,6 +497,7 @@ String ringDrain() {
 HardwareSerial         rs485(1);
 volatile unsigned long rxCount = 0;
 volatile unsigned long txCount = 0;
+volatile unsigned long sfParseRejects = 0;  // corrupt/garbled frames rejected at parse
 
 static uint32_t buildSerialConfig() {
   struct Entry { uint8_t d, p, s; uint32_t c; };
@@ -477,6 +519,13 @@ static uint32_t buildSerialConfig() {
 }
 
 void rs485Begin() {
+  // Enlarge the UART RX buffer BEFORE begin(). The default is 256 bytes, but a
+  // full EEPROM dump response is ~565 bytes and streams in over ~590ms at 9600
+  // baud. If taskRS485 is briefly preempted by other core-0 work while the frame
+  // arrives, a 256-byte buffer (plus the 128-byte HW FIFO) can overflow and the
+  // driver silently DROPS bytes -- producing mid-frame corruption. A 1024-byte
+  // buffer holds a full frame with margin. Must be set before begin() to apply.
+  rs485.setRxBufferSize(1024);
   rs485.begin(cfg.rs485Baud, buildSerialConfig(), RS485_RX_PIN, RS485_TX_PIN);
   rs485.setPins(-1, -1, -1, RS485_EN_PIN);
   rs485.setMode(UART_MODE_RS485_HALF_DUPLEX);
@@ -484,20 +533,40 @@ void rs485Begin() {
 }
 
 void rs485Send(const uint8_t* data, size_t len) {
-  if (!len || len > MSG_MAX_BYTES) return;
+  if (!len || len > TX_MAX_BYTES) return;
+  // Collision avoidance on the half-duplex bus: if modules are mid-response
+  // (e.g. the staggered reply train after a broadcast m*v), transmitting now
+  // would fight their drivers, corrupting bytes and destroying the newline
+  // terminators (observed as glued/garbled frames and poisoned serial numbers).
+  // Hold off until the bus has been quiet for TX_BUS_GUARD_MS, bounded by
+  // TX_BUS_WAIT_CAP_MS so we always make progress.
+  {
+    unsigned long waitStart = millis();
+    while (millis() - gLastRxMs < TX_BUS_GUARD_MS &&
+           millis() - waitStart < TX_BUS_WAIT_CAP_MS) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
   rs485.write(data, len);
   rs485.flush();
   txCount++;
-  // Log the transmitted frame (strip trailing newline for readability)
-  { char dbg[MSG_MAX_BYTES]; size_t dlen = (len > 0 && data[len-1] == '\n') ? len-1 : len;
+  // Log the transmitted frame (strip trailing newline for readability).
+  // Cap the debug buffer at MSG_MAX_BYTES; long frames are truncated in the log.
+  { char dbg[MSG_MAX_BYTES];
+    size_t dlen = (len > 0 && data[len-1] == '\n') ? len-1 : len;
+    if (dlen > sizeof(dbg) - 1) dlen = sizeof(dbg) - 1;
     memcpy(dbg, data, dlen); dbg[dlen] = '\0';
     DBG("[TX] %s\n", dbg); }
   RS485Msg m;
   m.timestamp = millis();
   m.dir = 'T';
-  m.len = len;
-  memcpy(m.data, data, len);
+  // The monitor ring entry is fixed-size; store at most MSG_MAX_BYTES bytes.
+  // The full frame was already transmitted above -- this copy is for display only.
+  size_t ringLen = (len > MSG_MAX_BYTES) ? MSG_MAX_BYTES : len;
+  m.len = ringLen;
+  memcpy(m.data, data, ringLen);
   rtcFormatTime(m.wallTime, sizeof(m.wallTime));
+  m.epoch = rtcEpochNow();   // UTC epoch; web UI renders in browser-local time
   ringPush(m);
   mqttPublishMsg(m);
 }
@@ -667,6 +736,19 @@ static void sfModulesLoad() {
       pruned++;
       continue;
     }
+    // Skip records whose SN fails validation: a bus collision before the
+    // validation fix could have persisted a garbage SN (e.g. a glued frame
+    // tail). Dropping the record here HEALS the registry -- the module
+    // re-registers with its correct SN on its next version response.
+    {
+      char snChk[21];
+      strlcpy(snChk, recs[i].serialNum, sizeof(snChk));
+      if (snChk[0] && !sfValidSN(snChk)) {
+        DBG("[MOD] dropping persisted record id=%d with corrupt SN\n", recs[i].id);
+        pruned++;
+        continue;
+      }
+    }
     SFModule* m = &sfModules[sfModuleCount++];
     memset(m, 0, sizeof(SFModule));
     m->id            = recs[i].id;
@@ -717,29 +799,28 @@ static void sfModulesPruneStale() {
   if (changed) sfModulesDirty = true;
 }
 
-// Return index in FLAP_CHARS for a character, or -1
-static int flapCharIndex(char c) {
-  const char* p = strchr(FLAP_CHARS, c);
-  return p ? (int)(p - FLAP_CHARS) : -1;
-}
-
 /* ----------------------------------------------------------
    Send split-flap commands
    All generate the ASCII bus protocol and call rs485SendStr()
 ---------------------------------------------------------- */
 
 // Display a character on one module.  addr=-1 = broadcast.
+// The gateway does NOT translate the character to a flap index -- the module
+// firmware does that itself. We only ensure it is a printable ASCII byte and
+// uppercase it (the flap set is uppercase), then send m<id>-<char> verbatim.
 void sfSendChar(int addr, char c) {
+  if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');  // normalize to uppercase
+  if (c < 0x20 || c > 0x7E) return;                     // reject non-printable / non-ASCII
   char buf[24];
   if (addr < 0)
     snprintf(buf, sizeof(buf), "m*-%c\n", c);
   else
     snprintf(buf, sizeof(buf), "m%d-%c\n", addr, c);
   rs485SendStr(buf);
-  // Update local state
+  // Update local state (display char only; the index is the module's concern)
   if (addr >= 0) {
     SFModule* m = sfFindById((uint8_t)addr);
-    if (m) { m->flapChar = c; m->flapIndex = flapCharIndex(c); }
+    if (m) { m->flapChar = c; m->flapIndex = -1; }
   }
 }
 
@@ -755,7 +836,7 @@ void sfSendIndex(int addr, int idx) {
     SFModule* m = sfFindById((uint8_t)addr);
     if (m) {
       m->flapIndex = idx;
-      m->flapChar  = (idx >= 0 && idx < FLAP_CHAR_COUNT) ? FLAP_CHARS[idx] : 0;
+      m->flapChar  = 0;   // unknown without the module's own char table
     }
   }
 }
@@ -912,10 +993,10 @@ void sfSetAutoHome(int addr, bool enable) {
 void sfSendText(int startAddr, const char* text, bool blankUnused) {
   size_t len = strlen(text);
   for (size_t i = 0; i < len; i++) {
-    char c = text[i];
-    if (c >= 'a' && c <= 'z') c = c - 'a' + 'A'; // lowercase -> uppercase
-    if (flapCharIndex(c) == -1) c = ' ';           // unsupported -> blank
-    sfSendChar((int)(startAddr + i), c);
+    // sfSendChar uppercases and rejects non-printable bytes itself; the module
+    // firmware maps the character to a flap index. The gateway does not need
+    // its own character table. A non-ASCII byte is simply dropped by sfSendChar.
+    sfSendChar((int)(startAddr + i), text[i]);
     delay(10); // inter-message gap to avoid bus collision
   }
   // Optionally blank any previously-set modules beyond the text length
@@ -944,12 +1025,33 @@ static inline void sfTouch(SFModule* m) {
   if (ep) m->lastSeenEpoch = ep;
 }
 
+// A serial number is 4..20 alphanumeric characters (in practice 20 hex chars
+// from the module's chip ID). Bus collisions destroy frame terminators and can
+// glue responses together, producing SN tokens containing ':' or raw garbage
+// bytes; storing one of those poisons the registry (and FATFS), after which
+// every SN-addressed command (mXD<sn>, mXW<sn>, ...) silently fails. Validate
+// before EVERY store and on load so corruption can never enter or persist.
+bool sfValidSN(const char* sn) {
+  if (!sn || !sn[0]) return false;
+  size_t n = strlen(sn);
+  if (n < 4 || n > 20) return false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)sn[i];
+    if (!isalnum(c)) return false;
+  }
+  return true;
+}
+
 void sfParseResponse(const uint8_t* data, size_t len) {
   if (len < 2 || data[0] != 'm') return;
 
-  // Convert to null-terminated string for easier parsing
-  char buf[MSG_MAX_BYTES + 1];
-  size_t copyLen = (len < MSG_MAX_BYTES) ? len : MSG_MAX_BYTES;
+  // Convert to null-terminated string for easier parsing.
+  // Sized for long inbound frames (a full dump response is ~590 bytes).
+  // NOTE: static (not stack) -- sfParseResponse is called only from taskRS485
+  // (single caller, no reentrancy), and a 768-byte stack buffer here would
+  // overflow that task's 4KB stack. Keeping it in .bss avoids the overflow.
+  static char buf[TX_MAX_BYTES + 1];
+  size_t copyLen = (len < TX_MAX_BYTES) ? len : TX_MAX_BYTES;
   memcpy(buf, data, copyLen);
   buf[copyLen] = 0;
   // Strip trailing \r\n
@@ -959,6 +1061,11 @@ void sfParseResponse(const uint8_t* data, size_t len) {
   // -- Provisioning advertisement: mXadv:<serialNumber>
   if (strncmp(buf, "mXadv:", 6) == 0) {
     const char* sn = buf + 6;
+    if (!sfValidSN(sn)) {
+      DBG("[SF] rejecting adv with corrupt SN: %s\n", sn);
+      sfParseRejects++;
+      return;
+    }
     xSemaphoreTake(sfMutex, portMAX_DELAY);
     SFModule* m = sfFindBySN(sn);
     if (!m) {
@@ -981,6 +1088,11 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       *colon = 0;
       const char* sn = tmp;
       int newId = atoi(colon + 1);
+      if (!sfValidSN(sn)) {
+        DBG("[SF] rejecting ack with corrupt SN: %s\n", sn);
+      sfParseRejects++;
+        return;
+      }
       xSemaphoreTake(sfMutex, portMAX_DELAY);
       SFModule* m = sfFindBySN(sn);
       if (!m) m = sfUpsert((uint8_t)newId, sn);
@@ -1025,17 +1137,40 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     for (char* cp = verBuf; *cp && fi < 3; cp++) {
       if (*cp == ':') { *cp = '\0'; field[fi++] = cp + 1; }
     }
-    strlcpy(m->fwVersion, field[0] ? field[0] : "?", sizeof(m->fwVersion));
-    if (field[2] && field[2][0]) {
-      strlcpy(m->serialNum, field[2], sizeof(m->serialNum));
+    // A glued/garbled frame (bus collision destroying the newline between two
+    // responses) shows up here as an SN token with embedded ':' or raw garbage
+    // bytes. Reject the WHOLE response: a frame with a corrupt tail cannot be
+    // trusted, and storing its SN would poison the registry and FATFS, breaking
+    // every SN-addressed command for that module from then on.
+    if (field[2] && field[2][0] && !sfValidSN(field[2])) {
+      DBG("[SF] rejecting corrupt version response for module %d (sn:%s)\n",
+          id, field[2]);
+      sfParseRejects++;
+      return;
     }
     int reportedId = (field[1] && field[1][0]) ? atoi(field[1]) : -1;
+    // Write registry fields under the mutex, re-finding the entry by id: the
+    // pointer from the earlier upsert can be invalidated by concurrent array
+    // compaction (sfModulesPruneStale runs every 60s on taskNetwork, and
+    // deprovision can run from taskWeb) -- writing through a stale pointer
+    // would corrupt a DIFFERENT module's record.
+    char fwCopy[8] = "?";
+    if (field[0] && field[0][0]) strlcpy(fwCopy, field[0], sizeof(fwCopy));
+    xSemaphoreTake(sfMutex, portMAX_DELAY);
+    SFModule* mm = sfFindById((uint8_t)id);
+    if (mm) {
+      strlcpy(mm->fwVersion, fwCopy, sizeof(mm->fwVersion));
+      if (field[2] && field[2][0]) {
+        strlcpy(mm->serialNum, field[2], sizeof(mm->serialNum));
+      }
+    }
+    xSemaphoreGive(sfMutex);
     DBG("[SF] Module %d fw:%s reportedId:%d sn:%s\n",
-                  id, m->fwVersion, reportedId, field[2] ? field[2] : "");
+                  id, fwCopy, reportedId, field[2] ? field[2] : "");
     char payload[96];
     snprintf(payload, sizeof(payload),
       "{\"id\":%d,\"ver\":\"%s\",\"reportedId\":%d,\"sn\":\"%s\"}",
-      id, m->fwVersion, reportedId, field[2] ? field[2] : "");
+      id, fwCopy, reportedId, field[2] ? field[2] : "");
     mqttPublishSFEvent("version", payload);
   }
   // Calibration result: m<id>:<steps>
@@ -1051,7 +1186,10 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     DBG("[SF] Module %d dump: %s\n", id, p + 1);
     // Capture into the shared single-slot buffer IF a dump request is
     // waiting for this module id (set by handleApiDump). No per-module cache.
-    char clean[MSG_MAX_BYTES];
+    // Buffers sized for a full dump response (~590 bytes for a 64-flap map).
+    // static (not stack): only taskRS485 reaches here, and 768-byte stack
+    // buffers would overflow its 4KB stack.
+    static char clean[TX_MAX_BYTES];
     strlcpy(clean, p + 1, sizeof(clean));
     size_t dl = strlen(clean);
     while (dl > 0 && (clean[dl-1] == '\n' || clean[dl-1] == '\r')) clean[--dl] = 0;
@@ -1059,7 +1197,10 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       strlcpy(sfDumpCapture, clean, sizeof(sfDumpCapture));
       sfDumpCaptureTs = millis();
     }
-    char payload[MSG_MAX_BYTES];
+    // Size the MQTT-event payload to the queue slot. The REST dump path
+    // (handleApiDump) carries the full untruncated dump; this MQTT event is an
+    // optional notification, so matching the queue size avoids a truncation gap.
+    static char payload[MQTT_BUF_SIZE];
     snprintf(payload, sizeof(payload), "{\"id\":%d,\"dump\":\"%s\"}", id, clean);
     mqttPublishSFEvent("dump", payload);
   }
@@ -1103,8 +1244,11 @@ void mqttPublishMsg(const RS485Msg& m) {
     else                             { ascii[ai++] = '.'; }
   }
   ascii[ai] = 0;
-  // Build JSON with snprintf -- avoids JsonDocument heap allocation in hot path
-  char buf[MQTT_BUF_SIZE];
+  // Build JSON with snprintf -- avoids JsonDocument heap allocation in hot path.
+  // The monitor frame (ascii) is capped at MSG_MAX_BYTES, so the JSON is at most
+  // ~313 bytes; a 384-byte buffer is ample and keeps this off-stack pressure low
+  // (this runs in taskRS485, which has a modest stack).
+  char buf[384];
   size_t n = (size_t)snprintf(buf, sizeof(buf),
     "{\"ts\":%lu,\"wt\":\"%s\",\"command\":\"%s\"}",
     m.timestamp, m.wallTime, ascii);
@@ -1144,8 +1288,19 @@ static void mqttPublishStatus() {
 //   <prefix>/flap/home     {"id":5}  or  {"id":-1}  (broadcast)
 //   <prefix>/flap/provision {"sn":"AABBCC...","id":5}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // Maintenance mode: ignore all externally-originated commands. Nothing from
+  // MQTT is relayed to the bus while this is on; only the gateway's own web UI
+  // / REST API can drive the display.
+  if (gMaintenanceMode) {
+    DBG("[MQTT] ignored (maintenance mode): %s\n", topic);
+    return;
+  }
   if (length >= MQTT_BUF_SIZE) return;
-  char buf[MQTT_BUF_SIZE + 1];
+  // static (not stack): mqttCallback is invoked only from mqtt.loop() in
+  // taskNetwork (single caller, no reentrancy). Three ~768-byte stack buffers
+  // here plus the rs485Send/mqttPublishMsg call chain would push taskNetwork's
+  // 6KB stack toward overflow -- the same failure mode that crashed taskRS485.
+  static char buf[MQTT_BUF_SIZE + 1];
   memcpy(buf, payload, length);
   buf[length] = 0;
 
@@ -1160,7 +1315,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Accept either a plain ASCII frame ("m9h\n") or JSON ({"data":"m9h\n"}).
   if (strcmp(topic, sendTopic) == 0) {
     const char* d = nullptr;
-    char plainBuf[MSG_MAX_BYTES + 1];
+    // Sized for long commands (e.g. a full restore) sent as a plain frame.
+    // static: see note on buf above (single-caller context, stack pressure).
+    static char plainBuf[TX_MAX_BYTES + 1];
     if (buf[0] == '{') {
       // Try JSON
       JsonDocument doc;
@@ -1177,8 +1334,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (_dl > 0 && (d[_dl-1]=='\n'||d[_dl-1]=='\r')) _dl--;
         memcpy(_dbg, d, _dl); _dbg[_dl] = '\0';
         DBG("[MQTT->BUS] %s\n", _dbg); }
-      uint8_t outBuf[MSG_MAX_BYTES];
-      size_t  outLen = min(strlen(d), (size_t)MSG_MAX_BYTES);
+      static uint8_t outBuf[TX_MAX_BYTES];  // static: see note on buf above
+      size_t  outLen = min(strlen(d), (size_t)TX_MAX_BYTES);
       memcpy(outBuf, d, outLen);
       rs485Send(outBuf, outLen);
     }
@@ -1247,7 +1404,21 @@ static void mqttConnect() {
     snprintf(t,sizeof(t),"%s/flap/home",      cfg.mqttPrefix); mqtt.subscribe(t);
     snprintf(t,sizeof(t),"%s/flap/provision", cfg.mqttPrefix); mqtt.subscribe(t);
   } else {
-    printf("[MQTT] Failed rc=%d\n", mqtt.state());
+    int st = mqtt.state();
+    const char* why;
+    switch (st) {                       // PubSubClient state codes
+      case -4: why = "timeout";               break;
+      case -3: why = "connection lost";       break;
+      case -2: why = "connect failed (TCP)";  break;
+      case -1: why = "disconnected";          break;
+      case  1: why = "bad protocol";          break;
+      case  2: why = "bad client id";         break;
+      case  3: why = "server unavailable";    break;
+      case  4: why = "bad credentials";       break;
+      case  5: why = "not authorized";        break;
+      default: why = "unknown";               break;
+    }
+    printf("[MQTT] Failed rc=%d (%s)\n", st, why);
   }
 }
 
@@ -1303,35 +1474,49 @@ void handleRoot() {
   server.sendContent(".row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:140px}");
   server.sendContent(".grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}");
   server.sendContent(".grid3{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}");
-  server.sendContent(".stat{background:#0d1b2a;border-radius:6px;padding:8px;text-align:center}");
-  server.sendContent(".stat .v{font-size:1.2rem;font-weight:bold;color:var(--hi)}.stat .k{font-size:.7rem;color:var(--dim)}");
-  server.sendContent(".mod{background:#0d1b2a;border-radius:6px;padding:8px;border:1px solid var(--acc);font-size:.8rem}");
+  server.sendContent(".stat{background:#0d1b2a;border-radius:8px;padding:12px 8px;text-align:center;border:1px solid #14263a}");
+  server.sendContent(".stat .v{font-size:1.15rem;font-weight:bold;color:var(--hi);word-break:break-all}.stat .k{font-size:.68rem;color:var(--dim);margin-top:3px;text-transform:uppercase;letter-spacing:.04em}");
+  server.sendContent(".sgh{color:var(--dim);font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;margin:0 0 8px 2px}");
+  server.sendContent(".stat .v.vok{color:var(--grn)}.stat .v.vwarn{color:var(--ylw)}.stat .v.vbad{color:var(--hi)}");
+  server.sendContent(".mod{background:#0d1b2a;border-radius:6px;padding:8px 8px 30px 8px;border:1px solid var(--acc);font-size:.8rem;position:relative}");
+  server.sendContent(".verbadge{font-size:.55em;font-weight:normal;color:var(--dim);vertical-align:middle;border:1px solid var(--acc);border-radius:10px;padding:1px 7px;margin-left:6px}");
+  server.sendContent(".micons{position:absolute;bottom:6px;right:6px;display:flex;gap:8px}");
+  server.sendContent(".micon{cursor:pointer;font-size:1rem;line-height:1;opacity:.78;background:none;border:none;padding:2px}.micon:hover{opacity:1}.micon.del{color:var(--hi)}");
+  server.sendContent(".mfield{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px solid #14263a;font-size:.82rem}.mk{color:var(--dim)}.mv{color:var(--txt);word-break:break-all;text-align:right}");
+  server.sendContent(".mmap{font-family:monospace;font-size:.72rem;color:var(--dim);background:#0a1622;border-radius:5px;padding:6px;margin-top:6px;max-height:140px;overflow:auto;word-break:break-all}");
+  server.sendContent(".dbtn{display:block;width:100%;text-align:left;margin:6px 0;padding:10px;border-radius:6px;border:1px solid var(--hi);background:#1a0d0d;color:var(--txt);cursor:pointer}.dbtn:hover{background:#2a1414}.dbtn small{display:block;color:var(--dim);font-size:.74rem;margin-top:2px}");
   server.sendContent(".mod .mid{font-size:1rem;font-weight:bold;color:var(--ylw)}.mod .mc{font-size:.75rem;color:var(--dim)}");
-  server.sendContent(".mod{cursor:pointer;transition:border-color .15s}.mod:hover{border-color:var(--hi)}.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100;align-items:center;justify-content:center}.modal-overlay.on{display:flex}.modal{background:var(--card);border:1px solid var(--acc);border-radius:10px;padding:20px;max-width:560px;width:90%;max-height:80vh;overflow-y:auto}.modal h3{color:var(--hi);margin-bottom:12px}.modal .mfield{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid #0d1b2a;font-size:.85rem}.modal .mfield .mk{color:var(--dim);min-width:120px}.modal .mfield .mv{color:var(--txt);font-family:monospace}.modal .mmap{margin-top:10px;font-size:.78rem;font-family:monospace;background:#080818;padding:8px;border-radius:4px;max-height:160px;overflow-y:auto}");
+  server.sendContent(".hdr-right{display:flex;align-items:center;gap:14px}.maint-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.82rem;color:var(--dim);user-select:none}.maint-toggle input{width:auto;margin:0;cursor:pointer}.maint-toggle.active{color:var(--ylw);font-weight:bold}body.maint-on{box-shadow:inset 0 0 0 3px var(--ylw)}.maint-banner{display:none;background:var(--ylw);color:#1a1206;text-align:center;padding:5px;font-size:.82rem;font-weight:bold}body.maint-on .maint-banner{display:block}");
   server.sendContent(".unprovisioned{border-color:var(--hi)}");
   server.sendContent("#sr{font-size:.8rem;color:var(--grn);min-height:16px;margin-top:5px}");
   server.sendContent("</style></head><body>");
   wdgWebMs = millis();  // touch WDG during long page send
-  server.sendContent("<header><h1>Split-Flap Gateway</h1><span id=\"badge\">...</span></header>");
+  server.sendContent("<header><h1>Split-Flap Gateway <span class=\"verbadge\">v" FW_VERSION "</span></h1><div class=\"hdr-right\"><label class=\"maint-toggle\" title=\"When on, commands received via MQTT are ignored and not relayed to the bus. The web UI keeps working.\"><input id=\"maintChk\" type=\"checkbox\" onchange=\"toggleMaint()\"><span class=\"maint-lbl\">Maintenance</span></label><span id=\"badge\">...</span></div></header>");
+  server.sendContent("<div class=\"maint-banner\">MAINTENANCE MODE - external MQTT commands are being ignored</div>");
   server.sendContent("<nav>");
   server.sendContent("<a class=\"on\" onclick=\"show('modules',this)\">Modules</a>");
   server.sendContent("<a onclick=\"show('display',this)\">Display</a>");
   server.sendContent("<a onclick=\"show('provision',this)\">Provision</a>");
-  server.sendContent("<a onclick=\"show('backup',this)\">Backup</a>");
   server.sendContent("<a onclick=\"show('monitor',this)\">Bus Monitor</a>");
   server.sendContent("<a onclick=\"show('settings',this)\">Settings</a>");
+  server.sendContent("<a onclick=\"show('backup',this)\">Backup</a>");
   server.sendContent("<a onclick=\"show('statusp',this)\">Status</a>");
   server.sendContent("</nav>");
   server.sendContent("<div id=\"pane-modules\" class=\"pane on\">");
   server.sendContent("<div class=\"card\"><h2>Known Modules</h2><div id=\"modGrid\" class=\"grid2\">Loading...</div><button class=\"sec\" onclick=\"refreshModules()\" title=\"Broadcasts m*v to all modules so they report their version and serial number\">&#x21bb; Identify All</button><span id=\"refreshR\" style=\"margin-left:10px;font-size:.8rem;color:var(--grn)\"></span></div>");
-  server.sendContent("<div class=\"card\"><h2>Quick Commands</h2><div class=\"row\"><div><label>Module ID (-1=all)</label><input id=\"qId\" type=\"number\" value=\"-1\" min=\"-1\" max=\"254\"></div><div><label>Character</label><input id=\"qChar\" type=\"text\" maxlength=\"1\" value=\"A\"></div></div>");
-  server.sendContent("<button onclick=\"qSendChar()\">Send Char</button> <button class=\"sec\" onclick=\"qHome()\">Home</button> <button class=\"sec\" onclick=\"qVersion()\">Get Version</button>");
-  server.sendContent("<div id=\"qr\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div></div>");
   server.sendContent("<div id=\"modModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;\" onclick=\"if(event.target===this)closeModal()\"><div style=\"background:var(--card);border:1px solid var(--acc);border-radius:10px;padding:22px;max-width:560px;width:90%;max-height:82vh;overflow-y:auto;\"><div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:10px\"><span style=\"font-size:1.05rem;font-weight:600;color:var(--hi)\" id=\"modModalTitle\">Module EEPROM</span><button class=\"sec\" onclick=\"closeModal()\" style=\"margin:0;padding:3px 10px;font-size:.8rem\">&#x2715;</button></div><div id=\"modModalBody\" style=\"font-size:.85rem\"></div><div style=\"margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap\"><button class=\"sec\" onclick=\"refreshDump()\">&#x21bb; Refresh</button><span id=\"modModalStatus\" style=\"font-size:.78rem;color:var(--ylw)\"></span></div></div></div>");
+  server.sendContent("<div id=\"delModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;\" onclick=\"if(event.target===this)closeDelModal()\"><div style=\"background:var(--card);border:1px solid var(--hi);border-radius:10px;padding:22px;max-width:460px;width:90%;\"><div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:12px\"><span style=\"font-size:1.05rem;font-weight:600;color:var(--hi)\" id=\"delModalTitle\">Destructive Actions</span><button class=\"sec\" onclick=\"closeDelModal()\" style=\"margin:0;padding:3px 10px;font-size:.8rem\">&#x2715;</button></div>");
+  server.sendContent("<p style=\"font-size:.82rem;color:var(--dim);margin-bottom:10px\">These actions cannot be undone. You will be asked to confirm.</p>");
+  server.sendContent("<button class=\"dbtn\" onclick=\"delAction('erase')\">Erase EEPROM<small>Clears the calibration flap map. The module keeps its ID but loses per-flap positions until re-calibrated.</small></button>");
+  server.sendContent("<button class=\"dbtn\" onclick=\"delAction('factoryreset')\">Factory Reset<small>Restores all module settings to firmware defaults (home offset, total steps, flap map).</small></button>");
+  server.sendContent("<button class=\"dbtn\" onclick=\"delAction('deprovision')\">De-provision<small>Sends Reset (R): the module forgets its assigned ID and returns to advertising for re-provisioning.</small></button>");
+  server.sendContent("<div id=\"delModalStatus\" style=\"margin-top:10px;font-size:.8rem;color:var(--ylw)\"></div></div></div>");
+  server.sendContent("</div>");  // close pane-modules
   server.sendContent("<div id=\"pane-display\" class=\"pane\"><div class=\"card\"><h2>Send Text to Display</h2>");
   server.sendContent("<label>Text</label><input id=\"dispText\" type=\"text\" placeholder=\"HELLO WORLD\" style=\"text-transform:uppercase\">");
   server.sendContent("<label>Start Module ID</label><input id=\"dispStart\" type=\"number\" value=\"0\" min=\"0\" max=\"253\">");
   server.sendContent("<button onclick=\"sendText()\">Send to Display</button><div id=\"dr\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
+  server.sendContent("<div class=\"card\"><h2>Send Single Character</h2><div class=\"row\"><div><label>Module ID (-1 = all)</label><input id=\"scId\" type=\"number\" value=\"-1\" min=\"-1\" max=\"254\"></div><div><label>Character</label><input id=\"scChar\" type=\"text\" maxlength=\"1\" value=\"A\" style=\"text-transform:uppercase\"></div></div><button onclick=\"sendChar()\">Send Character</button><div id=\"scr\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("<div class=\"card\"><h2>Send by Index</h2><div class=\"row\"><div><label>Module ID</label><input id=\"idxId\" type=\"number\" value=\"0\" min=\"0\" max=\"254\"></div><div><label>Flap Index (0-63)</label><input id=\"idxVal\" type=\"number\" value=\"0\" min=\"0\" max=\"63\"></div></div><button onclick=\"sendIndex()\">Send Index</button></div></div>");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("<div id=\"pane-provision\" class=\"pane\">");
@@ -1367,9 +1552,11 @@ void handleRoot() {
   server.sendContent("<div id=\"pane-monitor\" class=\"pane\"><div class=\"card\"><h2>RS485 Bus Monitor</h2><div id=\"log\"></div>");
   server.sendContent("<div style=\"display:flex;gap:10px;margin-top:8px;align-items:center;flex-wrap:wrap\">");
   server.sendContent("<button class=\"sec\" onclick=\"clearLog()\">Clear</button>");
-  server.sendContent("<label style=\"margin:0;display:flex;align-items:center;gap:5px;color:var(--txt)\"><input type=\"checkbox\" id=\"asc\" checked style=\"width:auto\"> Auto-scroll</label>");
+  server.sendContent("<button class=\"sec\" onclick=\"downloadLog()\">Download Log</button>");
+  server.sendContent("<label style=\"margin:0;display:flex;align-items:center;gap:5px;color:var(--txt)\"><input type=\"checkbox\" id=\"asc\" checked style=\"width:auto\" onchange=\"saveMonPrefs()\"> Auto-scroll</label>");
+  server.sendContent("<label style=\"margin:0;display:flex;align-items:center;gap:5px;color:var(--txt)\" title=\"Stops fetching new frames. Frames beyond the 64-entry ring are lost while paused.\"><input type=\"checkbox\" id=\"lpause\" style=\"width:auto\" onchange=\"saveMonPrefs()\"> Pause</label>");
   server.sendContent("<span id=\"logCount\" style=\"font-size:.74rem;color:var(--dim)\">0 frames</span></div></div>");
-  server.sendContent("<div class=\"card\"><h2>Send Frame</h2><label>Data (ASCII)</label><textarea id=\"sdata\" rows=\"2\" placeholder=\"m5-A\"></textarea><div id=\"sr\"></div><button onclick=\"doSend()\">Send</button></div></div>");
+  server.sendContent("<div class=\"card\"><h2>Send Frame</h2><label>Data (ASCII)</label><textarea id=\"sdata\" rows=\"2\" placeholder=\"m5-A\" onkeydown=\"if(event.key===&#39;Enter&#39;&&!event.shiftKey){event.preventDefault();doSend();}\"></textarea><div id=\"sr\"></div><button onclick=\"doSend()\">Send</button></div></div>");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("<div id=\"pane-settings\" class=\"pane\">");
   server.sendContent("<div class=\"card\"><h2>WiFi</h2>");
@@ -1384,56 +1571,66 @@ void handleRoot() {
   server.sendContent("<div class=\"row\"><div><label>Username</label><input id=\"mqU\"></div><div><label>Password</label><input id=\"mqPw\" type=\"password\"></div></div>");
   server.sendContent("<label>Topic Prefix</label><input id=\"mqPfx\" placeholder=\"splitflap\">");
   server.sendContent("<p style=\"font-size:.77rem;color:var(--dim);margin-top:4px\">Pub: .../rx &nbsp; .../tx &nbsp; .../status &nbsp; .../flap/adv &nbsp; .../flap/ack<br>Sub: .../flap/set &nbsp; .../flap/home &nbsp; .../flap/provision &nbsp; .../send</p>");
-  server.sendContent("<button onclick=\"saveMqtt()\">Save MQTT</button>");
+  server.sendContent("<button onclick=\"saveMqtt()\">Save MQTT</button> <button class=\"sec\" onclick=\"testMqtt()\">Test Connection</button>");
   server.sendContent("<div id=\"mr\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div>");
   server.sendContent("</div>");
   server.sendContent("<div class=\"card\"><h2>Timezone</h2>");
   server.sendContent("<label>Timezone</label><select id=\"tzSel\"><option value=\"UTC0\">UTC</option><option value=\"PST8PDT,M3.2.0,M11.1.0\">US Pacific (UTC-8/-7)</option><option value=\"MST7MDT,M3.2.0,M11.1.0\">US Mountain (UTC-7/-6)</option><option value=\"MST7\">US Mountain AZ (UTC-7 no DST)</option><option value=\"CST6CDT,M3.2.0,M11.1.0\">US Central (UTC-6/-5)</option><option value=\"EST5EDT,M3.2.0,M11.1.0\">US Eastern (UTC-5/-4)</option><option value=\"BRT3BRST,M10.3.0,M2.3.0\">Sao Paulo (UTC-3/-2)</option><option value=\"AZOT1AZOST,M3.5.0/0,M10.5.0/1\">Azores (UTC-1/0)</option><option value=\"GMT0BST,M3.5.0/1,M10.5.0\">London (UTC+0/+1)</option><option value=\"CET-1CEST,M3.5.0,M10.5.0/3\">Paris/Berlin (UTC+1/+2)</option><option value=\"EET-2EEST,M3.5.0/3,M10.5.0/4\">Helsinki/Athens (UTC+2/+3)</option><option value=\"MSK-3\">Moscow (UTC+3 no DST)</option><option value=\"GST-4\">Dubai (UTC+4 no DST)</option><option value=\"PKT-5\">Karachi (UTC+5 no DST)</option><option value=\"BST-6\">Dhaka (UTC+6 no DST)</option><option value=\"ICT-7\">Bangkok (UTC+7 no DST)</option><option value=\"CST-8\">Shanghai/HK/Singapore (UTC+8)</option><option value=\"JST-9\">Tokyo (UTC+9 no DST)</option><option value=\"AEST-10AEDT,M10.1.0,M4.1.0/3\">Sydney (UTC+10/+11)</option><option value=\"NZST-12NZDT,M9.5.0,M4.1.0/3\">Auckland (UTC+12/+13)</option></select>");
 
   server.sendContent("<p style=\"font-size:.82rem;color:var(--dim);margin-top:4px\">Used for bus monitor timestamps. Takes effect immediately after saving.</p>");
-  server.sendContent("<button onclick=\"saveTz()\">Save Timezone</button>");
+  server.sendContent("<label style=\"margin-top:10px\">NTP Server</label><input id=\"ntpSrv\" type=\"text\" placeholder=\"pool.ntp.org\">");
+  server.sendContent("<p style=\"font-size:.82rem;color:var(--dim);margin-top:4px\">Hostname of the time server used to sync the clock. Default: pool.ntp.org</p>");
+  server.sendContent("<button onclick=\"saveTz()\">Save Time Settings</button>");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("<div id=\"tzR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div>");
   server.sendContent("</div>");
   server.sendContent("<div class=\"card\"><h2>Serial Debug</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Enable verbose serial output on the native USB serial port (115200 baud). Shows every RX/TX frame, MQTT events, and module activity.</p><label style=\"display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--txt)\"><input type=\"checkbox\" id=\"dbgChk\" style=\"width:auto\">Enable Serial Debug Output</label><button onclick=\"saveDebug()\" style=\"margin-top:10px\">Save</button><div id=\"dbgR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("<div class=\"card\"><h2>OTA Firmware Update</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Upload new firmware directly from your browser ? no USB cable or Arduino IDE required.</p><a href=\"/ota\" target=\"_blank\" style=\"display:inline-block;margin-bottom:12px;padding:7px 16px;background:var(--hi);color:#fff;border-radius:4px;text-decoration:none;font-size:.9rem\">Open Firmware Updater &rarr;</a><label style=\"margin-top:8px\">OTA Password</label><input id=\"otaPw\" type=\"password\" placeholder=\"Leave blank for no password\"><p style=\"font-size:.77rem;color:var(--dim);margin-top:4px\">Protects ArduinoOTA (IDE/command-line) uploads. The web updater above is always accessible.</p><button onclick=\"saveOTA()\" style=\"margin-top:6px\">Save OTA Password</button><div id=\"otaR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("</div>");
-  server.sendContent("<div id=\"pane-statusp\" class=\"pane\"><div class=\"card\"><h2>System Status</h2><div class=\"grid3\">");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-up\">-</div><div class=\"k\">Uptime (s)</div></div>");
+  server.sendContent("<div id=\"pane-statusp\" class=\"pane\">");
+  server.sendContent("<div class=\"card\"><h3 class=\"sgh\">Network</h3><div class=\"grid3\">");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ip\">-</div><div class=\"k\">WiFi IP</div></div>");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ap\">-</div><div class=\"k\">AP IP</div></div>");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-mq\">-</div><div class=\"k\">MQTT</div></div>");
+  server.sendContent("</div></div>");
+  server.sendContent("<div class=\"card\"><h3 class=\"sgh\">System Health</h3><div class=\"grid3\">");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-up\">-</div><div class=\"k\">Uptime</div></div>");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-hp\">-</div><div class=\"k\">Free Heap</div></div>");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-mh\">-</div><div class=\"k\">Min Heap Ever</div></div>");
+  server.sendContent("<div class=\"stat\" title=\"Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.\"><div class=\"v\" id=\"s-stk\">-</div><div class=\"k\">Stack Min (task)</div></div>");
+  server.sendContent("</div></div>");
+  server.sendContent("<div class=\"card\"><h3 class=\"sgh\">RS-485 Bus</h3><div class=\"grid3\">");
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-rx\">-</div><div class=\"k\">Frames RX</div></div>");
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-tx\">-</div><div class=\"k\">Frames TX</div></div>");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-bd\">-</div><div class=\"k\">Baud Rate</div></div>");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ip\">-</div><div class=\"k\">STA IP</div></div>");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ap\">-</div><div class=\"k\">AP IP</div></div>");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-hp\">-</div><div class=\"k\">Free Heap</div></div>");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-mq\">-</div><div class=\"k\">MQTT</div></div>");
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-mod\">-</div><div class=\"k\">Modules</div></div>");
-  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-rtc\">-</div><div class=\"k\">RTC Time</div></div>");
+  server.sendContent("</div></div>");
+  server.sendContent("<div class=\"card\"><h3 class=\"sgh\">Clock</h3><div class=\"grid3\">");
+  server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-rtc\">-</div><div class=\"k\">Gateway Time</div></div>");
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ntp\">-</div><div class=\"k\">NTP Sync</div></div>");
   server.sendContent("</div></div></div>");
   server.sendContent("<script>");
   server.sendContent("function show(id,el){document.querySelectorAll(\".pane\").forEach(function(p){p.classList.remove(\"on\");});document.querySelectorAll(\"nav a\").forEach(function(a){a.classList.remove(\"on\");});document.getElementById(\"pane-\"+id).classList.add(\"on\");el.classList.add(\"on\");}");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("var FC=\" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\";");
-  server.sendContent("(function(){var el=document.getElementById(\"charMap\");if(!el)return;var s=\"\";for(var i=0;i<FC.length;i++){s+='<span style=\"margin-right:8px;color:var(--txt)\">'+i+':<strong>'+FC[i]+\"</strong></span>\";}el.innerHTML=s;})();");
   server.sendContent("function sfDecode(raw){var s=raw.replace(/[\\r\\n]+$/,\"\");if(s.length<2||s[0]!==\"m\")return \"\";if(s[1]===\"X\"){if(s.indexOf(\"mXadv:\")==0)return \"ADV  unprovisioned SN: \"+s.slice(6);if(s.indexOf(\"mXack:\")==0){var r=s.slice(6),ci=r.lastIndexOf(\":\");return ci>=0?\"ACK  SN \"+r.slice(0,ci)+\" -> ID \"+r.slice(ci+1):\"ACK \"+r;}if(s[2]===\"I\"){var ci2=s.indexOf(\":\",3);return ci2>=0?\"PROVISION  SN \"+s.slice(3,ci2)+\" -> ID \"+s.slice(ci2+1):\"PROVISION \"+s.slice(3);}if(s[2]===\"H\")return \"PROVISION  home SN \"+s.slice(3);if(s[2]===\"D\")return \"DUMP       SN \"+s.slice(3);if(s[2]===\"F\")return \"FACTORY RST SN \"+s.slice(3);if(s[2]===\"W\")return \"RESTORE    \"+s.slice(3);return \"PROVISIONING \"+s.slice(2);}var p=1,id=\"\",bc=false;while(p<s.length&&(s[p]===\"*\"||s[p]>=\"0\"&&s[p]<=\"9\")){if(s[p]===\"*\")bc=true;else id+=s[p];p++;}var who=bc?\"ALL\":\"#\"+id;if(p>=s.length)return who+\" (incomplete)\";var cmd=s[p],rest=s.slice(p+1);if(cmd===\"-\"){var fi=FC.indexOf(rest[0]||\"\");var sfx=fi>=0?\" (idx \"+fi+\")\":\"\";return \"SHOW CHAR    \"+who+\" -> [\"+(rest[0]||\"?\")+\"]\"+sfx;}if(cmd===\"+\"){var n=parseInt(rest);var ch=isNaN(n)?\"?\":(FC[n]||\"?\");return \"SHOW INDEX   \"+who+\" -> \"+n+\" [\"+ch+\"]\";}if(cmd===\"h\")return \"HOME         \"+who;if(cmd===\"c\")return rest?\"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\":\"CALIBRATE    \"+who;if(cmd===\"o\")return \"HOME OFFSET  \"+who+\" = \"+rest+\" steps\";if(cmd===\"t\")return \"TOTAL STEPS  \"+who+\" = \"+rest;if(cmd===\"s\")return \"NUDGE        \"+who+\" \"+rest+\" steps\";if(cmd===\"g\")return \"GOTO STEP    \"+who+\" -> step \"+rest;if(cmd===\"w\"){var wci=rest.indexOf(\":\");return wci>=0?\"WRITE POS    \"+who+\" idx \"+rest.slice(0,wci)+\" -> \"+rest.slice(wci+1)+\" steps\":\"WRITE POS    \"+who+\" \"+rest;}if(cmd===\"i\")return \"SET ID       \"+who+\" -> ID \"+rest;if(cmd===\"a\")return \"AUTO-HOME    \"+who+(rest===\"1\"?\" ON\":\" OFF\");if(cmd===\"d\")return rest&&rest[0]===\":\"?\"DUMP RESP    \"+who+\" \"+rest.slice(1):\"DUMP?        \"+who;if(cmd===\"e\")return \"ERASE MAP    \"+who;if(cmd===\":\")return \"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\";if(cmd===\"v\"){if(rest&&rest[0]===\":\"){var vp=rest.slice(1).split(\":\");var vs=\"VERSION RESP \"+who+\" fw:\"+vp[0];if(vp.length>1&&vp[1]!==\"\")vs+=\" id:\"+vp[1];if(vp.length>2&&vp[2]!==\"\")vs+=\" sn:\"+vp[2];return vs;}return \"VERSION?     \"+who;}if(cmd===\"R\")return \"RESET PROV   \"+who;if(cmd===\"F\")return \"FACTORY RST  \"+who;return \"CMD [\"+cmd+\"] \"+who+(rest?\" \"+rest:\"\");}");
-  server.sendContent("var _lfc=0;");
+  server.sendContent("var _lfc=0;var _loglines=[];function loadMonPrefs(){try{var a=localStorage.getItem(\"sfgw_asc\");if(a!==null)document.getElementById(\"asc\").checked=(a===\"1\");var p=localStorage.getItem(\"sfgw_pause\");if(p!==null)document.getElementById(\"lpause\").checked=(p===\"1\");}catch(e){}}function saveMonPrefs(){try{localStorage.setItem(\"sfgw_asc\",document.getElementById(\"asc\").checked?\"1\":\"0\");localStorage.setItem(\"sfgw_pause\",document.getElementById(\"lpause\").checked?\"1\":\"0\");}catch(e){}}function downloadLog(){if(!_loglines.length){return;}var blob=new Blob([_loglines.join(\"\\n\")+\"\\n\"],{type:\"text/plain\"});var url=URL.createObjectURL(blob);var a=document.createElement(\"a\");var ts=new Date().toISOString().replace(/[:.]/g,\"-\").slice(0,19);a.href=url;a.download=\"splitflap-buslog-\"+ts+\".txt\";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);}loadMonPrefs();");
   server.sendContent("function clearLog(){document.getElementById(\"log\").innerHTML=\"\";_lfc=0;document.getElementById(\"logCount\").textContent=\"0 frames\";}");
-  server.sendContent("function appendLogRow(m){var log=document.getElementById(\"log\");var ascii=(m.command||\"\").replace(/[\\r\\n]/g,\"\");var desc=sfDecode(ascii);var safeR=ascii.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var safeD=desc.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var ts=m.wt?m.wt:(m.ts<60000?m.ts+\"ms\":Math.floor(m.ts/1000)+\"s\");var row=document.createElement(\"div\");row.className=\"logrow \"+(m.dir===\"R\"?\"rx\":\"tx\");row.innerHTML=\"<span class=\\\"lts\\\">\"+ts+\"</span>\"+\"<span class=\\\"ldir\\\">\"+(m.dir===\"R\"?\"RX\":\"TX\")+\"</span>\"+\"<span class=\\\"lraw\\\">\"+safeR+\"</span>\";if(desc)row.innerHTML+=\"<span class=\\\"ldesc\\\">\"+safeD+\"</span>\";log.appendChild(row);_lfc++;document.getElementById(\"logCount\").textContent=_lfc+\" frame\"+(_lfc===1?\"\":\"s\");if(document.getElementById(\"asc\").checked)log.scrollTop=log.scrollHeight;}");
-  server.sendContent("setInterval(function(){fetch(\"/api/rs485/messages\").then(function(r){return r.json();}).then(function(arr){arr.forEach(appendLogRow);}).catch(function(){});},600);");
+  server.sendContent("function appendLogRow(m){var log=document.getElementById(\"log\");var ascii=(m.command||\"\").replace(/[\\r\\n]/g,\"\");var desc=sfDecode(ascii);var safeR=ascii.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var safeD=desc.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var ts=m.ep?new Date(m.ep*1000).toLocaleTimeString([],{hour12:false}):(m.wt?m.wt:(m.ts<60000?m.ts+\"ms\":Math.floor(m.ts/1000)+\"s\"));var row=document.createElement(\"div\");row.className=\"logrow \"+(m.dir===\"R\"?\"rx\":\"tx\");row.innerHTML=\"<span class=\\\"lts\\\">\"+ts+\"</span>\"+\"<span class=\\\"ldir\\\">\"+(m.dir===\"R\"?\"RX\":\"TX\")+\"</span>\"+\"<span class=\\\"lraw\\\">\"+safeR+\"</span>\";if(desc)row.innerHTML+=\"<span class=\\\"ldesc\\\">\"+safeD+\"</span>\";log.appendChild(row);_loglines.push(ts+\" \"+(m.dir===\"R\"?\"RX\":\"TX\")+\" \"+ascii+(desc?\"  [\"+desc+\"]\":\"\"));if(_loglines.length>5000)_loglines.splice(0,_loglines.length-5000);_lfc++;document.getElementById(\"logCount\").textContent=_lfc+\" frame\"+(_lfc===1?\"\":\"s\");if(document.getElementById(\"asc\").checked)log.scrollTop=log.scrollHeight;}");
+  server.sendContent("setInterval(function(){if(document.getElementById(\"lpause\").checked)return;fetch(\"/api/rs485/messages\").then(function(r){return r.json();}).then(function(arr){arr.forEach(appendLogRow);}).catch(function(){});},600);");
   server.sendContent("function doSend(){var data=document.getElementById(\"sdata\").value.trim();if(!data){document.getElementById(\"sr\").textContent=\"Nothing to send.\";return;}fetch(\"/api/rs485/send\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({data:data})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"sr\").textContent=j.ok?\"Sent \"+j.bytes+\" bytes\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"sr\").textContent=\"Error: \"+e;});}");
   server.sendContent("function apiFlapCmd(path,body){return fetch(path,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(body)}).then(function(r){return r.json();});}");
-  server.sendContent("var _currentModId=-1;function parseDump(raw){if(!raw)return{error:\"No data\"};var parts=raw.split(\":\");if(parts.length<2)return{error:\"Invalid format\",raw:raw};var r={homeOffset:parseInt(parts[0]),totalSteps:parseInt(parts[1]),map:{}};if(parts[2])parts[2].split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\")r.map[parseInt(kv[0])]=parseInt(kv[1]);});return r;}function renderDump(d){if(!d||!d.ok)return\"<p style=\\\"color:var(--hi)\\\">\"+(d&&d.error?d.error:\"No data\")+\"</p>\";var p=parseDump(d.dump||\"\");if(p.error)return\"<p style=\\\"color:var(--hi)\\\">\"+p.error+\"</p>\";function row(k,v){return\"<div class=\\\"mfield\\\"><span class=\\\"mk\\\">\"+k+\" : </span><span class=\\\"mv\\\">\"+v+\"</span></div>\";}var html=\"\"+row(\"Module ID\",d.id)+row(\"Serial Number\",d.sn)+row(\"Home Offset\",p.homeOffset+\" steps\")+row(\"Steps / Rev\",p.totalSteps);var keys=Object.keys(p.map);html+=row(\"Calibrated\",keys.length+\" / 64 flaps\");if(keys.length){html+=\"<div class=\\\"mmap\\\">\";keys.forEach(function(k){html+=\"[\"+k+\"]=\"+p.map[k]+\" \";});html+=\"</div>\";}html+=row(\"Raw EEPROM\",\"<span style=\\\"word-break:break-all;color:var(--dim)\\\">\"+d.dump+\"</span>\");return html;}function fetchDump(id){document.getElementById(\"modModalBody\").innerHTML=\"<p style=\\\"color:var(--dim)\\\">Fetching EEPROM from module #\"+id+\"...</p>\";document.getElementById(\"modModalStatus\").textContent=\"\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){document.getElementById(\"modModalBody\").innerHTML=renderDump(d);document.getElementById(\"modModalStatus\").textContent=d.stale?\"Cached data -- click Refresh for latest\":\"Fresh from module\";}).catch(function(e){document.getElementById(\"modModalBody\").innerHTML=\"<p style=\\\"color:var(--hi)\\\">Error: \"+e+\"</p>\";});}function openModModal(id){_currentModId=id;document.getElementById(\"modModalTitle\").textContent=\"Module #\"+id+\" - EEPROM\";var mo=document.getElementById(\"modModal\");mo.style.display=\"flex\";fetchDump(id);}function refreshDump(){if(_currentModId>=0)fetchDump(_currentModId);}function closeModal(){document.getElementById(\"modModal\").style.display=\"none\";_currentModId=-1;}");
+  server.sendContent("function parseDump(raw){if(!raw)return{error:\"No data\"};var parts=raw.split(\":\");if(parts.length<2)return{error:\"Invalid format\",raw:raw};var r={homeOffset:parseInt(parts[0]),totalSteps:parseInt(parts[1]),map:{}};if(parts[2])parts[2].split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\")r.map[parseInt(kv[0])]=parseInt(kv[1]);});return r;}");
   server.sendContent("function refreshModules(){var el=document.getElementById(\"refreshR\");el.textContent=\"Identifying...\";fetch(\"/api/flap/identify\",{method:\"POST\"}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"List cleared, identifying all modules -- refreshing in 2s\":\"Error: \"+j.error;if(j.ok)setTimeout(function(){loadModules();},2000);setTimeout(function(){loadModules();el.textContent=\"\";},7000);}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function doBackup(){var prog=document.getElementById(\"backupProg\");var res=document.getElementById(\"backupR\");res.textContent=\"\";prog.textContent=\"Loading module list...\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(mods){var targets=mods.filter(function(m){return m.sn&&m.sn.length>0;});if(!targets.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules with serial numbers found. Run Identify All first.</span>\";return;}var out={version:1,created:new Date().toISOString(),modules:[]};var i=0,okN=0,failN=0;function next(){if(i>=targets.length){prog.textContent=\"\";if(!out.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No calibration data could be read.</span>\";return;}var blob=new Blob([JSON.stringify(out,null,2)],{type:\"application/json\"});var url=URL.createObjectURL(blob);var a=document.createElement(\"a\");var ts=new Date().toISOString().replace(/[:.]/g,\"-\").slice(0,19);a.href=url;a.download=\"splitflap-backup-\"+ts+\".json\";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Backup created: \"+okN+\" module(s) saved\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\";return;}var m=targets[i];prog.textContent=\"Reading module \"+(i+1)+\" of \"+targets.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:m.id})}).then(function(r){return r.json();}).then(function(d){if(d.ok&&d.dump){out.modules.push({sn:m.sn,id:m.id,dump:d.dump});okN++;}else{failN++;}i++;next();}).catch(function(){failN++;i++;next();});}next();}).catch(function(e){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Error: \"+e+\"</span>\";});}function parseBackupDump(raw){var parts=raw.split(\":\");if(parts.length<2)return null;var ho=parseInt(parts[0]),ts=parseInt(parts[1]);if(isNaN(ho)||isNaN(ts))return null;var map=parts.length>2?parts.slice(2).join(\":\"):\"\";return {homeOffset:ho,totalSteps:ts,map:map};}function doRestore(){var prog=document.getElementById(\"restoreProg\");var res=document.getElementById(\"restoreR\");var fileInput=document.getElementById(\"restoreFile\");var preserve=document.getElementById(\"preserveId\").checked;res.textContent=\"\";if(!fileInput.files||!fileInput.files.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Choose a backup file first.</span>\";return;}var reader=new FileReader();reader.onload=function(){var data;try{data=JSON.parse(reader.result);}catch(e){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Invalid JSON file.</span>\";return;}if(!data||!Array.isArray(data.modules)||!data.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules found in backup file.</span>\";return;}var mods=data.modules,i=0,okN=0,failN=0;function next(){if(i>=mods.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Restore complete: \"+okN+\" module(s)\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\"+(preserve?\"\":\" IDs were reassigned from the backup.\");return;}var m=mods[i];if(!m.sn){failN++;i++;next();return;}var p=parseBackupDump(m.dump||\"\");if(!p){failN++;i++;next();return;}prog.textContent=\"Restoring module \"+(i+1)+\" of \"+mods.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/restorebysn\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,homeOffset:p.homeOffset,totalSteps:p.totalSteps,map:p.map})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){failN++;i++;next();return;}if(!preserve&&typeof m.id===\"number\"&&m.id>=0){fetch(\"/api/flap/provision\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,id:m.id})}).then(function(r){return r.json();}).then(function(){okN++;i++;next();}).catch(function(){okN++;i++;next();});}else{okN++;i++;next();}}).catch(function(){failN++;i++;next();});}next();};reader.onerror=function(){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Could not read file.</span>\";};reader.readAsText(fileInput.files[0]);}");
-  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?\"ID: <span class='mid'>\"+m.id+\"</span>\":\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b> (idx \"+m.flapIndex+\")\":\"\";var badge=\"\";h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+idStr+badge+\"<br><span class='mc'>SN: \"+m.sn+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+(m.fwVersion?\"<br><span class='mc'>FW: v\"+m.fwVersion+\"</span>\":\"\")+\"</div>\";});g.innerHTML=h;g.querySelectorAll(\".mod\").forEach(function(el){el.addEventListener(\"click\",function(){openModModal(parseInt(this.dataset.mid));});});}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
+  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?\"ID: <span class='mid'>\"+m.id+\"</span>\":\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\"+\"</div>\"):\"\";h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>SN: \"+m.sn+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+(m.fwVersion?\"<br><span class='mc'>FW: v\"+m.fwVersion+\"</span>\":\"\")+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
   server.sendContent("loadModules();setInterval(loadModules,5000);");
   server.sendContent("function loadUnprovisioned(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var el=document.getElementById(\"unprovList\");var up=arr.filter(function(m){return !m.provisioned;});if(!up.length){el.innerHTML=\"<p style=\\\"color:var(--dim)\\\">No unprovisioned modules seen yet.</p>\";return;}var h=\"\";up.forEach(function(m){h+=\"<div style=\\\"display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap\\\">\"+\"<code style=\\\"color:var(--ylw);flex:1;min-width:160px\\\">\"+m.sn+\"</code>\"+\"<button class=\\\"sec\\\" style=\\\"margin:0;padding:4px 10px;font-size:.78rem\\\" onclick=\\\"doHomeSN('\"+m.sn+\"')\\\" title=\\\"Home this module to identify it\\\">Home</button>\"+\"</div>\";});el.innerHTML=h;}).catch(function(){});}");
   server.sendContent("setInterval(loadUnprovisioned,10000);loadUnprovisioned();");
-  server.sendContent("function qSendChar(){var id=parseInt(document.getElementById(\"qId\").value);var ch=document.getElementById(\"qChar\").value;apiFlapCmd(\"/api/flap/char\",{id:id,\"char\":ch}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Sent\":\"Error: \"+j.error;});}");
-  server.sendContent("function qHome(){var id=parseInt(document.getElementById(\"qId\").value);apiFlapCmd(\"/api/flap/home\",{id:id}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Homing\":\"Error: \"+j.error;});}");
-  server.sendContent("function qCalibrate(){var id=parseInt(document.getElementById(\"qId\").value);apiFlapCmd(\"/api/flap/calibrate\",{id:id}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Calibrating\":\"Error: \"+j.error;});}");
-  server.sendContent("function qVersion(){var id=parseInt(document.getElementById(\"qId\").value);apiFlapCmd(\"/api/flap/version\",{id:id}).then(function(j){document.getElementById(\"qr\").textContent=j.ok?\"Query sent\":\"Error: \"+j.error;});}");
+  server.sendContent("function modHome(id){apiFlapCmd(\"/api/flap/home\",{id:id}).then(function(j){loadModules();});}var _infoId=-1;var _delId=-1;function openInfo(id){_infoId=id;document.getElementById(\"modModalTitle\").textContent=\"Module #\"+id;document.getElementById(\"modModal\").style.display=\"flex\";fetchInfo(id);}function refreshDump(){if(_infoId>=0)fetchInfo(_infoId);}function closeModal(){document.getElementById(\"modModal\").style.display=\"none\";_infoId=-1;}");
+  server.sendContent("function fetchInfo(id){var b=document.getElementById(\"modModalBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading module #\"+id+\" ...</p>\";document.getElementById(\"modModalStatus\").textContent=\"\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var m=null;arr.forEach(function(x){if(x.id===id)m=x;});fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){b.innerHTML=renderInfo(m,d);document.getElementById(\"modModalStatus\").textContent=d.stale?\"EEPROM is cached -- click Refresh for a fresh read\":\"EEPROM read fresh from module\";}).catch(function(e){b.innerHTML=renderInfo(m,{ok:false,error:String(e)});});}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
+  server.sendContent("function mrow(k,v){return \"<div class='mfield'><span class='mk'>\"+k+\"</span><span class='mv'>\"+v+\"</span></div>\";}function renderInfo(m,d){var h=\"\";if(m){h+=mrow(\"Module ID\",m.id)+mrow(\"Serial Number\",m.sn||\"-\")+mrow(\"Provisioned\",m.provisioned?\"yes\":\"no\")+mrow(\"Firmware\",m.fwVersion?(\"v\"+m.fwVersion):\"unknown\")+mrow(\"Last Char\",m.flapChar?m.flapChar:\"-\")+mrow(\"Last Seen\",m.lastSeenEpoch?new Date(m.lastSeenEpoch*1000).toLocaleString():\"-\");}else{h+=mrow(\"Module ID\",\"(not in registry)\");}h+=\"<div class='sgh' style='margin-top:12px'>EEPROM</div>\";if(!d||!d.ok){h+=\"<p style='color:var(--hi)'>\"+((d&&d.error)?d.error:\"No EEPROM data\")+\"</p>\";return h;}var p=parseDump(d.dump||\"\");if(p.error){h+=\"<p style='color:var(--hi)'>\"+p.error+\"</p>\";return h;}h+=mrow(\"Home Offset\",p.homeOffset+\" steps\")+mrow(\"Steps / Rev\",p.totalSteps);var keys=Object.keys(p.map);h+=mrow(\"Calibrated Flaps\",keys.length+\" / 64\");if(keys.length){h+=\"<div class='mmap'>\";keys.forEach(function(k){h+=\"[\"+k+\"]=\"+p.map[k]+\" \";});h+=\"</div>\";}h+=mrow(\"Raw\",\"<span style='word-break:break-all;color:var(--dim);font-size:.72rem'>\"+d.dump+\"</span>\");return h;}");
+  server.sendContent("function openDel(id){_delId=id;document.getElementById(\"delModalTitle\").textContent=\"Module #\"+id+\" -- Destructive Actions\";document.getElementById(\"delModalStatus\").textContent=\"\";document.getElementById(\"delModal\").style.display=\"flex\";}function closeDelModal(){document.getElementById(\"delModal\").style.display=\"none\";_delId=-1;}function delAction(kind){if(_delId<0)return;var names={erase:\"Erase EEPROM\",factoryreset:\"Factory Reset\",deprovision:\"De-provision\"};if(!confirm(names[kind]+\" on module #\"+_delId+\"? This cannot be undone.\"))return;var st=document.getElementById(\"delModalStatus\");st.textContent=names[kind]+\" in progress...\";apiFlapCmd(\"/api/flap/\"+kind,{id:_delId}).then(function(j){st.textContent=j.ok?(names[kind]+\" sent.\"):(\"Error: \"+(j.error||\"failed\"));if(j.ok){setTimeout(function(){closeDelModal();loadModules();},900);}}).catch(function(e){st.textContent=\"Error: \"+e;});}");
+  server.sendContent("function sendChar(){var id=parseInt(document.getElementById(\"scId\").value);var ch=document.getElementById(\"scChar\").value.toUpperCase().slice(0,1);var r=document.getElementById(\"scr\");if(!ch){r.textContent=\"Enter a character\";return;}apiFlapCmd(\"/api/flap/char\",{id:id,\"char\":ch}).then(function(j){r.textContent=j.ok?(\"Sent '\"+ch+\"' to \"+(id<0?\"all modules\":\"module #\"+id)):(\"Error: \"+(j.error||\"failed\"));}).catch(function(e){r.textContent=\"Error: \"+e;});}");
   server.sendContent("function sendText(){var text=document.getElementById(\"dispText\").value.toUpperCase();var start=parseInt(document.getElementById(\"dispStart\").value);apiFlapCmd(\"/api/flap/text\",{text:text,start:start}).then(function(j){document.getElementById(\"dr\").textContent=j.ok?\"Sent \"+j.chars+\" chars\":\"Error: \"+j.error;});}");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("function sendIndex(){var id=parseInt(document.getElementById(\"idxId\").value);var idx=parseInt(document.getElementById(\"idxVal\").value);apiFlapCmd(\"/api/flap/index\",{id:id,index:idx}).then(function(j){document.getElementById(\"dr\").textContent=j.ok?\"Sent\":\"Error: \"+j.error;});}");
@@ -1441,12 +1638,14 @@ void handleRoot() {
   server.sendContent("function doProvision(){var sn=document.getElementById(\"provSN\").value;var id=parseInt(document.getElementById(\"provId\").value);apiFlapCmd(\"/api/flap/provision\",{sn:sn,id:id}).then(function(j){document.getElementById(\"provR\").textContent=j.ok?\"Provisioning sent\":\"Error: \"+j.error;});}");
   server.sendContent("function doDeprovision(){var id=parseInt(document.getElementById(\"deprovId\").value);apiFlapCmd(\"/api/flap/deprovision\",{id:id}).then(function(j){document.getElementById(\"deprovR\").textContent=j.ok?(\"De-provisioned \"+(id<0?\"all modules\":\"module \"+id)):\"Error: \"+j.error;});}");
   server.sendContent("function saveWifi(){fetch(\"/api/config/wifi\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({ssid:document.getElementById(\"wSSID\").value,pass:document.getElementById(\"wPASS\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"wr\").textContent=j.ok?\"WiFi saved - reconnecting...\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"wr\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function testMqtt(){var el=document.getElementById(\"mr\");el.textContent=\"Testing...\";fetch(\"/api/mqtt/test\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({host:document.getElementById(\"mqH\").value,port:parseInt(document.getElementById(\"mqP\").value)||1883,user:document.getElementById(\"mqU\").value,pass:document.getElementById(\"mqPw\").value})}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"Broker OK - connected and authenticated\":\"Failed: \"+(j.detail||j.error||\"unknown\");}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function saveMqtt(){fetch(\"/api/config/mqtt\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({host:document.getElementById(\"mqH\").value,port:parseInt(document.getElementById(\"mqP\").value),user:document.getElementById(\"mqU\").value,pass:document.getElementById(\"mqPw\").value,prefix:document.getElementById(\"mqPfx\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"mr\").textContent=j.ok?\"MQTT saved - reconnecting...\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"mr\").textContent=\"Error: \"+e;});}");
-  server.sendContent("function saveTz(){var sel=document.getElementById(\"tzSel\");fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({posixTZ:sel.value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"tzR\").textContent=j.ok?\"Timezone saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"tzR\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function saveTz(){var sel=document.getElementById(\"tzSel\");var ntp=document.getElementById(\"ntpSrv\").value.trim();fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({posixTZ:sel.value,ntpServer:ntp})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"tzR\").textContent=j.ok?\"Time settings saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"tzR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveOTA(){fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({otaPassword:document.getElementById(\"otaPw\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"otaR\").textContent=j.ok?\"OTA password saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"otaR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveDebug(){var v=document.getElementById(\"dbgChk\").checked;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({serialDebug:v})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"dbgR\").textContent=j.ok?(v?\"Debug enabled\":\"Debug disabled\"):\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"dbgR\").textContent=\"Error: \"+e;});}");
-  server.sendContent("function pollStatus(){fetch(\"/api/status\").then(function(r){return r.json();}).then(function(s){document.getElementById(\"s-up\").textContent=s.uptime;document.getElementById(\"s-rx\").textContent=s.rx;document.getElementById(\"s-tx\").textContent=s.tx;document.getElementById(\"s-bd\").textContent=s.baud;document.getElementById(\"s-ip\").textContent=s.ip;document.getElementById(\"s-ap\").textContent=s.apip;document.getElementById(\"s-hp\").textContent=s.heap;document.getElementById(\"s-mq\").textContent=s.mqtt?\"Connected\":\"Off\";document.getElementById(\"s-mod\").textContent=s.modules;if(document.getElementById(\"s-rtc\"))document.getElementById(\"s-rtc\").textContent=s.time||\"--\";if(document.getElementById(\"s-ntp\"))document.getElementById(\"s-ntp\").textContent=s.ntpSynced?\"OK\":\"Pending\";var b=document.getElementById(\"badge\");b.textContent=s.wifi?\"WiFi: \"+s.ip:\"AP only\";b.className=s.wifi?\"ok\":\"\";}).catch(function(){});}setInterval(pollStatus,3000);pollStatus();");
-  server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}});");
+  server.sendContent("function setMaintUI(on){var chk=document.getElementById(\"maintChk\");if(chk)chk.checked=!!on;var lbl=document.querySelector(\".maint-toggle\");if(lbl)lbl.classList.toggle(\"active\",!!on);document.body.classList.toggle(\"maint-on\",!!on);}function toggleMaint(){var chk=document.getElementById(\"maintChk\");var on=chk.checked;fetch(\"/api/maintenance\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:on})}).then(function(r){return r.json();}).then(function(j){setMaintUI(j.on);}).catch(function(){chk.checked=!on;setMaintUI(!on);});}");
+  server.sendContent("function pollStatus(){fetch(\"/api/status\").then(function(r){return r.json();}).then(function(s){var up=s.uptime,ud=Math.floor(up/86400),uh=Math.floor(up%86400/3600),um=Math.floor(up%3600/60),us=up%60;document.getElementById(\"s-up\").textContent=(ud?ud+\"d \":\"\")+(uh||ud?uh+\"h \":\"\")+um+\"m \"+us+\"s\";document.getElementById(\"s-rx\").textContent=s.rx;document.getElementById(\"s-tx\").textContent=s.tx;document.getElementById(\"s-ip\").textContent=s.ip;document.getElementById(\"s-ap\").textContent=s.apip;var hp=document.getElementById(\"s-hp\");hp.textContent=Math.round(s.heap/1024)+\" KB\";hp.className=\"v \"+(s.heap>=40000?\"vok\":(s.heap>=25000?\"vwarn\":\"vbad\"));var mq=document.getElementById(\"s-mq\");mq.textContent=s.mqtt?\"Connected\":\"Off\";mq.className=\"v \"+(s.mqtt?\"vok\":\"\");document.getElementById(\"s-mod\").textContent=s.modules;if(s.minheap){var mh=document.getElementById(\"s-mh\");mh.textContent=Math.round(s.minheap/1024)+\" KB\";mh.className=\"v \"+(s.minheap>=40000?\"vok\":(s.minheap>=25000?\"vwarn\":\"vbad\"));}if(s.stk){var sm=null,sn=\"\";for(var k in s.stk){if(sm===null||s.stk[k]<sm){sm=s.stk[k];sn=k;}}var st=document.getElementById(\"s-stk\");st.textContent=sm+\" B (\"+sn+\")\";st.className=\"v \"+(sm>=800?\"vok\":(sm>=400?\"vwarn\":\"vbad\"));}if(document.getElementById(\"s-rtc\"))document.getElementById(\"s-rtc\").textContent=s.time||\"--\";var ntp=document.getElementById(\"s-ntp\");if(ntp){ntp.textContent=s.ntpSynced?\"Synced\":\"Pending\";ntp.className=\"v \"+(s.ntpSynced?\"vok\":\"vwarn\");}var b=document.getElementById(\"badge\");b.textContent=s.wifi?\"WiFi: \"+s.ip:\"AP only\";b.className=s.wifi?\"ok\":\"\";if(typeof s.maint!==\"undefined\")setMaintUI(s.maint);}).catch(function(){});}setInterval(pollStatus,3000);pollStatus();");
+  server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}});");
   server.sendContent("</script></body></html>");
   server.sendContent("");
   server.sendContent("");
@@ -1466,8 +1665,8 @@ void handleApiSend() {
     sendJsonError(400, "Bad JSON"); return;
   }
   const char* d = doc["data"] | "";
-  uint8_t outBuf[MSG_MAX_BYTES];
-  size_t  outLen = min(strlen(d), (size_t)MSG_MAX_BYTES);
+  uint8_t outBuf[TX_MAX_BYTES];
+  size_t  outLen = min(strlen(d), (size_t)TX_MAX_BYTES);
   memcpy(outBuf, d, outLen);
   if (!outLen) { sendJsonError(400, "Empty data"); return; }
   rs485Send(outBuf, outLen);
@@ -1527,7 +1726,7 @@ void handleApiIndex() {
   }
   int id  = doc["id"]    | -1;
   int idx = doc["index"] | -1;
-  if (idx < 0 || idx >= FLAP_CHAR_COUNT) { sendJsonError(400, "Invalid index"); return; }
+  if (idx < 0 || idx >= 64) { sendJsonError(400, "Invalid index (0-63)"); return; }
   DBG("[API] show index %d on module %d\n", idx, id);
   sfSendIndex(id, idx);
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1600,14 +1799,19 @@ void handleApiVersion() {
   // Send the version query onto the bus
   sfQueryVersion(id);
 
-  // Wait up to 500 ms for a fresh version response (lastSeen advances when
-  // sfParseResponse processes the reply and writes fwVersion)
+  // Wait for a fresh version response (lastSeen advances when sfParseResponse
+  // processes the reply and writes fwVersion). v18+ modules STAGGER their
+  // version responses by ~100ms per ID slot (observed train: id5 @ +100ms,
+  // id9 @ +200ms, id10 @ +300ms after the first), so a fixed 500ms window can
+  // never catch high-ID modules even when they are healthy. Scale the window
+  // with the queried ID, capped so the handler stays bounded.
   char          fwVer[8]     = "";
   char          sn[21]       = "";
   int           repId        = -1;
   bool          gotReply     = false;
   unsigned long repLastSeen  = 0;
-  unsigned long deadline = millis() + 500;
+  unsigned long waitMs   = 500UL + (unsigned long)(id > 25 ? 25 : id) * 100UL;
+  unsigned long deadline = millis() + waitMs;
   while (millis() < deadline) {
     wdgWebMs = millis();  // keep watchdog alive during version wait
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1712,20 +1916,31 @@ void handleApiStatus() {
   // Use snprintf to avoid JsonDocument heap allocation (called every 3s by browser)
   char rtcBuf[24]; rtcFormatTime(rtcBuf, sizeof(rtcBuf));
   IPAddress lip = WiFi.localIP(), aip = WiFi.softAPIP();
-  char out[320];
+  // Per-task minimum-ever free stack (bytes). A value trending toward 0 is an
+  // early warning of the stack-canary crash class.
+  unsigned stk485 = hTaskRS485 ? uxTaskGetStackHighWaterMark(hTaskRS485) : 0;
+  unsigned stkWeb = hTaskWeb   ? uxTaskGetStackHighWaterMark(hTaskWeb)   : 0;
+  unsigned stkNet = hTaskNet   ? uxTaskGetStackHighWaterMark(hTaskNet)   : 0;
+  unsigned stkOta = hTaskOTA   ? uxTaskGetStackHighWaterMark(hTaskOTA)   : 0;
+  unsigned stkRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
+  char out[560];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
-    "\"heap\":%u,\"mqtt\":%s,\"modules\":%d,"
-    "\"time\":\"%s\",\"ntpSynced\":%s}",
+    "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
+    "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
+    "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
     aip[0],aip[1],aip[2],aip[3],
-    ESP.getFreeHeap(),
+    ESP.getFreeHeap(), ESP.getMinFreeHeap(),
     mqtt.connected()?"true":"false",
-    sfModuleCount, rtcBuf,
-    ntpSynced?"true":"false");
+    sfModuleCount,
+    stk485, stkWeb, stkNet, stkOta, stkRtc,
+    rtcBuf,
+    ntpSynced?"true":"false",
+    gMaintenanceMode?"true":"false");
   server.send(200, "application/json", out);
 }
 
@@ -1742,6 +1957,7 @@ void handleApiConfigGet() {
   doc["parity"]   = cfg.rs485Parity;
   doc["stopBits"] = cfg.rs485StopBits;
   doc["posixTZ"]    = cfg.posixTZ;
+  doc["ntpServer"]  = cfg.ntpServer;
   doc["serialDebug"]   = cfg.serialDebug;
   doc["otaPasswordSet"] = (strlen(cfg.otaPassword) > 0);
   char out[640];
@@ -1853,6 +2069,12 @@ void handleApiConfigSettings() {
     ntpSynced = false;
     DBG("[CFG] Timezone set to %s\n", cfg.posixTZ);
   }
+  if (doc["ntpServer"].is<const char*>()) {
+    strlcpy(cfg.ntpServer, doc["ntpServer"] | DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
+    if (!cfg.ntpServer[0]) strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
+    ntpSynced = false;   // re-sync against the new server on next network tick
+    DBG("[CFG] NTP server set to %s\n", cfg.ntpServer);
+  }
   bool baudChanged = (newBaud != cfg.rs485Baud);
   cfg.rs485Baud = newBaud;
   saveConfig();
@@ -1911,7 +2133,10 @@ static void otaInit() {
   });
 
   ArduinoOTA.begin();
-  printf("[OTA] Ready (hostname: splitflap-gw)\n");
+  // ArduinoOTA.begin() started the mDNS responder with our hostname; also
+  // advertise the web UI so browsers can reach http://splitflap-gw.local
+  MDNS.addService("http", "tcp", 80);
+  printf("[OTA] Ready (hostname: splitflap-gw, web UI at http://splitflap-gw.local)\n");
 }
 
 // OTA runs in its own task so ArduinoOTA.handle() is called frequently
@@ -2222,7 +2447,15 @@ void handleApiDump() {
   sfDumpCaptureTs  = 0;
   sfDumpWaitId     = id;
 
-  // Try mXD<sn> first for fw >= 15; fall back to m<id>d otherwise.
+  // Prefer the serial-number dump command mXD<sn> for fw >= 15 with a known SN.
+  // A full 64-flap dump is ~565 bytes -- ~590ms just to transmit at 9600 baud,
+  // plus the module's EEPROM-read time -- so the wait MUST be well over 500ms.
+  // The previous 500ms window expired mid-response and triggered the m<id>d
+  // fallback, whose request collided on the half-duplex bus with the late mXD
+  // response (the cause of the dropped bytes / no-response). A 1200ms window
+  // lets mXD fully respond, so no premature fallback and no collision.
+  // The wait loop touches wdgWebMs each iteration, so a longer wait is
+  // watchdog-safe.
   bool triedSN = false;
   if (fwVerNum >= 15 && sn[0]) {
     DBG("[API] dump module %d via SN %s (fw=%d)\n", id, sn, fwVerNum);
@@ -2233,10 +2466,9 @@ void handleApiDump() {
     char buf[16]; snprintf(buf, sizeof(buf), "m%dd\n", id); rs485SendStr(buf);
   }
 
-  // Wait up to 500 ms for a fresh response (captured by sfParseResponse).
-  char rawDump[MSG_MAX_BYTES] = "";
+  char rawDump[TX_MAX_BYTES] = "";
   bool gotReply = false;
-  unsigned long deadline = millis() + 500;
+  unsigned long deadline = millis() + 1200;
   while (millis() < deadline) {
     wdgWebMs = millis();
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -2247,11 +2479,13 @@ void handleApiDump() {
     }
   }
 
-  // SN-based command got no response -- fall back to ID-based.
+  // Only if the SN command got NO response within the full window do we fall
+  // back to m<id>d. After a complete 1200ms with silence, the module clearly
+  // isn't answering mXD, so there is no late response left to collide with.
   if (!gotReply && triedSN) {
     DBG("[API] SN dump timed out, retrying module %d via ID\n", id);
     char buf[16]; snprintf(buf, sizeof(buf), "m%dd\n", id); rs485SendStr(buf);
-    deadline = millis() + 500;
+    deadline = millis() + 1200;
     while (millis() < deadline) {
       wdgWebMs = millis();
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -2292,6 +2526,91 @@ void handleApiIdentify() {
   sfModulesClear();
   rs485SendStr("m*v\n");
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /api/mqtt/test {host?,port?,user?,pass?} -- tries the given (or saved)
+// broker settings WITHOUT touching the live connection, so settings can be
+// verified before saving. Two phases: TCP reachability (3s cap), then a real
+// MQTT CONNECT/CONNACK using a throwaway client. Runs on taskWeb (8KB stack;
+// the temporary client objects are small and its packet buffer is heap).
+void handleApiMqttTest() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  char host[64]; int port = cfg.mqttPort;
+  char user[48], pass[64];
+  strlcpy(host, cfg.mqttHost, sizeof(host));
+  strlcpy(user, cfg.mqttUser, sizeof(user));
+  strlcpy(pass, cfg.mqttPass, sizeof(pass));
+  if (server.hasArg("plain") && server.arg("plain").length() > 1) {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) == DeserializationError::Ok) {
+      if (doc["host"].is<const char*>()) strlcpy(host, doc["host"] | "", sizeof(host));
+      if (doc["port"].is<int>())         port = doc["port"] | cfg.mqttPort;
+      if (doc["user"].is<const char*>()) strlcpy(user, doc["user"] | "", sizeof(user));
+      if (doc["pass"].is<const char*>()) strlcpy(pass, doc["pass"] | "", sizeof(pass));
+    }
+  }
+  if (!host[0]) { sendJsonError(400, "no broker host configured"); return; }
+  DBG("[MQTT] testing %s:%d\n", host, port);
+
+  wdgWebMs = millis();
+  WiFiClient testNet;
+  // Phase 1: TCP reachability with an explicit 3s cap.
+  if (!testNet.connect(host, (uint16_t)port, 3000)) {
+    server.send(200, "application/json",
+      "{\"ok\":false,\"tcp\":false,\"mqtt\":false,"
+      "\"error\":\"TCP connect failed (host/port unreachable)\"}");
+    return;
+  }
+  wdgWebMs = millis();
+  // Phase 2: real MQTT CONNECT on the already-open socket. PubSubClient skips
+  // its own TCP connect when the client is connected, so this only exchanges
+  // CONNECT/CONNACK. CONNACK from a live broker arrives in milliseconds.
+  PubSubClient testMq(testNet);
+  testMq.setBufferSize(128);   // CONNECT/CONNACK only -- keep the heap use tiny
+  bool mqOk;
+  if (user[0]) mqOk = testMq.connect("sfgw-test", user, pass);
+  else         mqOk = testMq.connect("sfgw-test");
+  int state = testMq.state();
+  testMq.disconnect();
+  testNet.stop();
+  wdgWebMs = millis();
+
+  const char* why = "";
+  switch (state) {                       // PubSubClient state codes
+    case  0: why = "connected";                       break;
+    case  1: why = "bad protocol version";            break;
+    case  2: why = "client id rejected";              break;
+    case  3: why = "broker unavailable";              break;
+    case  4: why = "bad username or password";        break;
+    case  5: why = "not authorized";                  break;
+    case -2: why = "network failed during handshake"; break;
+    case -4: why = "broker did not respond (timeout)";break;
+    default: why = "connection failed";               break;
+  }
+  char out[160];
+  snprintf(out, sizeof(out),
+    "{\"ok\":%s,\"tcp\":true,\"mqtt\":%s,\"state\":%d,\"detail\":\"%s\"}",
+    mqOk ? "true" : "false", mqOk ? "true" : "false", state, why);
+  server.send(200, "application/json", out);
+}
+
+void handleApiMaintenance() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  // GET returns current state; POST {"on":true|false} sets it.
+  if (server.method() == HTTP_POST) {
+    if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+      sendJsonError(400, "Bad JSON"); return;
+    }
+    if (!doc["on"].is<bool>()) { sendJsonError(400, "'on' (bool) required"); return; }
+    gMaintenanceMode = doc["on"].as<bool>();
+    printf("[MAINT] Maintenance mode %s\n", gMaintenanceMode ? "ENABLED" : "disabled");
+  }
+  char out[40];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s}",
+           gMaintenanceMode ? "true" : "false");
+  server.send(200, "application/json", out);
 }
 
 void webInit() {
@@ -2347,6 +2666,11 @@ void webInit() {
   server.on("/api/flap/restorebysn",     HTTP_POST,    handleApiRestoreBySN);
   server.on("/api/flap/restorebysn",     HTTP_OPTIONS, handleOptions);
   server.on("/api/status",           HTTP_GET,     handleApiStatus);
+  server.on("/api/mqtt/test",        HTTP_POST,    handleApiMqttTest);
+  server.on("/api/mqtt/test",        HTTP_OPTIONS, handleOptions);
+  server.on("/api/maintenance",      HTTP_GET,     handleApiMaintenance);
+  server.on("/api/maintenance",      HTTP_POST,    handleApiMaintenance);
+  server.on("/api/maintenance",      HTTP_OPTIONS, handleOptions);
   server.on("/api/config",           HTTP_GET,     handleApiConfigGet);
   server.on("/api/config/wifi",      HTTP_POST,    handleApiConfigWifi);
   server.on("/api/config/wifi",      HTTP_OPTIONS, handleOptions);
@@ -2373,7 +2697,11 @@ void webInit() {
 // is exactly one complete protocol message regardless of how the UART delivers
 // the bytes (split across reads, multiple messages in one read, etc.).
 void taskRS485(void* pv) {
-  static uint8_t lineBuf[MSG_MAX_BYTES];
+  // Receive accumulator sized for long inbound frames (e.g. a full EEPROM dump
+  // response m<id>d:<offset>:<steps>:<map> can reach ~590 bytes). The monitor
+  // ring entry (RS485Msg.data) stays at MSG_MAX_BYTES, so the ring copy below
+  // is truncated for display while the full frame is parsed.
+  static uint8_t lineBuf[TX_MAX_BYTES];
   static size_t  lineLen = 0;
 
   while (true) {
@@ -2387,6 +2715,7 @@ void taskRS485(void* pv) {
       // parse) could otherwise keep us in this inner loop past the 30s
       // RS485 watchdog threshold and trigger a false stall reboot.
       wdgRS485Ms = millis();
+      gLastRxMs  = wdgRS485Ms;   // bus activity marker for TX collision avoidance
 
       // If we see an 'm' and the buffer already has content that doesn't
       // start with 'm', discard the stale partial frame and start fresh.
@@ -2400,7 +2729,7 @@ void taskRS485(void* pv) {
       }
 
       // Append byte, guarding against overflow.
-      if (lineLen < MSG_MAX_BYTES - 1) {
+      if (lineLen < TX_MAX_BYTES - 1) {
         lineBuf[lineLen++] = c;
       } else {
         // Buffer full without a newline -- corrupt/oversized frame, discard.
@@ -2414,16 +2743,21 @@ void taskRS485(void* pv) {
         RS485Msg m;
         m.timestamp = millis();
         m.dir       = 'R';
-        m.len       = lineLen;
-        memcpy(m.data, lineBuf, lineLen);
+        // The monitor ring entry is fixed-size; store at most MSG_MAX_BYTES.
+        // The full frame is still parsed below -- this copy is display-only.
+        size_t ringLen = (lineLen > MSG_MAX_BYTES) ? MSG_MAX_BYTES : lineLen;
+        m.len       = ringLen;
+        memcpy(m.data, lineBuf, ringLen);
         rtcFormatTime(m.wallTime, sizeof(m.wallTime));
+        m.epoch     = rtcEpochNow();  // UTC epoch for browser-local display
         // Log the received frame (strip trailing newline for readability)
-        { char dbg[MSG_MAX_BYTES]; size_t dlen = lineLen > 0 ? lineLen-1 : 0;
+        { char dbg[MSG_MAX_BYTES]; size_t dlen = (ringLen > 0) ? ringLen-1 : 0;
+          if (dlen > sizeof(dbg) - 1) dlen = sizeof(dbg) - 1;
           memcpy(dbg, lineBuf, dlen); dbg[dlen] = '\0';
           DBG("[RX] %s  (%s)\n", dbg, m.wallTime); }
         ringPush(m);
         mqttPublishMsg(m);
-        sfParseResponse(lineBuf, lineLen);
+        sfParseResponse(lineBuf, lineLen);   // full frame, not the truncated copy
         lineLen = 0;
       }
     }
@@ -2560,7 +2894,28 @@ void setup() {
   Serial.begin(115200);
   { unsigned long t = millis(); while (!Serial && millis() - t < 3000) delay(10); }
   delay(200);
-  printf("\n[Boot] Split-Flap Gateway\n");
+  printf("\n[Boot] Split-Flap Gateway v%s\n", FW_VERSION);
+  // Reset reason + chip/heap snapshot -- the first thing to check after an
+  // unexpected reboot. PANIC/INT_WDT/TASK_WDT point at firmware faults;
+  // BROWNOUT points at power. Pair this with the last [WDG] line before the gap.
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char* rs = "OTHER";
+    switch (rr) {
+      case ESP_RST_POWERON:  rs = "POWERON";  break;
+      case ESP_RST_SW:       rs = "SW";       break;
+      case ESP_RST_PANIC:    rs = "PANIC";    break;
+      case ESP_RST_INT_WDT:  rs = "INT_WDT";  break;
+      case ESP_RST_TASK_WDT: rs = "TASK_WDT"; break;
+      case ESP_RST_WDT:      rs = "WDT";      break;
+      case ESP_RST_BROWNOUT: rs = "BROWNOUT"; break;
+      case ESP_RST_DEEPSLEEP:rs = "DEEPSLEEP";break;
+      default: break;
+    }
+    printf("[Boot] reset=%s heap=%u psram=%u flash=%uKB sdk=%s\n",
+           rs, ESP.getFreeHeap(), ESP.getPsramSize(),
+           ESP.getFlashChipSize()/1024, ESP.getSdkVersion());
+  }
 
   // 2. Load config and init module registry
   cfgSetDefaults();
@@ -2599,11 +2954,11 @@ void setup() {
   webInit();
 
   // 7. Spawn tasks after WiFi stack is ready
-  xTaskCreatePinnedToCore(taskRTC,     "RTC",     2048, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskRS485,   "RS485",   4096, NULL, 3, NULL, 0);
-  xTaskCreatePinnedToCore(taskOTA,     "OTA",     4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(taskWeb,     "Web",     8192, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskRTC,     "RTC",     2048, NULL, 2, &hTaskRTC,   0);
+  xTaskCreatePinnedToCore(taskRS485,   "RS485",   6144, NULL, 3, &hTaskRS485, 0);
+  xTaskCreatePinnedToCore(taskOTA,     "OTA",     4096, NULL, 1, &hTaskOTA,   1);
+  xTaskCreatePinnedToCore(taskWeb,     "Web",     8192, NULL, 2, &hTaskWeb,   0);
+  xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
 
   printf("[Boot] Ready\n");
 }
@@ -2613,9 +2968,29 @@ void loop() {
   unsigned long now = millis();
   if (now - lastWdgCheck >= 30000UL) {
     lastWdgCheck = now;
-    printf("[WDG] up=%lus heap=%u rx=%lu tx=%lu wifi=%d mqtt=%d\n",
-                  now/1000, ESP.getFreeHeap(), rxCount, txCount,
-                  (int)(WiFi.status()==WL_CONNECTED), (int)mqtt.connected());
+    // Rich periodic telemetry for troubleshooting. Heap + min-ever heap +
+    // largest free block (fragmentation: a big gap between freeHeap and
+    // maxAlloc signals fragmentation, a common pre-crash signature). Per-task
+    // stack high-water marks catch the canary-overflow class before it fires.
+    // rx/tx/parse-reject counters surface bus health and corruption rates.
+    unsigned freeHeap = ESP.getFreeHeap();
+    unsigned minHeap  = ESP.getMinFreeHeap();
+    unsigned maxBlk   = ESP.getMaxAllocHeap();
+    unsigned s485 = hTaskRS485 ? uxTaskGetStackHighWaterMark(hTaskRS485) : 0;
+    unsigned sWeb = hTaskWeb   ? uxTaskGetStackHighWaterMark(hTaskWeb)   : 0;
+    unsigned sNet = hTaskNet   ? uxTaskGetStackHighWaterMark(hTaskNet)   : 0;
+    unsigned sOta = hTaskOTA   ? uxTaskGetStackHighWaterMark(hTaskOTA)   : 0;
+    unsigned sRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
+    printf("[WDG] up=%lus heap=%u min=%u maxblk=%u frag=%u%% "
+           "stk(485/web/net/ota/rtc)=%u/%u/%u/%u/%u "
+           "rx=%lu tx=%lu rej=%lu wifi=%d rssi=%d mqtt=%d mods=%d\n",
+           now/1000, freeHeap, minHeap, maxBlk,
+           freeHeap ? (unsigned)(100 - (maxBlk * 100UL / freeHeap)) : 0,
+           s485, sWeb, sNet, sOta, sRtc,
+           rxCount, txCount, sfParseRejects,
+           (int)(WiFi.status()==WL_CONNECTED),
+           (WiFi.status()==WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
+           (int)mqtt.connected(), sfModuleCount);
 
     // Boot grace period: skip stall detection for the first 60s. The first
     // boot after flashing formats the FATFS partition (a long blocking flash
@@ -2631,8 +3006,12 @@ void loop() {
       bool okWeb  = (wdgWebMs  == 0 || wdgWebMs  > now || now - wdgWebMs  < 120000UL);
       bool okNet  = (wdgNetMs  == 0 || wdgNetMs  > now || now - wdgNetMs  < 30000UL);
       if (!ok485 || !okWeb || !okNet) {
-        printf("[WDG] STALL: RS485=%d Web=%d Net=%d -- rebooting\n",
-                      ok485, okWeb, okNet);
+        printf("[WDG] STALL: RS485=%d Web=%d Net=%d (age485=%lus ageWeb=%lus ageNet=%lus heap=%u) -- rebooting\n",
+                      ok485, okWeb, okNet,
+                      wdgRS485Ms ? (now - wdgRS485Ms)/1000 : 0,
+                      wdgWebMs   ? (now - wdgWebMs)/1000   : 0,
+                      wdgNetMs   ? (now - wdgNetMs)/1000   : 0,
+                      ESP.getFreeHeap());
         delay(200);
         ESP.restart();
       }
