@@ -208,14 +208,15 @@ locate_or_download_bridge() {
 clear
 hdr "Split-Flap Gateway -- Bridge Service Setup"
 echo "  This script will:"
-echo "    1. Install sfgw_serial_bridge.py to a directory you choose"
-echo "    2. Optionally install and configure an MQTT broker (Mosquitto),"
+echo "    1. Install Python 3 and pip if they are missing"
+echo "    2. Install sfgw_serial_bridge.py to a directory you choose"
+echo "    3. Optionally install and configure an MQTT broker (Mosquitto),"
 echo "       including an optional username/password and auto-start on boot"
-echo "    3. Install paho-mqtt if not already present"
-echo "    4. Write a config file with your MQTT settings"
-echo "    5. Create and enable a systemd service"
-echo "    6. Tell you exactly what to enter on the gateway's Settings page"
-echo "    7. Optionally install the splitflap-os web app and point it at the"
+echo "    4. Install paho-mqtt if not already present"
+echo "    5. Write a config file with your MQTT settings"
+echo "    6. Create and enable a systemd service"
+echo "    7. Tell you exactly what to enter on the gateway's Settings page"
+echo "    8. Optionally install the splitflap-os web app and point it at the"
 echo "       virtual serial port (network setup skipped via --skip-network)"
 echo
 echo "  Run with sudo if you want to install system-wide."
@@ -238,18 +239,58 @@ if ! command -v systemctl &>/dev/null; then
 fi
 ok "systemd found"
 
+# PKG_MGR is detected later in the broker section; detect it now too so we can
+# install Python/pip if they are missing (it is cheap and idempotent).
+PKG_MGR="$(detect_pkg_mgr)"
+
+# Python 3 -- install it if missing.
 if ! command -v python3 &>/dev/null; then
-    die "python3 not found. Please install Python 3.7+ first."
+    warn "python3 not found."
+    if [ -n "$PKG_MGR" ] && ask_yn "Install Python 3 now?" y; then
+        need_sudo
+        case "$PKG_MGR" in
+            apt)    $SUDO apt-get update && $SUDO apt-get install -y python3 || true ;;
+            dnf)    $SUDO dnf install -y python3 || true ;;
+            yum)    $SUDO yum install -y python3 || true ;;
+            pacman) $SUDO pacman -Sy --noconfirm python || true ;;
+            zypper) $SUDO zypper install -y python3 || true ;;
+        esac
+    fi
+fi
+if ! command -v python3 &>/dev/null; then
+    die "python3 is required but could not be installed. Install Python 3.7+ manually and re-run."
 fi
 PYTHON=$(command -v python3)
 ok "python3 found: $PYTHON"
+
+# pip3 -- install it if missing. Some minimal images ship python3 without pip.
+if ! command -v pip3 &>/dev/null && ! python3 -m pip --version &>/dev/null; then
+    warn "pip (Python package installer) not found."
+    if [ -n "$PKG_MGR" ] && ask_yn "Install pip now?" y; then
+        need_sudo
+        case "$PKG_MGR" in
+            apt)    $SUDO apt-get install -y python3-pip || true ;;
+            dnf)    $SUDO dnf install -y python3-pip || true ;;
+            yum)    $SUDO yum install -y python3-pip || true ;;
+            pacman) $SUDO pacman -Sy --noconfirm python-pip || true ;;
+            zypper) $SUDO zypper install -y python3-pip || true ;;
+        esac
+    fi
+fi
+if command -v pip3 &>/dev/null || python3 -m pip --version &>/dev/null; then
+    ok "pip is available"
+else
+    warn "pip is not available. If paho-mqtt can be installed from your distro"
+    warn "package manager (python3-paho-mqtt) this is fine; otherwise install"
+    warn "pip manually so the MQTT library can be installed."
+fi
 
 # ---------------------------------------------------------------------------
 # Optional: install AND configure an MQTT broker (Mosquitto)
 # ---------------------------------------------------------------------------
 hdr "MQTT broker (Mosquitto)"
 
-PKG_MGR="$(detect_pkg_mgr)"
+# PKG_MGR was detected earlier in the prerequisites section.
 
 # These get populated if we install/configure Mosquitto here, and are then
 # offered as defaults when we write the bridge's own MQTT config further down.
