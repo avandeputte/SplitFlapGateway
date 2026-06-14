@@ -1,6 +1,6 @@
 # Split-Flap Gateway
 
-**Firmware version: 1.0**
+**Firmware version: 1.3**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem.
@@ -162,7 +162,7 @@ The firmware outputs diagnostic messages at **115200 baud** via the native USB C
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v1.0
+[Boot] Split-Flap Gateway v1.3
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -222,6 +222,7 @@ Navigate to the gateway's IP address in any browser.
 <a href="screenshots/modules_manage.png"><img src="screenshots/modules_manage.png" width="260" alt="Module destructive-actions dialog"></a>
 <a href="screenshots/display.png"><img src="screenshots/display.png" width="260" alt="Display tab"></a>
 <a href="screenshots/provision.png"><img src="screenshots/provision.png" width="260" alt="Provision tab"></a>
+<a href="screenshots/calibration.png"><img src="screenshots/calibration.png" width="260" alt="Calibration tab — module grid, in-place home offset and total steps with Count Steps, and the per-character map"></a>
 <a href="screenshots/bus_monitor.png"><img src="screenshots/bus_monitor.png" width="260" alt="Bus Monitor tab"></a>
 <a href="screenshots/settings.png"><img src="screenshots/settings.png" width="260" alt="Settings tab"></a>
 <a href="screenshots/backups.png"><img src="screenshots/backups.png" width="260" alt="Backup tab"></a>
@@ -231,12 +232,13 @@ Navigate to the gateway's IP address in any browser.
 
 | Tab | Description |
 |---|---|
-| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog with all known module data plus a parsed view of its EEPROM — home offset, steps/rev, and the calibrated flap map), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
-| **Display** | Send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
+| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog with all known module data plus a parsed view of its EEPROM — home offset, steps/rev, and the calibrated flap map), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
+| **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change. Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
+| **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap's current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). |
 | **Backup** | Download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. |
-| **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, serial debug toggle, OTA firmware update |
+| **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update |
 | **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
 
 ---
@@ -357,7 +359,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
-| `POST` | `/api/flap/calibrate` | `{"id":5}` | Calibrate steps/rev |
+| `POST` | `/api/flap/calibrate` | `{"id":5}` | Calibrate steps/rev — for a single module, waits up to ~15s for the reel to measure and returns `{ok,id,stepsPerRev}` (`504` on timeout); a broadcast (`id:-1`) is fire-and-forget |
 | `POST` | `/api/flap/homeoffset` | `{"id":5,"steps":42}` | Set home offset |
 | `POST` | `/api/flap/totalsteps` | `{"id":5,"steps":4096}` | Set total steps per revolution |
 | `POST` | `/api/flap/nudge` | `{"id":5,"steps":10}` | Nudge forward n steps |
@@ -386,6 +388,19 @@ All `POST` endpoints accept `Content-Type: application/json`.
 ```
 
 `/api/flap/dump` returns data fetched fresh from the module each call (no cache). On timeout it returns `{ "ok": false, ... }`. The `stale` field is always `false` and retained only for response-shape compatibility. `/api/flap/version` includes `lastSeen`, the milliseconds-since-boot of the most recent module activity.
+
+#### `/api/flap/calibrate` response format
+
+```json
+{ "ok": true, "id": 11, "stepsPerRev": 4097 }
+{ "ok": false, "error": "No calibration response from module" }
+```
+
+For a single module the call blocks while the reel physically measures one revolution (up to ~15s), then returns the measured `stepsPerRev`. The module saves the value to its own EEPROM during calibration; callers typically follow up with `/api/flap/totalsteps` to confirm it. A broadcast (`id:-1`) returns `{ "ok": true, "broadcast": true }` immediately.
+
+#### Module object and `lastSeenEpoch`
+
+Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, resets on reboot) and `lastSeenEpoch` (RTC wall-clock epoch in seconds, which survives reboot; `0` until the clock is set). The UI uses `lastSeenEpoch` to show a human-readable "Last Seen" time. A provisioned module that has responded but reports no `fwVersion` is treated as a **legacy** (firmware v7 or earlier) module.
 
 ### Status and Configuration
 
