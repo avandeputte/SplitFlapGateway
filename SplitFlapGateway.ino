@@ -53,6 +53,82 @@
 #include <FFat.h>
 #include <ESPmDNS.h>
 
+/* ============================================================================
+ *  BOARD / BUILD CONFIGURATION
+ *  ----------------------------------------------------------------------------
+ *  Everything you need to retarget this firmware to a different board, pinout,
+ *  or default setup lives in this single block. Change values here -- nothing
+ *  below this section hardcodes pins, buffer sizes, or factory defaults.
+ *
+ *  Default config is for the Waveshare ESP32-S3-RS485-CAN board.
+ * ==========================================================================*/
+
+/* ---- RS-485 transceiver pins ---- */
+#define RS485_TX_PIN   17
+#define RS485_RX_PIN   18
+#define RS485_EN_PIN   21          // DE/RE direction control (high = transmit)
+
+/* ---- I2C + PCF85063 RTC (SDA=39, SCL=38, addr 0x51) ----
+   NTP syncs the RTC on first WiFi connection. */
+#define I2C_SDA_PIN       39
+#define I2C_SCL_PIN       38
+#define PCF85063_ADDR     0x51
+#define PCF85063_SEC_REG  0x04
+#define PCF85063_CTRL1    0x00
+#define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
+
+/* ---- Firmware identity ---- */
+#define FW_VERSION           "1.4"            // gateway firmware version (UI + boot log)
+
+/* ---- Network / service defaults (overridable at runtime via Settings) ---- */
+#define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
+#define DEFAULT_AP_PASS      "12345678"       // SoftAP password (>= 8 chars)
+#define DEFAULT_BAUD         9600UL           // RS-485 bus baud rate
+#define DEFAULT_MQTT_PORT    1883
+#define DEFAULT_MQTT_PREFIX  "splitflap"
+#define DEFAULT_NTP_SERVER   "pool.ntp.org"   // overridable via Settings
+#define NTP_TIMEOUT_MS       8000UL
+
+/* ---- Bus timing ----
+   Half-duplex collision avoidance: before transmitting, wait until the bus has
+   been quiet for TX_BUS_GUARD_MS (so we never stomp on an in-flight module
+   response train), capped at TX_BUS_WAIT_CAP_MS so a noisy bus can't block
+   transmit forever. 12ms ~= 12 byte-times at 9600 baud. */
+#define TX_BUS_GUARD_MS      12
+#define TX_BUS_WAIT_CAP_MS   400
+
+/* ---- Buffer / queue sizes ----
+   Outbound frames may be longer than the 256-byte monitor-ring entry size --
+   a full 64-flap restore command (mXW<sn>:<offset>:<steps>:<map>) can reach
+   ~620 bytes. TX_MAX_BYTES bounds what rs485Send will transmit; the monitor
+   ring still stores only the first MSG_MAX_BYTES for display. */
+#define MSG_RING_SIZE        64    // monitor ring: number of frames retained
+#define MSG_MAX_BYTES        256   // monitor ring: bytes stored per frame
+#define TX_MAX_BYTES         768   // max bytes rs485Send will transmit in one frame
+#define MQTT_BUF_SIZE        768   // holds a full restore command via MQTT
+#define MQTT_Q_SIZE          32    // outbound MQTT publish queue depth
+
+/* ---- Housekeeping cadences ---- */
+#define STATUS_INTERVAL_MS      60000UL   // MQTT status publish cadence (1/min)
+#define MODULE_STALE_SECS       21600UL   // 6h: prune modules not seen in this long
+#define MODULE_SAVE_DEBOUNCE_MS 5000UL    // coalesce NVS writes
+
+/* ---- Module registry sizing ----
+   Supports module IDs 0-254 (255 modules). id==255 is reserved as the
+   empty-slot / unprovisioned sentinel, so the array needs one slot per usable
+   ID. Frame buffers (MSG_MAX_BYTES / TX_MAX_BYTES / MQTT_BUF_SIZE) are sized by
+   the 64-flap dump/restore MAP, not by module count -- a frame targets a single
+   module -- so they are unaffected by this bound. 3-digit IDs (vs 2) add ~1
+   byte to a handful of commands, still far inside TX_MAX_BYTES. */
+#define MAX_MODULES         255   // module IDs 0-254
+
+/* ---- Persisted module-registry file (FFat) ---- */
+#define MODULES_FILE     "/modules.dat"
+#define MODULES_MAGIC    0x53464731UL   // "SFG1"
+
+/* ==========================================================================*/
+
+
 // Early-declared debug flag so DBG() works before cfg is constructed.
 // Kept in sync with cfg.serialDebug in loadConfig() and handleApiConfigSettings().
 static volatile bool gSerialDebug = false;
@@ -62,26 +138,6 @@ static volatile bool gSerialDebug = false;
 // reboot is a guaranteed return to normal operation.
 static volatile bool gMaintenanceMode = false;
 #define DBG(...) do { if (gSerialDebug) printf(__VA_ARGS__); } while(0)
-
-/* ----------------------------------------------------------
-   Pin definitions  (Waveshare ESP32-S3-RS485-CAN)
----------------------------------------------------------- */
-#define RS485_TX_PIN   17
-#define RS485_RX_PIN   18
-#define RS485_EN_PIN   21
-
-/* ----------------------------------------------------------
-   I2C + PCF85063 RTC  (SDA=39, SCL=38, I2C addr 0x51)
-   NTP syncs the RTC on first WiFi connection.
----------------------------------------------------------- */
-#define I2C_SDA_PIN       39
-#define I2C_SCL_PIN       38
-#define PCF85063_ADDR     0x51
-#define PCF85063_SEC_REG  0x04
-#define PCF85063_CTRL1    0x00
-#define RTC_YEAR_OFFSET   2000  // PCF85063 reg 6 is 0-99 = 2000-2099
-#define DEFAULT_NTP_SERVER "pool.ntp.org"   // overridable via Settings
-#define NTP_TIMEOUT_MS    8000UL
 
 struct RtcTime {
   uint16_t year;
@@ -270,51 +326,17 @@ static unsigned long rtcEpochNow() {
   return (unsigned long)((long)days * 86400L + (long)hr * 3600L + (long)mn * 60L + sc);
 }
 
-/* ----------------------------------------------------------
-   Compile-time defaults
----------------------------------------------------------- */
-#define DEFAULT_AP_SSID      "Split-Flap-GW"
-#define DEFAULT_AP_PASS      "12345678"
-#define DEFAULT_BAUD         9600UL
-#define DEFAULT_MQTT_PORT    1883
-#define DEFAULT_MQTT_PREFIX  "splitflap"
-#define FW_VERSION           "1.3"   // gateway firmware version (UI + boot log)
-#define MSG_RING_SIZE        64
-#define MSG_MAX_BYTES        256
-// Outbound frames may be longer than the 256-byte monitor-ring entry size --
-// a full 64-flap restore command (mXW<sn>:<offset>:<steps>:<map>) can reach
-// ~620 bytes. TX_MAX_BYTES bounds what rs485Send will transmit; the monitor
-// ring still stores only the first MSG_MAX_BYTES for display.
-#define TX_MAX_BYTES         768
-// Half-duplex collision avoidance: before transmitting, wait until the bus has
-// been quiet for TX_BUS_GUARD_MS (so we never stomp on an in-flight module
-// response train), capped at TX_BUS_WAIT_CAP_MS so a noisy bus can't block
-// transmit forever. 12ms ~= 12 byte-times at 9600 baud.
-#define TX_BUS_GUARD_MS      12
-#define TX_BUS_WAIT_CAP_MS   400
-#define MQTT_BUF_SIZE       768   // holds a full restore command via MQTT
-#define MQTT_Q_SIZE 32
 struct MqttQItem { char topic[48]; char payload[MQTT_BUF_SIZE]; size_t len; };
 static MqttQItem             mqttQueue[MQTT_Q_SIZE];
 static volatile int          mqttQHead     = 0;
 static volatile int          mqttQTail     = 0;
 static SemaphoreHandle_t     mqttQMutex    = NULL;
 static StaticSemaphore_t     mqttQMutexBuf;
-#define STATUS_INTERVAL_MS   60000UL   // MQTT status publish cadence (1/min)
-#define MODULE_STALE_SECS    21600UL   // 6h: prune modules not seen in this long
-#define MODULE_SAVE_DEBOUNCE_MS 5000UL // coalesce NVS writes
 
 /* ----------------------------------------------------------
    Module registry  (tracks known modules on the bus)
+   See MAX_MODULES in the configuration block at the top.
 ---------------------------------------------------------- */
-// Supports module IDs 0-254 (255 modules). id==255 is reserved as the
-// empty-slot / unprovisioned sentinel, so the array needs one slot per usable
-// ID. Frame buffers (MSG_MAX_BYTES / TX_MAX_BYTES / MQTT_BUF_SIZE) are sized by
-// the 64-flap dump/restore MAP, not by module count -- a frame targets a single
-// module -- so they are unaffected by this bound. 3-digit IDs (vs 2) add ~1
-// byte to a handful of commands, still far inside TX_MAX_BYTES.
-#define MAX_MODULES         255   // module IDs 0-254
-
 struct SFModule {
   uint8_t  id;               // 0-254; 255 = slot empty
   char     serialNum[21];    // hex serial from advertisement (0-terminated)
@@ -344,6 +366,14 @@ static volatile unsigned long sfDumpCaptureTs = 0;   // millis() when captured (
 static volatile int           sfCalibWaitId   = -1;  // module id handleApiCalibrate is waiting on
 static volatile int           sfCalibSteps    = 0;   // captured steps/rev from m<id>:<steps>
 static volatile unsigned long sfCalibCaptureTs = 0;  // millis() when captured (0=none)
+// Async calibration job: the POST starts it and returns immediately; the UI
+// polls /api/flap/calibrate/status. This keeps the single-threaded web task
+// responsive during the ~15s the reel takes to physically measure a revolution
+// (a synchronous wait would freeze the whole UI for every other request).
+static volatile bool          sfCalibJobActive   = false;  // a job is in flight
+static volatile int           sfCalibJobId       = -1;     // module being calibrated
+static volatile int           sfCalibJobSteps    = -1;     // measured result (-1 until done)
+static volatile unsigned long sfCalibJobDeadline = 0;      // millis() timeout
 static volatile bool          sfModulesDirty   = false;  // pending NVS save
 static volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
 static bool          ntpSynced   = false; // declared early; also set in taskNetwork
@@ -718,11 +748,9 @@ static SFModule* sfUpsert(uint8_t id, const char* sn) {
 // Stored in the FATFS partition (already present in the default
 // "16M Flash (3MB APP/9.9MB FATFS)" scheme) -- no custom partition needed.
 // File format: a 4-byte magic+count header followed by N PersistedModule
-// records written as raw bytes.
+// records written as raw bytes. (MODULES_FILE / MODULES_MAGIC are defined in
+// the configuration block at the top.)
 // ------------------------------------------------------------------
-#define MODULES_FILE     "/modules.dat"
-#define MODULES_MAGIC    0x53464731UL   // "SFG1"
-
 struct PersistedModule {
   uint8_t       id;
   char          serialNum[21];
@@ -1617,8 +1645,11 @@ void handleRoot() {
   server.sendContent(".cedit{display:flex;gap:14px;flex-wrap:wrap;background:#0a0a0a;border-radius:6px;padding:10px 14px;margin-bottom:8px}.cedit .cb{flex:1;min-width:210px}.cedit .ck{font-size:.68rem;color:var(--dim);letter-spacing:.05em;margin-bottom:4px}.cedit .cer{display:flex;gap:5px;align-items:center}.cedit .cer input{flex:1;min-width:60px;font-family:monospace;font-size:1.15rem;font-weight:bold;text-align:center}.cedit .cer input.ho{color:var(--grn)}.cedit .cer input.ts{color:var(--ylw)}.cedit .cer button{margin:0;padding:7px 11px;white-space:nowrap;font-size:.82rem}");
   server.sendContent(".cnudge{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0;align-items:center}.cnudge button{margin:0;padding:5px 9px;font-size:.8rem;background:var(--acc)}.cnudge button.neg{background:#5a2030}.cnudge button.pos{background:#1f5a2a}.cnudge .lbl{font-size:.72rem;color:var(--dim);padding:0 4px}");
   server.sendContent(".tnudge{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0}.tnudge button{flex:1;min-width:34px;margin:0;padding:7px 3px;font-size:.78rem}.tnudge button.neg{background:#5a2030}.tnudge button.pos{background:#1f5a2a}.tnudge .lbl{flex:0 0 auto;align-self:center;font-size:.68rem;color:var(--dim);padding:0 3px}");
-  server.sendContent(".cmap{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:5px;margin-top:8px}.cc{background:#0d1b2a;border:1px solid var(--acc);border-radius:5px;padding:5px 2px;text-align:center;cursor:pointer}.cc:hover{border-color:var(--hi)}.cc .cch{font-size:1.05rem;font-weight:bold;font-family:monospace}.cc .ccv{font-size:.7rem;color:var(--dim);font-family:monospace}.cc.custom{border-color:var(--grn)}.cc.custom .ccv{color:var(--grn)}.cc .sw{display:inline-block;width:14px;height:14px;border-radius:2px;vertical-align:middle}");
+  server.sendContent(".cmap{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:5px;margin-top:8px}.cc{background:#0d1b2a;border:1px solid var(--acc);border-radius:5px;padding:5px 2px;text-align:center;cursor:pointer}.cc:hover{border-color:var(--hi)}.cc .cch{font-size:1.05rem;font-weight:bold;font-family:monospace}.cc .ccv{font-size:.7rem;color:var(--dim);font-family:monospace}.cc.custom{border-color:var(--grn)}.cc.custom .ccv{color:var(--grn)}.cc .sw{display:inline-block;width:14px;height:14px;border-radius:2px;vertical-align:middle;border:1px solid #555}");
+  server.sendContent(".calnote{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#0d1b2a;border:1px solid var(--acc);border-radius:6px;padding:9px 12px;margin-bottom:10px}.calnote .cntxt{flex:1;min-width:220px;font-size:.8rem;color:var(--dim)}.calnote button{margin:0;white-space:nowrap}");
+  server.sendContent(".calmaint{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#2a230a;border:1px solid var(--ylw);border-radius:6px;padding:9px 12px;margin-bottom:10px}.calmaint .cmtxt{flex:1;min-width:220px;font-size:.8rem;color:var(--ylw)}.calmaint button{margin:0;white-space:nowrap;background:var(--ylw);color:#1a1206;font-weight:bold}body.maint-on .calmaint{display:none}");
   server.sendContent(".tunebox{background:var(--card);border:2px solid var(--hi);border-radius:10px;padding:18px;max-width:340px;width:90%}.tunebox h3{color:var(--hi);font-size:1.1rem;margin-bottom:2px}.tunebox .exp{font-size:.8rem;color:var(--dim);margin-bottom:10px}.tunebox button{width:100%;margin-top:8px;padding:10px}.tunebox .bgoto{background:var(--acc)}.tunebox .block{background:var(--grn)}.tunebox .brev{background:var(--hi)}.tunebox .bcancel{background:#333}");
+  server.sendContent(".wizbtn{background:var(--grn);margin:8px 0 0}.wizbox{background:var(--card);border:2px solid var(--grn);border-radius:10px;padding:20px;max-width:380px;width:92%;text-align:center}.wizbox h3{color:var(--grn);font-size:1.1rem;margin:0 0 4px}.wizprog{font-size:.78rem;color:var(--dim);margin-bottom:10px}.wizbar{height:6px;background:#0a0a0a;border-radius:3px;overflow:hidden;margin-bottom:14px}.wizbar>div{height:100%;background:var(--grn);width:0;transition:width .2s}.wizchar{font-size:3.4rem;font-weight:bold;font-family:monospace;line-height:1.1;margin:6px 0}.wizchar .wsw{display:inline-block;width:56px;height:56px;border-radius:6px;vertical-align:middle;border:1px solid #555}.wizsub{font-size:.82rem;color:var(--dim);margin-bottom:10px}.wiztarget{font-size:.9rem;color:var(--ylw);font-family:monospace;margin-bottom:8px}.wiznudge{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;margin:8px 0}.wiznudge button{flex:1;min-width:36px;margin:0;padding:8px 3px;font-size:.8rem}.wiznudge button.neg{background:#5a2030}.wiznudge button.pos{background:#1f5a2a}.wizbox .wconfirm{width:100%;margin-top:10px;padding:11px;background:var(--grn);font-weight:bold}.wizbox .wreset{width:100%;margin-top:8px;padding:9px;background:var(--hi)}.wizrow{display:flex;gap:6px;margin-top:8px}.wizrow button{flex:1;margin:0;padding:9px}.wizrow .wback{background:var(--acc)}.wizrow .wskip{background:#444}.wizrow .wexit{background:var(--hi)}.wizstat{margin-top:8px;font-size:.76rem;color:var(--ylw);min-height:14px}");
   server.sendContent("</style></head><body>");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("<header><h1>Split-Flap Gateway <span class=\"verbadge\">v" FW_VERSION "</span></h1><div class=\"hdr-right\"><label class=\"maint-toggle\" title=\"When on, commands received via MQTT are ignored and not relayed to the bus. The web UI keeps working.\"><input id=\"maintChk\" type=\"checkbox\" onchange=\"toggleMaint()\"><span class=\"maint-lbl\">Maintenance</span></label><span id=\"badge\">...</span></div></header>");
@@ -1667,6 +1698,7 @@ void handleRoot() {
   server.sendContent("</div>");
   wdgWebMs = millis();
   server.sendContent("<div id=\"pane-calib\" class=\"pane\">");
+  server.sendContent("<div class=\"calmaint\"><span class=\"cmtxt\">Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.</span><button onclick=\"calEnableMaint()\">Turn On Maintenance</button></div>");
   server.sendContent("<div class=\"card\"><h2>Module Calibration</h2>");
   server.sendContent("<p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Select any module -- known or not -- to view and adjust its home offset, total steps, and per-character flap positions. Changes are written to the module's EEPROM.</p>");
   server.sendContent("<div id=\"calMods\" class=\"cmods\">Loading modules...</div>");
@@ -1674,15 +1706,23 @@ void handleRoot() {
   server.sendContent("<div id=\"calDetail\" class=\"card\" style=\"display:none\">");
   server.sendContent("<div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:8px\"><h2 id=\"calTitle\" style=\"margin:0\">Module</h2><button class=\"sec\" onclick=\"calRefresh()\" style=\"margin:0;padding:4px 10px;font-size:.8rem\">&#x21bb; Re-read EEPROM</button></div>");
   server.sendContent("<div id=\"calStatus\" style=\"font-size:.78rem;color:var(--ylw);min-height:15px;margin-bottom:6px\"></div>");
+  server.sendContent("<div class=\"calnote\"><span class=\"cntxt\">New module? Running Calibrate is recommended to confirm this reel's actual step count and home offset. It spins one full revolution to measure steps/rev, then saves the result.</span><button onclick=\"calCountSteps()\">Calibrate</button></div>");
   server.sendContent("<div class=\"cedit\"><div class=\"cb\"><div class=\"ck\">HOME OFFSET</div><div class=\"cer\"><input id=\"calHoIn\" class=\"ho\" type=\"number\" min=\"0\"><button onclick=\"calSaveHo()\">Save</button><button class=\"sec\" onclick=\"calRevertHo()\" title=\"Reset to default 2832\">Revert</button></div></div><div class=\"cb\"><div class=\"ck\">TOTAL STEPS</div><div class=\"cer\"><input id=\"calTsIn\" class=\"ts\" type=\"number\" min=\"1\"><button onclick=\"calSaveTs()\">Save</button><button class=\"sec\" onclick=\"calRevertTs()\" title=\"Reset to default 4096\">Revert</button><button class=\"sec\" id=\"calCountBtn\" onclick=\"calCountSteps()\" title=\"Run the calibrate command: the reel spins one full revolution to measure its steps per revolution\">Count Steps</button></div></div></div>");
   server.sendContent("<div class=\"cnudge\"><button class=\"neg\" onclick=\"calNudge(-32)\">-32</button><button class=\"neg\" onclick=\"calNudge(-16)\">-16</button><button class=\"neg\" onclick=\"calNudge(-4)\">-4</button><button class=\"neg\" onclick=\"calNudge(-1)\">-1</button><span class=\"lbl\">NUDGE OFFSET</span><button class=\"pos\" onclick=\"calNudge(1)\">+1</button><button class=\"pos\" onclick=\"calNudge(4)\">+4</button><button class=\"pos\" onclick=\"calNudge(16)\">+16</button><button class=\"pos\" onclick=\"calNudge(32)\">+32</button></div>");
   server.sendContent("<p style=\"font-size:.72rem;color:var(--dim);margin:0 0 8px\">Nudge moves the reel and saves the offset instantly. Press Home to verify.</p>");
   server.sendContent("<button class=\"sec\" onclick=\"calHomeMotor()\" style=\"margin:0\">Home Motor</button>");
   server.sendContent("<h2 style=\"margin-top:14px\">Character Map</h2>");
-  server.sendContent("<p style=\"font-size:.78rem;color:var(--dim);margin-bottom:4px\">Green = custom EEPROM value. Grey = firmware default. Click a character to tune its position.</p>");
+  server.sendContent("<p style=\"font-size:.78rem;color:var(--dim);margin-bottom:4px\">Green = custom EEPROM value. Grey = firmware default. Click a character to tune its position, or run the wizard to step through every flap.</p>");
+  server.sendContent("<button class=\"wizbtn\" onclick=\"calWizStart()\">&#x1f9ed; Calibration Wizard (step through all flaps)</button>");
   server.sendContent("<div id=\"calMap\" class=\"cmap\"></div></div>");
   server.sendContent("<div id=\"tuneModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center\" onclick=\"if(event.target===this)calCloseTune()\">");
   server.sendContent("<div class=\"tunebox\"><h3 id=\"tuneTitle\">Tune</h3><div class=\"exp\" id=\"tuneExp\">Expected: -</div><label>Absolute Target Step</label><input id=\"tuneVal\" type=\"number\" min=\"0\"><div class=\"tnudge\"><button class=\"neg\" onclick=\"calTuneNudge(-32)\">-32</button><button class=\"neg\" onclick=\"calTuneNudge(-16)\">-16</button><button class=\"neg\" onclick=\"calTuneNudge(-4)\">-4</button><button class=\"neg\" onclick=\"calTuneNudge(-1)\">-1</button><button class=\"pos\" onclick=\"calTuneNudge(1)\">+1</button><button class=\"pos\" onclick=\"calTuneNudge(4)\">+4</button><button class=\"pos\" onclick=\"calTuneNudge(16)\">+16</button><button class=\"pos\" onclick=\"calTuneNudge(32)\">+32</button></div><p style=\"font-size:.72rem;color:var(--dim);margin:2px 0 6px\">Adjust the value, then Test Position to move there. Lock to EEPROM when it looks right.</p><button class=\"bgoto\" onclick=\"calTuneGoto()\">Test Position (GOTO)</button><button class=\"block\" onclick=\"calTuneLock()\">Lock to EEPROM</button><button class=\"brev\" onclick=\"calTuneRevert()\">Revert to Default</button><button class=\"bcancel\" onclick=\"calCloseTune()\">Cancel</button><div id=\"tuneStatus\" style=\"margin-top:8px;font-size:.78rem;color:var(--ylw);min-height:15px\"></div></div></div>");
+  server.sendContent("<div id=\"wizModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:210;align-items:center;justify-content:center\">");
+  server.sendContent("<div class=\"wizbox\"><h3>Calibration Wizard</h3><div class=\"wizprog\" id=\"wizProg\">-</div><div class=\"wizbar\"><div id=\"wizBar\"></div></div><div style=\"font-size:.8rem;color:var(--dim)\">This flap should be showing on the reel:</div><div class=\"wizchar\" id=\"wizChar\">-</div><div class=\"wizsub\" id=\"wizSub\">Look at the module. If it is centered, confirm. If not, nudge until it is.</div><div class=\"wiztarget\" id=\"wizTarget\">step -</div><div class=\"wiznudge\"><button class=\"neg\" onclick=\"calWizNudge(-32)\">-32</button><button class=\"neg\" onclick=\"calWizNudge(-16)\">-16</button><button class=\"neg\" onclick=\"calWizNudge(-4)\">-4</button><button class=\"neg\" onclick=\"calWizNudge(-1)\">-1</button><button class=\"pos\" onclick=\"calWizNudge(1)\">+1</button><button class=\"pos\" onclick=\"calWizNudge(4)\">+4</button><button class=\"pos\" onclick=\"calWizNudge(16)\">+16</button><button class=\"pos\" onclick=\"calWizNudge(32)\">+32</button></div><button class=\"wreset\" onclick=\"calWizReset()\">Reset to Default</button><button class=\"wconfirm\" onclick=\"calWizConfirm()\">Confirm &amp; Next &#x2192;</button><div class=\"wizrow\"><button class=\"wback\" onclick=\"calWizBack()\">&#x2190; Back</button><button class=\"wskip\" onclick=\"calWizSkip()\">Skip</button><button class=\"wexit\" onclick=\"calWizExit()\">Exit</button></div><div class=\"wizstat\" id=\"wizStat\"></div></div></div>");
+  server.sendContent("<div id=\"wizIntroModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:210;align-items:center;justify-content:center\">");
+  server.sendContent("<div class=\"wizbox\"><div id=\"wizStep1\"><h3>Before you start (1 of 2)</h3><p style=\"font-size:.86rem;color:var(--txt);margin:6px 0 4px\">Have you run <b>Calibrate (Count Steps)</b> on this module to confirm the reel's actual step count?</p><p style=\"font-size:.78rem;color:var(--dim);margin:0 0 14px\">The wizard relies on the measured step count to place each flap. If it is wrong, every flap will be off. Calibrate first if you haven't.</p><button class=\"wconfirm\" onclick=\"calWizStep2()\">Yes -- step count is confirmed</button><button class=\"wreset\" style=\"background:var(--acc)\" onclick=\"calWizIntroCalibrate()\">No -- run Calibrate now</button><button class=\"wskip\" style=\"width:100%;margin-top:8px;padding:9px;background:#444\" onclick=\"calWizIntroCancel()\">Cancel</button></div>");
+  server.sendContent("<div id=\"wizStep2\" style=\"display:none\"><h3>Before you start (2 of 2)</h3><p style=\"font-size:.86rem;color:var(--txt);margin:6px 0 4px\">Has the <b>home position</b> been confirmed? When homed, the blank (black) flap should sit centered in the window.</p><p style=\"font-size:.78rem;color:var(--dim);margin:0 0 14px\">This is the home offset. If the blank flap is off-center, every character will be too. Confirm it now if you haven't.</p><button class=\"wconfirm\" onclick=\"calWizIntroYes()\">Yes -- home is confirmed, start wizard</button><button class=\"wreset\" style=\"background:var(--acc)\" onclick=\"calWizHomeStage()\">Confirm / adjust home position now</button><button class=\"wskip\" style=\"width:100%;margin-top:8px;padding:9px;background:#444\" onclick=\"calWizIntroCancel()\">Cancel</button></div>");
+  server.sendContent("<div id=\"wizStep3\" style=\"display:none\"><h3>Confirm home position</h3><div style=\"font-size:.8rem;color:var(--dim)\">This flap should be showing on the reel (homed):</div><div class=\"wizchar\"><span class=\"wsw\" style=\"background:#000\"></span></div><div class=\"wizsub\">BLANK (home). Press Re-home, then nudge until the blank flap is centered. Nudges save instantly.</div><div class=\"wiztarget\" id=\"wizHoVal\">offset -</div><div class=\"wiznudge\"><button class=\"neg\" onclick=\"calWizHomeNudge(-32)\">-32</button><button class=\"neg\" onclick=\"calWizHomeNudge(-16)\">-16</button><button class=\"neg\" onclick=\"calWizHomeNudge(-4)\">-4</button><button class=\"neg\" onclick=\"calWizHomeNudge(-1)\">-1</button><button class=\"pos\" onclick=\"calWizHomeNudge(1)\">+1</button><button class=\"pos\" onclick=\"calWizHomeNudge(4)\">+4</button><button class=\"pos\" onclick=\"calWizHomeNudge(16)\">+16</button><button class=\"pos\" onclick=\"calWizHomeNudge(32)\">+32</button></div><button class=\"wreset\" style=\"background:var(--acc)\" onclick=\"calWizHomeRehome()\">Re-home (verify)</button><button class=\"wconfirm\" onclick=\"calWizIntroYes()\">Home is centered -- start wizard</button><button class=\"wskip\" style=\"width:100%;margin-top:8px;padding:9px;background:#444\" onclick=\"calWizStep2Back()\">Back</button><div class=\"wizstat\" id=\"wizHoStat\"></div></div></div></div>");
   server.sendContent("</div>");
   server.sendContent("<div id=\"pane-backup\" class=\"pane\">");
   server.sendContent("<div class=\"card\"><h2>Backup Calibration</h2>");
@@ -1800,25 +1840,25 @@ void handleRoot() {
   server.sendContent("function saveGrid(){var rows=parseInt(document.getElementById(\"gRows\").value)||1;var cols=parseInt(document.getElementById(\"gCols\").value)||1;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({gridRows:rows,gridCols:cols})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"gridR\").textContent=j.ok?\"Layout saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"gridR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveOTA(){fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({otaPassword:document.getElementById(\"otaPw\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"otaR\").textContent=j.ok?\"OTA password saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"otaR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveDebug(){var v=document.getElementById(\"dbgChk\").checked;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({serialDebug:v})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"dbgR\").textContent=j.ok?(v?\"Debug enabled\":\"Debug disabled\"):\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"dbgR\").textContent=\"Error: \"+e;});}");
-  server.sendContent("function setMaintUI(on){var chk=document.getElementById(\"maintChk\");if(chk)chk.checked=!!on;var lbl=document.querySelector(\".maint-toggle\");if(lbl)lbl.classList.toggle(\"active\",!!on);document.body.classList.toggle(\"maint-on\",!!on);}function toggleMaint(){var chk=document.getElementById(\"maintChk\");var on=chk.checked;fetch(\"/api/maintenance\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:on})}).then(function(r){return r.json();}).then(function(j){setMaintUI(j.on);}).catch(function(){chk.checked=!on;setMaintUI(!on);});}");
+  server.sendContent("function setMaintUI(on){var chk=document.getElementById(\"maintChk\");if(chk)chk.checked=!!on;var lbl=document.querySelector(\".maint-toggle\");if(lbl)lbl.classList.toggle(\"active\",!!on);document.body.classList.toggle(\"maint-on\",!!on);}function toggleMaint(){var chk=document.getElementById(\"maintChk\");var on=chk.checked;fetch(\"/api/maintenance\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:on})}).then(function(r){return r.json();}).then(function(j){setMaintUI(j.on);}).catch(function(){chk.checked=!on;setMaintUI(!on);});}function calEnableMaint(){var chk=document.getElementById(\"maintChk\");if(chk&&!chk.checked){chk.checked=true;toggleMaint();}}");
   server.sendContent("function pollStatus(){fetch(\"/api/status\").then(function(r){return r.json();}).then(function(s){var up=s.uptime,ud=Math.floor(up/86400),uh=Math.floor(up%86400/3600),um=Math.floor(up%3600/60),us=up%60;document.getElementById(\"s-up\").textContent=(ud?ud+\"d \":\"\")+(uh||ud?uh+\"h \":\"\")+um+\"m \"+us+\"s\";document.getElementById(\"s-rx\").textContent=s.rx;document.getElementById(\"s-tx\").textContent=s.tx;document.getElementById(\"s-ip\").textContent=s.ip;document.getElementById(\"s-ap\").textContent=s.apip;var hp=document.getElementById(\"s-hp\");hp.textContent=Math.round(s.heap/1024)+\" KB\";hp.className=\"v \"+(s.heap>=40000?\"vok\":(s.heap>=25000?\"vwarn\":\"vbad\"));var mq=document.getElementById(\"s-mq\");mq.textContent=s.mqtt?\"Connected\":\"Off\";mq.className=\"v \"+(s.mqtt?\"vok\":\"\");document.getElementById(\"s-mod\").textContent=s.modules;if(s.minheap){var mh=document.getElementById(\"s-mh\");mh.textContent=Math.round(s.minheap/1024)+\" KB\";mh.className=\"v \"+(s.minheap>=40000?\"vok\":(s.minheap>=25000?\"vwarn\":\"vbad\"));}if(s.stk){var sm=null,sn=\"\";for(var k in s.stk){if(sm===null||s.stk[k]<sm){sm=s.stk[k];sn=k;}}var st=document.getElementById(\"s-stk\");st.textContent=sm+\" B (\"+sn+\")\";st.className=\"v \"+(sm>=800?\"vok\":(sm>=400?\"vwarn\":\"vbad\"));}if(document.getElementById(\"s-rtc\"))document.getElementById(\"s-rtc\").textContent=s.time||\"--\";var ntp=document.getElementById(\"s-ntp\");if(ntp){ntp.textContent=s.ntpSynced?\"Synced\":\"Pending\";ntp.className=\"v \"+(s.ntpSynced?\"vok\":\"vwarn\");}var b=document.getElementById(\"badge\");b.textContent=s.wifi?\"WiFi: \"+s.ip:\"AP only\";b.className=s.wifi?\"ok\":\"\";if(typeof s.maint!==\"undefined\")setMaintUI(s.maint);}).catch(function(){});}setInterval(pollStatus,3000);pollStatus();");
   server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}if(c.gridRows){document.getElementById(\"gRows\").value=c.gridRows;}if(c.gridCols){document.getElementById(\"gCols\").value=c.gridCols;}});");
   server.sendContent("var CAL_CHARS=\" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\";var CAL_COLORS={r:\"#e23b3b\",o:\"#ff9f0a\",y:\"#ffd60a\",g:\"#2fb84a\",b:\"#3b82f6\",p:\"#a855f7\",w:\"#e8e8e8\"};");
-  server.sendContent("var _calId=-1,_calTotal=4096,_calHo=0,_calMap={},_tuneIdx=-1;var CAL_UNSET=65535,CAL_DEF_HO=2832,CAL_DEF_TS=4096;");
-  server.sendContent("function calDefault(i){return i*64;}");
+  server.sendContent("var _calId=-1,_calTotal=4096,_calHo=0,_calMap={},_tuneIdx=-1;var CAL_UNSET=65535,CAL_DEF_HO=2832,CAL_DEF_TS=4096;var _wizIdx=-1,_wizTarget=0;");
+  server.sendContent("function calDefault(i){var ts=(_calTotal&&_calTotal>0)?_calTotal:CAL_DEF_TS;return Math.floor((i*ts)/64);}");
   server.sendContent("function calParseDump(raw){var r={homeOffset:0,totalSteps:4096,map:{}};if(!raw)return r;var parts=raw.split(\":\");r.homeOffset=parseInt(parts[0]);r.totalSteps=parseInt(parts[1]);if(isNaN(r.totalSteps))r.totalSteps=4096;if(parts.length>2){var rest=parts.slice(2).join(\":\");rest.split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\"){var k=parseInt(kv[0]),v=parseInt(kv[1]);if(!isNaN(k)&&!isNaN(v)&&v!==CAL_UNSET)r.map[k]=v;}});}return r;}");
   server.sendContent("function calLoadModules(){var el=document.getElementById(\"calMods\");el.textContent=\"Loading layout...\";Promise.all([fetch(\"/api/display/state\").then(function(r){return r.json();}),fetch(\"/api/flap/modules\").then(function(r){return r.json();})]).then(function(res){var st=res[0]||{},arr=res[1]||[];var rows=st.rows||1,cols=st.cols||16;var count=rows*cols;el.classList.remove(\"single\");el.style.gridTemplateColumns=\"repeat(\"+cols+\",minmax(0,1fr))\";var byId={};arr.forEach(function(m){if(m.provisioned)byId[m.id]=m;});var h=\"\";for(var id=0;id<count;id++){var m=byId[id];var legacy=m&&m.lastSeen>0&&!m.fwVersion;var known=m&&m.fwVersion;var cls=\"cmod\";if(id===_calId)cls+=\" sel\";if(legacy)cls+=\" legacy\";else if(known)cls+=\" known\";else if(!m)cls+=\" unknown\";var sub=legacy?\"<span class='csn lg'>v7</span>\":(m&&m.sn?\"<span class='csn'>\"+m.sn.slice(-4)+\"</span>\":\"<span class='csn'>--</span>\");h+=\"<div class='\"+cls+\"' data-id='\"+id+\"' onclick='calSelect(\"+id+\")'>\"+id+sub+\"</div>\";}el.innerHTML=h;}).catch(function(){el.innerHTML=\"<span style='color:var(--hi)'>Error loading layout</span>\";});}");
   server.sendContent("function calSelectAny(){var v=parseInt(document.getElementById(\"calAnyId\").value);if(isNaN(v)||v<0||v>254){alert(\"Enter an ID from 0 to 254.\");return;}calSelect(v);}");
   server.sendContent("function calSelect(id){_calId=id;document.querySelectorAll(\"#calMods .cmod\").forEach(function(el){el.classList.toggle(\"sel\",parseInt(el.dataset.id)===id);});var cell=document.querySelector(\"#calMods .cmod[data-id='\"+id+\"']\");var tag=\"\";if(cell){if(cell.classList.contains(\"legacy\"))tag=\" (legacy v7)\";else if(cell.classList.contains(\"unknown\"))tag=\" (not yet seen)\";}document.getElementById(\"calDetail\").style.display=\"block\";document.getElementById(\"calTitle\").textContent=\"Module \"+id+tag;calRefresh();}");
   server.sendContent("function calRefresh(){if(_calId<0)return;var st=document.getElementById(\"calStatus\");st.textContent=\"Reading EEPROM from module \"+_calId+\"...\";document.getElementById(\"calHoIn\").value=\"\";document.getElementById(\"calTsIn\").value=\"\";document.getElementById(\"calMap\").innerHTML=\"\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:_calId})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){st.textContent=\"Error: \"+(d.error||\"no response from module\");return;}var p=calParseDump(d.dump||\"\");_calHo=p.homeOffset;_calTotal=p.totalSteps;_calMap=p.map;document.getElementById(\"calHoIn\").value=isNaN(p.homeOffset)?\"\":p.homeOffset;document.getElementById(\"calTsIn\").value=p.totalSteps;st.textContent=d.stale?\"Cached EEPROM -- click Re-read for a fresh value\":\"EEPROM read fresh from module\";calRenderMap();}).catch(function(e){st.textContent=\"Error: \"+e;});}");
   server.sendContent("function calSwatch(ch){var c=CAL_COLORS[ch];return c?\"<span class='sw' style='background:\"+c+\"'></span>\":ch;}");
-  server.sendContent("function calRenderMap(){var el=document.getElementById(\"calMap\");var h=\"\";for(var i=0;i<CAL_CHARS.length;i++){var ch=CAL_CHARS[i];var has=_calMap.hasOwnProperty(i);var val=has?_calMap[i]:calDefault(i);var disp=(ch===\" \")?\"&#9632;\":(CAL_COLORS[ch]?calSwatch(ch):ch);h+=\"<div class='cc\"+(has?\" custom\":\"\")+\"' onclick='calOpenTune(\"+i+\")'><div class='cch'>\"+disp+\"</div><div class='ccv'>\"+val+\"</div></div>\";}el.innerHTML=h;}");
+  server.sendContent("function calRenderMap(){var el=document.getElementById(\"calMap\");var h=\"\";for(var i=0;i<CAL_CHARS.length;i++){var ch=CAL_CHARS[i];var has=_calMap.hasOwnProperty(i);var val=has?_calMap[i]:calDefault(i);var disp=(ch===\" \")?\"<span class='sw' style='background:#000'></span>\":(CAL_COLORS[ch]?calSwatch(ch):ch);h+=\"<div class='cc\"+(has?\" custom\":\"\")+\"' onclick='calOpenTune(\"+i+\")'><div class='cch'>\"+disp+\"</div><div class='ccv'>\"+val+\"</div></div>\";}el.innerHTML=h;}");
   server.sendContent("function calApi(path,body,cb){fetch(path,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(cb).catch(function(e){cb({ok:false,error:String(e)});});}");
   server.sendContent("function calSaveHo(){var v=parseInt(document.getElementById(\"calHoIn\").value);if(isNaN(v)||v<0){document.getElementById(\"calStatus\").textContent=\"Enter a valid home offset.\";return;}calApi(\"/api/flap/homeoffset\",{id:_calId,steps:v},function(j){document.getElementById(\"calStatus\").textContent=j.ok?\"Home offset saved (\"+v+\"). Click Home Motor to verify.\":\"Error: \"+j.error;if(j.ok)_calHo=v;});}");
   server.sendContent("function calRevertHo(){document.getElementById(\"calHoIn\").value=CAL_DEF_HO;calApi(\"/api/flap/homeoffset\",{id:_calId,steps:CAL_DEF_HO},function(j){document.getElementById(\"calStatus\").textContent=j.ok?\"Home offset reset to default (\"+CAL_DEF_HO+\").\":\"Error: \"+j.error;if(j.ok)_calHo=CAL_DEF_HO;});}");
   server.sendContent("function calSaveTs(){var v=parseInt(document.getElementById(\"calTsIn\").value);if(isNaN(v)||v<1){document.getElementById(\"calStatus\").textContent=\"Enter a valid total steps.\";return;}calApi(\"/api/flap/totalsteps\",{id:_calId,steps:v},function(j){document.getElementById(\"calStatus\").textContent=j.ok?\"Total steps saved (\"+v+\").\":\"Error: \"+j.error;if(j.ok){_calTotal=v;calRenderMap();}});}");
   server.sendContent("function calRevertTs(){document.getElementById(\"calTsIn\").value=CAL_DEF_TS;calApi(\"/api/flap/totalsteps\",{id:_calId,steps:CAL_DEF_TS},function(j){document.getElementById(\"calStatus\").textContent=j.ok?\"Total steps reset to default (\"+CAL_DEF_TS+\").\":\"Error: \"+j.error;if(j.ok){_calTotal=CAL_DEF_TS;calRenderMap();}});}");
-  server.sendContent("function calCountSteps(){if(_calId<0)return;var btn=document.getElementById(\"calCountBtn\");var st=document.getElementById(\"calStatus\");if(!confirm(\"Count steps on module \"+_calId+\"? The reel will spin a full revolution to measure its steps per revolution.\"))return;btn.disabled=true;btn.textContent=\"Counting...\";st.textContent=\"Calibrating module \"+_calId+\" -- the reel is spinning, please wait (up to ~15s)...\";calApi(\"/api/flap/calibrate\",{id:_calId},function(j){if(j.ok&&typeof j.stepsPerRev===\"number\"){var n=j.stepsPerRev;document.getElementById(\"calTsIn\").value=n;_calTotal=n;calRenderMap();st.textContent=\"Measured \"+n+\" steps/rev. Saving to module...\";calApi(\"/api/flap/totalsteps\",{id:_calId,steps:n},function(j2){st.textContent=j2.ok?(\"Total steps measured and saved: \"+n+\".\"):(\"Measured \"+n+\" but save failed: \"+j2.error);btn.disabled=false;btn.textContent=\"Count Steps\";});}else{st.textContent=\"Error: \"+(j.error||\"no calibration response\");btn.disabled=false;btn.textContent=\"Count Steps\";}});}");
+  server.sendContent("function calCountSteps(){if(_calId<0)return;var btn=document.getElementById(\"calCountBtn\");var st=document.getElementById(\"calStatus\");if(!confirm(\"Count steps on module \"+_calId+\"? The reel will spin a full revolution to measure its steps per revolution.\"))return;btn.disabled=true;btn.textContent=\"Counting...\";st.textContent=\"Calibrating module \"+_calId+\" -- the reel is spinning, please wait (up to ~15s)...\";var jobId=_calId;calApi(\"/api/flap/calibrate\",{id:jobId},function(j){if(!j.ok||!j.started){st.textContent=\"Error: \"+(j.error||\"could not start calibration\");btn.disabled=false;btn.textContent=\"Count Steps\";return;}var tries=0;var poll=setInterval(function(){tries++;if(tries>40){clearInterval(poll);st.textContent=\"Calibration timed out (no response).\";btn.disabled=false;btn.textContent=\"Count Steps\";return;}fetch(\"/api/flap/calibrate/status\").then(function(r){return r.json();}).then(function(s){if(s.state===\"pending\")return;clearInterval(poll);if(s.state===\"done\"&&typeof s.stepsPerRev===\"number\"){var n=s.stepsPerRev;if(_calId===jobId){document.getElementById(\"calTsIn\").value=n;_calTotal=n;calRenderMap();}st.textContent=\"Measured \"+n+\" steps/rev. Saving to module...\";calApi(\"/api/flap/totalsteps\",{id:jobId,steps:n},function(j2){st.textContent=j2.ok?(\"Total steps measured and saved: \"+n+\".\"):(\"Measured \"+n+\" but save failed: \"+j2.error);btn.disabled=false;btn.textContent=\"Count Steps\";});}else{st.textContent=(s.state===\"timeout\")?\"Calibration timed out (no response from module).\":\"Calibration failed.\";btn.disabled=false;btn.textContent=\"Count Steps\";}}).catch(function(){});},500);});}");
   server.sendContent("function calNudge(d){if(_calId<0)return;calApi(\"/api/flap/nudge\",{id:_calId,steps:d},function(j){if(j.ok){_calHo+=d;document.getElementById(\"calHoIn\").value=_calHo;document.getElementById(\"calStatus\").textContent=\"Nudged \"+(d>0?\"+\":\"\")+d+\" (offset now \"+_calHo+\"). Saved instantly.\";}else{document.getElementById(\"calStatus\").textContent=\"Error: \"+j.error;}});}");
   server.sendContent("function calHomeMotor(){if(_calId<0)return;calApi(\"/api/flap/home\",{id:_calId},function(j){document.getElementById(\"calStatus\").textContent=j.ok?\"Homing module \"+_calId+\"...\":\"Error: \"+j.error;});}");
   server.sendContent("function calOpenTune(i){_tuneIdx=i;var ch=CAL_CHARS[i];var has=_calMap.hasOwnProperty(i);var cur=has?_calMap[i]:calDefault(i);var label=(ch===\" \")?\"(blank)\":(CAL_COLORS[ch]?ch.toUpperCase()+\" (color)\":ch);document.getElementById(\"tuneTitle\").textContent=\"Tune: \"+label;document.getElementById(\"tuneExp\").textContent=\"Default: \"+calDefault(i)+(has?\"  |  Current EEPROM: \"+cur:\"  (using default)\");document.getElementById(\"tuneVal\").value=cur;document.getElementById(\"tuneStatus\").textContent=\"\";document.getElementById(\"tuneModal\").style.display=\"flex\";}");
@@ -1827,6 +1867,26 @@ void handleRoot() {
   server.sendContent("function calTuneGoto(){if(_tuneIdx<0)return;var v=parseInt(document.getElementById(\"tuneVal\").value);if(isNaN(v)||v<0){document.getElementById(\"tuneStatus\").textContent=\"Enter a valid step.\";return;}calApi(\"/api/flap/goto\",{id:_calId,step:v},function(j){document.getElementById(\"tuneStatus\").textContent=j.ok?\"Moving to step \"+v+\"... watch the reel.\":\"Error: \"+j.error;});}");
   server.sendContent("function calTuneLock(){if(_tuneIdx<0)return;var v=parseInt(document.getElementById(\"tuneVal\").value);if(isNaN(v)||v<0){document.getElementById(\"tuneStatus\").textContent=\"Enter a valid step.\";return;}calApi(\"/api/flap/writepos\",{id:_calId,idx:_tuneIdx,pos:v},function(j){if(j.ok){_calMap[_tuneIdx]=v;document.getElementById(\"tuneStatus\").textContent=\"Locked to EEPROM at step \"+v+\".\";calRenderMap();setTimeout(calCloseTune,700);}else{document.getElementById(\"tuneStatus\").textContent=\"Error: \"+j.error;}});}");
   server.sendContent("function calTuneRevert(){if(_tuneIdx<0)return;var def=calDefault(_tuneIdx);calApi(\"/api/flap/writepos\",{id:_calId,idx:_tuneIdx,pos:CAL_UNSET},function(j){if(j.ok){delete _calMap[_tuneIdx];document.getElementById(\"tuneVal\").value=def;document.getElementById(\"tuneStatus\").textContent=\"Unset in EEPROM -- now uses default (\"+def+\").\";calRenderMap();setTimeout(calCloseTune,800);}else{document.getElementById(\"tuneStatus\").textContent=\"Error: \"+j.error;}});}");
+  server.sendContent("function calCharDisp(i){var ch=CAL_CHARS[i];if(ch===\" \")return \"<span class='wsw' style='background:#000'></span>\";if(CAL_COLORS[ch])return \"<span class='wsw' style='background:\"+CAL_COLORS[ch]+\"'></span>\";return ch;}");
+  server.sendContent("function calCharName(i){var ch=CAL_CHARS[i];if(ch===\" \")return \"BLANK (home)\";if(CAL_COLORS[ch])return ch.toUpperCase()+\" color flap\";return \"'\"+ch+\"'\";}");
+  server.sendContent("function calWizIntroStage(n){document.getElementById(\"wizStep1\").style.display=(n===1)?\"block\":\"none\";document.getElementById(\"wizStep2\").style.display=(n===2)?\"block\":\"none\";document.getElementById(\"wizStep3\").style.display=(n===3)?\"block\":\"none\";}");
+  server.sendContent("function calWizStart(){if(_calId<0)return;calWizIntroStage(1);document.getElementById(\"wizIntroModal\").style.display=\"flex\";}");
+  server.sendContent("function calWizIntroCancel(){document.getElementById(\"wizIntroModal\").style.display=\"none\";}");
+  server.sendContent("function calWizIntroCalibrate(){document.getElementById(\"wizIntroModal\").style.display=\"none\";calCountSteps();}");
+  server.sendContent("function calWizStep2(){calWizIntroStage(2);}");
+  server.sendContent("function calWizStep2Back(){calWizIntroStage(2);}");
+  server.sendContent("function calWizHomeStage(){calWizIntroStage(3);document.getElementById(\"wizHoVal\").textContent=\"offset \"+_calHo;document.getElementById(\"wizHoStat\").textContent=\"Homing...\";calApi(\"/api/flap/home\",{id:_calId},function(j){document.getElementById(\"wizHoStat\").textContent=j.ok?\"Homed. Is the blank flap centered?\":\"Home error: \"+j.error;});}");
+  server.sendContent("function calWizHomeNudge(d){calApi(\"/api/flap/nudge\",{id:_calId,steps:d},function(j){if(j.ok){_calHo+=d;document.getElementById(\"calHoIn\").value=_calHo;document.getElementById(\"wizHoVal\").textContent=\"offset \"+_calHo;document.getElementById(\"wizHoStat\").textContent=\"Nudged \"+(d>0?\"+\":\"\")+d+\" (offset \"+_calHo+\"). Saved.\";}else{document.getElementById(\"wizHoStat\").textContent=\"Error: \"+j.error;}});}");
+  server.sendContent("function calWizHomeRehome(){document.getElementById(\"wizHoStat\").textContent=\"Re-homing...\";calApi(\"/api/flap/home\",{id:_calId},function(j){document.getElementById(\"wizHoStat\").textContent=j.ok?\"Re-homed. Check the blank flap is centered.\":\"Home error: \"+j.error;});}");
+  server.sendContent("function calWizIntroYes(){document.getElementById(\"wizIntroModal\").style.display=\"none\";_wizIdx=0;document.getElementById(\"wizModal\").style.display=\"flex\";calWizShow();}");
+  server.sendContent("function calWizShow(){if(_wizIdx>=CAL_CHARS.length){calWizFinish();return;}var i=_wizIdx;_wizTarget=_calMap.hasOwnProperty(i)?_calMap[i]:calDefault(i);document.getElementById(\"wizProg\").textContent=\"Flap \"+(i+1)+\" of \"+CAL_CHARS.length+\" -- \"+calCharName(i);document.getElementById(\"wizBar\").style.width=Math.round((i)/CAL_CHARS.length*100)+\"%\";document.getElementById(\"wizChar\").innerHTML=calCharDisp(i);document.getElementById(\"wizTarget\").textContent=\"step \"+_wizTarget+(_calMap.hasOwnProperty(i)?\" (custom)\":\" (default)\");document.getElementById(\"wizStat\").textContent=\"\";calApi(\"/api/flap/goto\",{id:_calId,step:_wizTarget},function(j){if(!j.ok)document.getElementById(\"wizStat\").textContent=\"Move error: \"+j.error;});}");
+  server.sendContent("function calWizNudge(d){_wizTarget+=d;if(_wizTarget<0)_wizTarget=0;document.getElementById(\"wizTarget\").textContent=\"step \"+_wizTarget+\" (adjusting)\";calApi(\"/api/flap/goto\",{id:_calId,step:_wizTarget},function(j){if(!j.ok)document.getElementById(\"wizStat\").textContent=\"Move error: \"+j.error;});}");
+  server.sendContent("function calWizReset(){var i=_wizIdx;var def=calDefault(i);var st=document.getElementById(\"wizStat\");_wizTarget=def;document.getElementById(\"wizTarget\").textContent=\"step \"+def+\" (default)\";if(_calMap.hasOwnProperty(i)){calApi(\"/api/flap/writepos\",{id:_calId,idx:i,pos:CAL_UNSET},function(j){if(j.ok){delete _calMap[i];st.textContent=\"Reset to default (\"+def+\") and cleared custom value.\";}else{st.textContent=\"Reset error: \"+j.error;}});}else{st.textContent=\"Already at default (\"+def+\").\";}calApi(\"/api/flap/goto\",{id:_calId,step:def},function(j){});}");
+  server.sendContent("function calWizConfirm(){var i=_wizIdx;var def=calDefault(i);var had=_calMap.hasOwnProperty(i);var st=document.getElementById(\"wizStat\");if(_wizTarget!==def){calApi(\"/api/flap/writepos\",{id:_calId,idx:i,pos:_wizTarget},function(j){if(j.ok){_calMap[i]=_wizTarget;st.textContent=\"Saved custom position \"+_wizTarget+\".\";_wizIdx++;setTimeout(calWizShow,300);}else{st.textContent=\"Save error: \"+j.error;}});}else if(had){calApi(\"/api/flap/writepos\",{id:_calId,idx:i,pos:CAL_UNSET},function(j){if(j.ok){delete _calMap[i];st.textContent=\"Matches default -- cleared custom value.\";_wizIdx++;setTimeout(calWizShow,300);}else{st.textContent=\"Save error: \"+j.error;}});}else{st.textContent=\"Already at default -- no change needed.\";_wizIdx++;setTimeout(calWizShow,250);}}");
+  server.sendContent("function calWizSkip(){_wizIdx++;calWizShow();}");
+  server.sendContent("function calWizBack(){if(_wizIdx>0)_wizIdx--;calWizShow();}");
+  server.sendContent("function calWizFinish(){document.getElementById(\"wizModal\").style.display=\"none\";_wizIdx=-1;calRenderMap();document.getElementById(\"calStatus\").textContent=\"Calibration wizard complete -- all flaps reviewed.\";}");
+  server.sendContent("function calWizExit(){if(!confirm(\"Exit the wizard? Flaps you already confirmed are saved; the rest are unchanged.\"))return;document.getElementById(\"wizModal\").style.display=\"none\";_wizIdx=-1;calRenderMap();}");
   server.sendContent("</script></body></html>");
   server.sendContent("");
   server.sendContent("");
@@ -1857,30 +1917,43 @@ void handleApiSend() {
 }
 
 // GET /api/flap/modules
+// Streamed with chunked transfer + a small per-module stack buffer instead of
+// building one large heap String. This avoids the alloc/free of a multi-KB
+// String on every poll (the UI polls this every few seconds), which was a
+// meaningful contributor to long-run heap fragmentation. The sfMutex is taken
+// only briefly to snapshot each entry -- never held across the (potentially
+// blocking) sendContent network write, which could otherwise stall taskRS485.
 void handleApiModules() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent("[");
+
   xSemaphoreTake(sfMutex, portMAX_DELAY);
-  String out;
-  out.reserve(sfModuleCount * 220);
-  out = "[";
-  for (int i = 0; i < sfModuleCount; i++) {
-    const SFModule& m = sfModules[i];
-    if (i) out += ',';
-    out += "{\"id\":";      out += (int)m.id;
-    out += ",\"sn\":\"";    out += m.serialNum;  out += '"';
-    out += ",\"provisioned\":"; out += m.provisioned ? "true" : "false";
-    out += ",\"flapIndex\":"; out += m.flapIndex;
-    out += ",\"flapChar\":\"";
-    if (m.flapChar >= 32 && m.flapChar <= 126 && m.flapChar != '"') out += m.flapChar;
-    out += '"';
-    out += ",\"fwVersion\":\""; out += m.fwVersion; out += '"';
-    out += ",\"lastSeen\":"; out += m.lastSeen;
-    out += ",\"lastSeenEpoch\":"; out += m.lastSeenEpoch;
-    out += '}';
-  }
-  out += ']';
+  int count = sfModuleCount;
   xSemaphoreGive(sfMutex);
-  server.send(200, "application/json", out);
+
+  for (int i = 0; i < count; i++) {
+    // Snapshot this entry under the lock, then release before formatting/sending.
+    SFModule m;
+    bool valid = false;
+    xSemaphoreTake(sfMutex, portMAX_DELAY);
+    if (i < sfModuleCount) { m = sfModules[i]; valid = true; }
+    xSemaphoreGive(sfMutex);
+    if (!valid) break;   // list shrank (prune/deprovision) mid-iteration
+
+    char flapBuf[2] = {0, 0};
+    if (m.flapChar >= 32 && m.flapChar <= 126 && m.flapChar != '"') flapBuf[0] = m.flapChar;
+    char obj[256];
+    snprintf(obj, sizeof(obj),
+      "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"flapIndex\":%d,"
+      "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"lastSeen\":%lu,\"lastSeenEpoch\":%lu}",
+      i ? "," : "", (int)m.id, m.serialNum, m.provisioned ? "true" : "false",
+      m.flapIndex, flapBuf, m.fwVersion, m.lastSeen, m.lastSeenEpoch);
+    server.sendContent(obj);
+  }
+  server.sendContent("]");
+  server.sendContent("");   // terminate the chunked response
 }
 
 // GET /api/display/state -- the data behind the visual "display wall". Returns
@@ -1911,21 +1984,30 @@ void handleApiDisplayState() {
   }
   xSemaphoreGive(sfMutex);
 
-  String out;
-  out.reserve(cells * 6 + 64);
-  out = "{\"rows\":"; out += rows;
-  out += ",\"cols\":"; out += cols;
-  out += ",\"cells\":[";
+  // Stream the response (chunked) from the static cellChar snapshot rather than
+  // building a multi-KB heap String for a frequently-polled endpoint. The mutex
+  // was already released above, so nothing is held across these network writes.
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  char head[48];
+  snprintf(head, sizeof(head), "{\"rows\":%d,\"cols\":%d,\"cells\":[", rows, cols);
+  server.sendContent(head);
+  // Emit cells in batches to keep the number of tiny network writes down.
+  char batch[256]; size_t bl = 0;
   for (int i = 0; i < cells; i++) {
-    if (i) out += ',';
+    char cellBuf[8]; int cn;
     char c = cellChar[i];
-    if (c == 0)            out += "null";              // no module at this id
-    else if (c == 1)       out += "\"?\"";             // module present, char unknown
-    else if (c == '"' || c == '\\') { out += '"'; out += '\\'; out += c; out += '"'; }
-    else { out += '"'; out += c; out += '"'; }
+    if (c == 0)                       cn = snprintf(cellBuf, sizeof(cellBuf), "%snull", i ? "," : "");
+    else if (c == 1)                  cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"?\"", i ? "," : "");
+    else if (c == '"' || c == '\\')   cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"\\%c\"", i ? "," : "", c);
+    else                              cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"%c\"", i ? "," : "", c);
+    if (cn < 0) cn = 0;
+    if (bl + (size_t)cn >= sizeof(batch)) { server.sendContent(batch); bl = 0; }
+    memcpy(batch + bl, cellBuf, cn); bl += cn;
   }
-  out += "]}";
-  server.send(200, "application/json", out);
+  if (bl) { batch[bl] = 0; server.sendContent(batch); }
+  server.sendContent("]}");
+  server.sendContent("");   // terminate the chunked response
 }
 
 // POST /api/flap/char   {"id":5,"char":"A"}   id=-1 for broadcast
@@ -1991,10 +2073,12 @@ void handleApiHome() {
 }
 
 // POST /api/flap/calibrate  {"id":5}
-// Sends m<id>c, then waits for the module's m<id>:<steps> reply (the reel
-// physically measures a full revolution, which takes several seconds). On
-// success returns {ok,id,stepsPerRev}; the module saves the measured value to
-// its own EEPROM as part of calibration. Broadcast (id<0) is fire-and-forget.
+// Starts an asynchronous calibration. Sends m<id>c and returns immediately so
+// the single-threaded web server stays responsive while the reel physically
+// measures a revolution (~6.5s, up to 15s). The module replies m<id>:<steps>,
+// captured in sfParseResponse; the UI polls /api/flap/calibrate/status for the
+// result. The module saves the measured value to its own EEPROM as part of
+// calibration. A broadcast (id<0) is fire-and-forget.
 void handleApiCalibrate() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
@@ -2012,36 +2096,80 @@ void handleApiCalibrate() {
     return;
   }
 
-  // Arm the capture slot for this id, then send the calibrate command.
-  sfCalibSteps     = 0;
-  sfCalibCaptureTs = 0;
-  sfCalibWaitId    = id;
-  sfCalibrate(id);
-
-  // The reel turns a full revolution plus a homing pass; the sample log shows
-  // ~6.5s end to end, so a 15s window gives generous margin for slower reels.
-  // The wait loop touches wdgWebMs each iteration, so it is watchdog-safe.
-  int  steps    = 0;
-  bool gotReply = false;
-  unsigned long deadline = millis() + 15000;
-  while (millis() < deadline) {
-    wdgWebMs = millis();
-    vTaskDelay(pdMS_TO_TICKS(20));
-    if (sfCalibCaptureTs != 0) {
-      steps    = sfCalibSteps;
-      gotReply = true;
-      break;
-    }
-  }
-  sfCalibWaitId = -1;  // disarm capture
-
-  if (!gotReply) {
-    sendJsonError(504, "No calibration response from module");
+  // Reject a second start while one is already running for a different module;
+  // re-starting the same module is allowed (re-arms the capture).
+  if (sfCalibJobActive && sfCalibJobId != id) {
+    char busy[96];
+    snprintf(busy, sizeof(busy),
+      "{\"ok\":false,\"error\":\"calibration already running for module %d\"}",
+      sfCalibJobId);
+    server.send(409, "application/json", busy);
     return;
   }
+
+  // Arm the capture slot and the job, then send the calibrate command.
+  sfCalibSteps       = 0;
+  sfCalibCaptureTs   = 0;
+  sfCalibWaitId      = id;
+  sfCalibJobActive   = true;
+  sfCalibJobId       = id;
+  sfCalibJobSteps    = -1;
+  sfCalibJobDeadline = millis() + 15000;
+  sfCalibrate(id);
+
   char out[64];
-  snprintf(out, sizeof(out), "{\"ok\":true,\"id\":%d,\"stepsPerRev\":%d}", id, steps);
+  snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d}", id);
   server.send(200, "application/json", out);
+}
+
+// GET /api/flap/calibrate/status
+// Poll target for the async calibration job. Reports one of:
+//   {"ok":true,"state":"idle"}                          no job has run
+//   {"ok":true,"state":"pending","id":N}                still measuring
+//   {"ok":true,"state":"done","id":N,"stepsPerRev":S}   result ready
+//   {"ok":true,"state":"timeout","id":N}                no reply within window
+// The "done"/"timeout" result latches until the next start (or until read), so
+// a poll that arrives right after completion still sees it.
+void handleApiCalibrateStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  char out[96];
+
+  if (sfCalibJobActive) {
+    // Capture arrives via sfParseResponse setting sfCalibCaptureTs.
+    if (sfCalibCaptureTs != 0) {
+      sfCalibJobSteps  = sfCalibSteps;
+      sfCalibJobActive = false;
+      sfCalibWaitId    = -1;
+      snprintf(out, sizeof(out),
+        "{\"ok\":true,\"state\":\"done\",\"id\":%d,\"stepsPerRev\":%d}",
+        sfCalibJobId, sfCalibJobSteps);
+      server.send(200, "application/json", out);
+      return;
+    }
+    if ((long)(millis() - sfCalibJobDeadline) >= 0) {
+      sfCalibJobActive = false;
+      sfCalibWaitId    = -1;
+      snprintf(out, sizeof(out),
+        "{\"ok\":true,\"state\":\"timeout\",\"id\":%d}", sfCalibJobId);
+      server.send(200, "application/json", out);
+      return;
+    }
+    snprintf(out, sizeof(out),
+      "{\"ok\":true,\"state\":\"pending\",\"id\":%d}", sfCalibJobId);
+    server.send(200, "application/json", out);
+    return;
+  }
+
+  // No active job. If a result was latched from the last run, report it once.
+  if (sfCalibJobSteps >= 0) {
+    snprintf(out, sizeof(out),
+      "{\"ok\":true,\"state\":\"done\",\"id\":%d,\"stepsPerRev\":%d}",
+      sfCalibJobId, sfCalibJobSteps);
+    sfCalibJobSteps = -1;   // consume the latched result
+    server.send(200, "application/json", out);
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"state\":\"idle\"}");
 }
 
 // POST /api/flap/version  {"id":5}
@@ -2456,6 +2584,7 @@ void handleOTAPage() {
     "function upload(){"
     "var f=document.getElementById('fw').files[0];"
     "if(!f){document.getElementById('status').textContent='No file selected.';return;}"
+    "var fd=new FormData();fd.append('firmware',f,f.name);"
     "var xhr=new XMLHttpRequest();"
     "xhr.upload.onprogress=function(e){"
     "if(e.lengthComputable){"
@@ -2467,61 +2596,85 @@ void handleOTAPage() {
     "xhr.onload=function(){"
     "if(xhr.status===200){"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(76,175,80)\">Upload successful! Rebooting...</span>';"  
+    "'<span style=\"color:rgb(76,175,80)\">Upload successful! Rebooting... This page will stop responding; wait ~20s and reload.</span>';"
     "}else{"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(233,69,96)\">Error: '+xhr.responseText+'</span>';}"
+    "'<span style=\"color:rgb(233,69,96)\">Error: '+(xhr.responseText||'upload failed')+'</span>';}"
     "};"
     "xhr.onerror=function(){"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(233,69,96)\">Upload failed.</span>';"  
+    "'<span style=\"color:rgb(233,69,96)\">Upload failed (connection error).</span>';"
     "};"
     "xhr.open('POST','/api/ota/upload');"
-    "xhr.setRequestHeader('X-OTA-Password',document.getElementById('fw').name);"
-    "xhr.send(f);"
+    "xhr.send(fd);"
     "}"
     "</script></body></html>";
   server.send(200, "text/html", html);
 }
 
+// Tracks whether the in-progress OTA upload has hit a fatal error, so we can
+// reject cleanly at the end instead of rebooting into a half-written image.
+static bool otaUploadFailed = false;
+
 void handleOTAUpload() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
 
-  // Optional password check
-  if (strlen(cfg.otaPassword) > 0) {
-    if (!server.hasHeader("X-OTA-Password") ||
-        strcmp(server.header("X-OTA-Password").c_str(), cfg.otaPassword) != 0) {
-      // Password check is advisory from web UI; ArduinoOTA handles its own auth
-    }
-  }
-
-  if (!server.hasArg("plain") && server.method() != HTTP_POST) {
-    server.send(400, "text/plain", "POST firmware binary");
-    return;
-  }
-
-  // The firmware binary arrives as the raw POST body
+  // The firmware binary arrives as a multipart/form-data file part. The ESP32
+  // WebServer streams it to us in chunks via server.upload(); the empty POST
+  // body handler registered alongside this callback sends the final response.
   HTTPUpload& upload = server.upload();
+
   if (upload.status == UPLOAD_FILE_START) {
+    otaUploadFailed = false;
     printf("[OTA] Web upload start: %s\n", upload.filename.c_str());
+    // UPDATE_SIZE_UNKNOWN lets the Update library size the partition itself.
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      printf("[OTA] Begin failed\n");
+      otaUploadFailed = true;
+      printf("[OTA] Begin failed (%s) -- aborting upload\n", Update.errorString());
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      printf("[OTA] Write error\n");
+    // Skip writing once we've failed, so we don't keep feeding a dead Update.
+    if (!otaUploadFailed) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        otaUploadFailed = true;
+        printf("[OTA] Write error (%s) -- aborting upload\n", Update.errorString());
+        Update.abort();
+      }
     }
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) {
-      printf("[OTA] Web upload complete (%u bytes) -- rebooting\n", upload.totalSize);
-      server.send(200, "text/plain", "OK");
-      delay(500);
-      ESP.restart();
+    if (otaUploadFailed) {
+      Update.abort();
+      printf("[OTA] Upload ended in failed state -- image discarded\n");
+      // Response is sent by the POST body handler (sendOTAUploadResult).
+    } else if (Update.end(true)) {   // true = set the new image as bootable
+      printf("[OTA] Web upload complete (%u bytes) -- verified, rebooting\n",
+             upload.totalSize);
     } else {
-      printf("[OTA] Update.end failed\n");
-      server.send(500, "text/plain", "Update failed");
+      otaUploadFailed = true;
+      printf("[OTA] Update.end failed (%s) -- incomplete or corrupt image\n",
+             Update.errorString());
     }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    otaUploadFailed = true;
+    Update.abort();
+    printf("[OTA] Upload aborted by client -- image discarded\n");
   }
+}
+
+// Final response for the OTA upload POST. Runs after the whole multipart body
+// (and thus all handleOTAUpload chunk callbacks) has been processed, so by now
+// otaUploadFailed reflects the true outcome. On success we reply 200 then
+// reboot into the freshly flashed image; on failure we reply 500 and stay up.
+void sendOTAUploadResult() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (otaUploadFailed || !Update.isFinished()) {
+    server.send(500, "text/plain",
+                "Update failed -- firmware not flashed. Device left unchanged.");
+    return;
+  }
+  server.send(200, "text/plain", "OK");
+  delay(500);        // let the response flush to the browser before we restart
+  ESP.restart();
 }
 
 
@@ -2896,7 +3049,7 @@ void handleApiMaintenance() {
 void webInit() {
   server.on("/",                     HTTP_GET,     handleRoot);
   server.on("/ota",                  HTTP_GET,     handleOTAPage);
-  server.on("/api/ota/upload",       HTTP_POST,    [](){}, handleOTAUpload);
+  server.on("/api/ota/upload",       HTTP_POST,    sendOTAUploadResult, handleOTAUpload);
   server.on("/api/rs485/messages",   HTTP_GET,     handleApiMessages);
   server.on("/api/rs485/send",       HTTP_POST,    handleApiSend);
   server.on("/api/rs485/send",       HTTP_OPTIONS, handleOptions);
@@ -2914,6 +3067,7 @@ void webInit() {
   server.on("/api/flap/home",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/calibrate",   HTTP_POST,    handleApiCalibrate);
   server.on("/api/flap/calibrate",   HTTP_OPTIONS, handleOptions);
+  server.on("/api/flap/calibrate/status", HTTP_GET, handleApiCalibrateStatus);
   server.on("/api/flap/version",     HTTP_POST,    handleApiVersion);
   server.on("/api/flap/version",     HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/provision",   HTTP_POST,    handleApiProvision);
