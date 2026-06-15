@@ -1,6 +1,6 @@
 # Split-Flap Gateway
 
-**Firmware version: 1.6**
+**Firmware version: 1.7**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
@@ -68,7 +68,7 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 
 - **Web UI** — single-page dashboard accessible from any browser
 - **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 255: IDs 0-254)
-- **Sticky module list** — the known-module registry persists across reboots in flash; entries not seen for 6 hours are pruned automatically
+- **Sticky module list** — the known-module registry persists across reboots in flash; a stale module is version-probed before being dropped (so a merely-quiet module isn't lost), and a gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
 - **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
 - **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs
 - **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
@@ -165,7 +165,7 @@ The firmware outputs diagnostic messages at **115200 baud** via the native USB C
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v1.6
+[Boot] Split-Flap Gateway v1.7
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -242,7 +242,7 @@ Navigate to the gateway's IP address in any browser.
 
 | Tab | Description |
 |---|---|
-| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version. The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog with all known module data plus a parsed view of its EEPROM — home offset, steps/rev, and the calibrated flap map), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
+| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version, sorted by ID (unprovisioned modules last). The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog that queries the module live — refreshing its firmware version and reading its EEPROM — and shows all known module data plus a parsed view of the EEPROM: home offset, steps/rev, and the calibrated flap map), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
 | **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change. Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap's current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through all 64 flaps one at a time. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
@@ -264,11 +264,18 @@ dashboard isn't empty after a restart.
 - Only durable fields are saved (ID, serial number, provisioned flag, firmware
   version, and a last-seen wall-clock timestamp). Transient display state and
   EEPROM dumps are not persisted.
-- Entries not seen for **6 hours** are pruned automatically (checked at boot and
-  once a minute). The 6-hour window uses the battery-backed RTC clock, so it
-  measures real elapsed time across reboots.
+- Entries not seen for **6 hours** are checked at boot and once a minute. Rather
+  than dropping a stale module outright, the gateway first sends it a version
+  query (`m<id>v`) and waits a few seconds — modules only speak when addressed,
+  so "not seen" usually just means "nothing talked to it." Only if the module
+  fails to answer the probe is it removed. The 6-hour window uses the
+  battery-backed RTC clock, so it measures real elapsed time across reboots.
+- If the gateway boots with an **empty registry** (first boot, or after Identify
+  All), it broadcasts `m*v` once at startup so every module on the bus reports
+  its version and serial and repopulates the list automatically.
 - Saves are written only when the list actually changes (a module appears, is
-  provisioned, or is deprovisioned) and are debounced to limit flash wear.
+  provisioned, gets its firmware version recorded, or is deprovisioned) and are
+  debounced to limit flash wear.
 - The **↻ Identify All** button (or `POST /api/flap/identify`) wipes both the
   in-memory list and the saved file, then broadcasts `m*v` to rebuild from
   scratch.
@@ -389,6 +396,8 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `POST` | `/api/flap/dumpbysn` | `{"sn":"AABBCCDD"}` | Dump EEPROM by serial number (fw v15+) |
 | `POST` | `/api/flap/factoryresetbysn` | `{"sn":"AABBCCDD"}` | Factory reset by serial number |
 | `POST` | `/api/flap/restorebysn` | `{"sn":"...","homeOffset":42,"totalSteps":4096,"map":"0=210,1=320,..."}` | Restore EEPROM by serial number |
+
+When a module acknowledges provisioning, the gateway marks it **provisioning-confirmed** and, after a brief settling delay, queries its firmware version (`m<id>v`) to record the version in the registry. The short delay matters: a version request sent the instant the ack arrives reaches the module before it has settled on its new ID, so no reply comes back; the query is also retried a few times until the version is read. A provisioning-confirmed module is never shown as **legacy** — legacy (v7) modules have no serial number and never acknowledge provisioning, so an ack is definitive proof the module is modern, regardless of whether its version has been read back yet. The Modules grid is always sorted by ID (unprovisioned modules last), so a newly provisioned module slots into its proper place rather than appearing at the end.
 
 #### `/api/flap/version` and `/api/flap/dump` response format
 
@@ -526,13 +535,15 @@ The **NTP server** defaults to `pool.ntp.org`. You can point it at a LAN time se
 
 After the initial USB flash, all subsequent updates can be done over WiFi.
 
+> **Upgrading from a pre-1.6 version?** The firmware *currently running* is what receives and writes the new image, so the OTA-reliability improvements in 1.6 (PSRAM-backed buffers, AP-drop and MQTT-pause during upload) can't help the upload that installs 1.6 — they only take effect once 1.6 is running. On a memory-constrained older build the browser upload of 1.6 may drop near the end (heap exhaustion); this is harmless (the image is written to the inactive partition, so a failed upload leaves your old firmware running and fully functional), but for that first jump it's more reliable to use **espota** or a one-time **USB flash**. After 1.6 is installed, the web updater is reliable. No migration is needed: PSRAM is set up at boot, and your saved settings and module registry carry over (the new Home Assistant option simply defaults to off).
+
 ### Browser upload (recommended)
 
 1. In Arduino IDE: **Sketch → Export Compiled Binary** (Ctrl/Cmd+Alt+S). The files land in a `build/<board-fqbn>/` subfolder next to your sketch.
 2. From that folder, choose **`SplitFlapGateway.ino.bin`** — the plain application image. **This is the only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `SplitFlapGateway.ino.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v1.6**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v1.7**).
 
 > **Which file?** The compiler emits several files alongside the app image — pick the right one:
 >
