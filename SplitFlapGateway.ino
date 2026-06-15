@@ -78,7 +78,7 @@
 #define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
 
 /* ---- Firmware identity ---- */
-#define FW_VERSION           "1.6"            // gateway firmware version (UI + boot log)
+#define FW_VERSION           "1.7"            // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -111,6 +111,10 @@
 /* ---- Housekeeping cadences ---- */
 #define STATUS_INTERVAL_MS      60000UL   // MQTT status publish cadence (1/min)
 #define MODULE_STALE_SECS       21600UL   // 6h: prune modules not seen in this long
+#define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before dropping it
+#define MODULE_POSTPROV_VER_MS  4000UL    // delay after a provisioning ack before the first version query. A freshly-provisioned module writes its new ID to EEPROM and then runs a staggered startup (~150ms x new-ID), so it can be unresponsive for several seconds; wait well past that before the first query.
+#define MODULE_VER_RETRY_MS     2500UL    // gap between post-provision version-query retries
+#define MODULE_VER_MAX_TRIES    6         // give up after this many version-query attempts (covers ~4s + 5x2.5s ~= 16s)
 #define MODULE_SAVE_DEBOUNCE_MS 5000UL    // coalesce NVS writes
 
 /* ---- Module registry sizing ----
@@ -124,7 +128,7 @@
 
 /* ---- Persisted module-registry file (FFat) ---- */
 #define MODULES_FILE     "/modules.dat"
-#define MODULES_MAGIC    0x53464731UL   // "SFG1"
+#define MODULES_MAGIC    0x53464732UL   // "SFG2" (bumped: PersistedModule gained 'acked')
 
 /* ==========================================================================*/
 
@@ -381,6 +385,22 @@ struct SFModule {
   char     pendChar;         // requested char while quiet (0 = none / index-based)
   int      pendIndex;        // requested flap index while quiet (-1 = none)
   bool     hasPend;          // a deferred display request is waiting
+  // Stale-probe: before dropping a module that hasn't been seen in
+  // MODULE_STALE_SECS, the gateway sends it a version query and waits. probeMs
+  // is the millis() deadline by which it must reply; 0 = not being probed. A
+  // reply (any frame -> sfTouch) clears it; if the deadline passes, it's dropped.
+  unsigned long probeMs;     // probe-response deadline (0 = not probing)
+  // Provisioning-confirmed: set true when this module produces a provisioning
+  // ack (mXack). A legacy (v7) module has no serial and never acks provisioning,
+  // so an acked module is, by definition, NOT legacy -- regardless of whether
+  // its firmware version has been read back yet. Persisted.
+  bool     acked;            // true once the module acknowledged provisioning
+  // Deferred post-provision version query. A version request sent inline in the
+  // ack handler fires before the module is ready to answer on its new ID (no
+  // reply observed on the bus). Instead we set a deadline a moment in the future
+  // and let taskRS485 issue the query once it passes. 0 = none pending.
+  unsigned long verDueMs;    // millis() to issue the post-provision version query (0 = none)
+  uint8_t       verTries;    // post-provision version-query attempts made so far
 };
 
 // Module registry (~14 KB). Lives in PSRAM -- accessed only under sfMutex from
@@ -521,6 +541,7 @@ static void mqttPublishStateTopics();          // HA entity state (display/maint
 static void mqttPublishDisplayState();         // current display string
 static void haPublishDiscovery(bool enable);   // HA MQTT discovery (or removal)
 void rs485Send(const uint8_t* data, size_t len);
+void sfQueryVersion(int addr);                 // forward (used by stale-probe)
 
 // The bus-monitor ring (64 x ~296 bytes ~= 19 KB) lives in PSRAM, not internal
 // RAM. It's a diagnostic log on no hot path, so the slightly slower PSRAM is
@@ -884,6 +905,29 @@ static SFModule* sfFindBySN(const char* sn) {
   return NULL;
 }
 
+// A serial number is a module's true identity, but its id changes on
+// (de)provision. A stale in-flight frame carrying an old id can briefly create a
+// second registry entry for a serial we already track (seen as duplicate cards
+// in the grid after a deprovision). This collapses any extra entries sharing a
+// serial down to the FIRST one, keeping the registry's "one serial = one module"
+// invariant. Caller MUST already hold sfMutex. Returns true if anything changed.
+static bool sfDedupeBySNLocked(const char* sn) {
+  if (!sn || !sn[0]) return false;
+  int first = -1;
+  bool changed = false;
+  for (int i = 0; i < sfModuleCount; ) {
+    if (strcmp(sfModules[i].serialNum, sn) == 0) {
+      if (first < 0) { first = i; i++; continue; }
+      // Duplicate: drop it (shift the tail down, stable order).
+      for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+      sfModuleCount--;
+      memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
+      changed = true;
+    } else i++;
+  }
+  return changed;
+}
+
 // Add or update a module entry
 static SFModule* sfUpsert(uint8_t id, const char* sn) {
   SFModule* m = (id != 255) ? sfFindById(id) : sfFindBySN(sn);
@@ -899,6 +943,7 @@ static SFModule* sfUpsert(uint8_t id, const char* sn) {
   }
   if (sn && sn[0]) strlcpy(m->serialNum, sn, sizeof(m->serialNum));
   m->lastSeen = millis();
+  m->probeMs  = 0;   // module is transmitting -> cancel any pending stale probe
   unsigned long ep = rtcEpochNow();
   if (ep) m->lastSeenEpoch = ep;
   if (isNew) sfModulesDirty = true;  // new module -> persist
@@ -923,6 +968,7 @@ struct PersistedModule {
   uint8_t       id;
   char          serialNum[21];
   bool          provisioned;
+  bool          acked;          // provisioning-confirmed (never legacy)
   char          fwVersion[8];
   unsigned long lastSeenEpoch;
 };
@@ -969,6 +1015,7 @@ static void sfModulesSave() {
     recs[n].id            = m.id;
     strlcpy(recs[n].serialNum, m.serialNum, sizeof(recs[n].serialNum));
     recs[n].provisioned   = m.provisioned;
+    recs[n].acked         = m.acked;
     strlcpy(recs[n].fwVersion, m.fwVersion, sizeof(recs[n].fwVersion));
     recs[n].lastSeenEpoch = m.lastSeenEpoch;
     n++;
@@ -1042,6 +1089,7 @@ static void sfModulesLoad() {
     m->id            = recs[i].id;
     strlcpy(m->serialNum, recs[i].serialNum, sizeof(m->serialNum));
     m->provisioned   = recs[i].provisioned;
+    m->acked         = recs[i].acked;
     strlcpy(m->fwVersion, recs[i].fwVersion, sizeof(m->fwVersion));
     m->lastSeenEpoch = recs[i].lastSeenEpoch;
     m->flapIndex     = -1;
@@ -1064,26 +1112,51 @@ static void sfModulesClear() {
   DBG("[MOD] Registry cleared (memory + FATFS)\n");
 }
 
-// Prune in-memory entries not seen for MODULE_STALE_SECS. Called periodically.
+// Two-phase stale handling, called periodically:
+//   Phase 1: a module unseen for MODULE_STALE_SECS that isn't being probed is
+//            sent a version query (m<id>v) and given MODULE_PROBE_GRACE_MS to
+//            reply. A reply (sfTouch) clears the probe and keeps the module.
+//   Phase 2: a probed module whose grace window has elapsed without a reply is
+//            actually dropped. This avoids evicting a module that has merely
+//            been quiet (modules only speak when addressed).
+// Version queries are sent OUTSIDE sfMutex (rs485Send re-takes the lock via
+// frame tracking, so probing under it would deadlock): IDs to probe are
+// collected under the lock, then queried after release.
 static void sfModulesPruneStale() {
   unsigned long nowEp = rtcEpochNow();
   if (!nowEp) return;  // no valid clock yet
+  unsigned long nowMs = millis();
   bool changed = false;
+  static uint8_t toProbe[MAX_MODULES];
+  int probeN = 0;
+
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < sfModuleCount; ) {
     SFModule& m = sfModules[i];
-    if (m.lastSeenEpoch && nowEp > m.lastSeenEpoch &&
-        (nowEp - m.lastSeenEpoch) > MODULE_STALE_SECS) {
-      // Remove by shifting the tail down
+    bool stale = (m.lastSeenEpoch && nowEp > m.lastSeenEpoch &&
+                  (nowEp - m.lastSeenEpoch) > MODULE_STALE_SECS);
+    if (stale && m.probeMs == 0) {
+      // Phase 1: start a probe -- give it a chance to answer before dropping.
+      m.probeMs = nowMs + MODULE_PROBE_GRACE_MS;
+      if (probeN < MAX_MODULES) toProbe[probeN++] = m.id;
+      i++;
+    } else if (stale && m.probeMs != 0 && nowMs >= m.probeMs) {
+      // Phase 2: probed and the grace window elapsed with no reply -> drop it.
       for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
       sfModuleCount--;
       memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
       changed = true;
     } else {
-      i++;
+      i++;   // fresh, or probe still pending -> leave it
     }
   }
   if (sfMutex) xSemaphoreGive(sfMutex);
+
+  // Send the probes now that the lock is released.
+  for (int i = 0; i < probeN; i++) {
+    DBG("[MOD] stale module %d -- probing before drop\n", toProbe[i]);
+    sfQueryVersion(toProbe[i]);
+  }
   if (changed) sfModulesDirty = true;
 }
 
@@ -1230,10 +1303,30 @@ void sfCalibrate(int addr) {
   rs485SendStr(buf);
 }
 
-// Query firmware version of a module
+// Query firmware version of a DIRECT (single-id, never broadcast) module.
+//
+// IMPORTANT: deliberately NO trailing '\n'. A module answers a direct version
+// query SYNCHRONOUSLY, the instant it parses the 'v' command byte -- with zero
+// assembly delay (unlike a dump, which builds its EEPROM string before raising
+// DE). On this half-duplex bus the ESP32's hardware-managed DE keeps driving the
+// line until the WHOLE frame has clocked out, so a trailing '\n' keeps us
+// transmitting for one extra byte-time (~1 ms at 9600 baud) AFTER the module has
+// already begun its reply. The module's reply then collides with our trailing
+// '\n', and because our receiver is off while we transmit, its leading bytes are
+// lost and no [RX] frame is ever assembled -- the long-standing "version query
+// gets no reply (but a dump right after works)" symptom. Sending "m<id>v" with
+// no terminator releases the bus exactly as the module parses 'v', so the reply
+// lands cleanly (verified on hardware: a newline-less monitor send always
+// replies; the byte-identical "m<id>v\n" never did).
+//
+// The module's parser acts on the 'v' byte itself for a direct query and needs
+// no terminator. The BROADCAST "m*v\n" path is separate and MUST keep its
+// newline: a wildcard query enters the module's range-collector state and fires
+// its staggered reply on the '\n' (or a 50 ms idle timeout). sfQueryVersion is
+// only ever called with a concrete id, so dropping the newline here is safe.
 void sfQueryVersion(int addr) {
   char buf[16];
-  snprintf(buf, sizeof(buf), "m%dv\n", addr);
+  snprintf(buf, sizeof(buf), "m%dv", addr);   // no '\n' -- see note above
   rs485SendStr(buf);
 }
 
@@ -1260,14 +1353,19 @@ void sfDeprovision(int addr) {
   if (addr < 0) snprintf(buf, sizeof(buf), "m*R\n");
   else          snprintf(buf, sizeof(buf), "m%dR\n", addr);
   rs485SendStr(buf);
-  // Remove from local registry
+  // Remove from local registry. Shift the tail down (stable order) rather than
+  // swapping the last entry into the gap, so the Modules grid keeps a consistent
+  // order after a deprovision -- matching sfModulesPruneStale's removal.
   xSemaphoreTake(sfMutex, portMAX_DELAY);
   if (addr < 0) {
     sfModuleCount = 0;
+    memset(sfModules, 0, sizeof(SFModule) * MAX_MODULES);
   } else {
     for (int i = 0; i < sfModuleCount; i++) {
       if (sfModules[i].id == (uint8_t)addr) {
-        sfModules[i] = sfModules[--sfModuleCount];
+        for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+        sfModuleCount--;
+        memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
         break;
       }
     }
@@ -1364,6 +1462,7 @@ void mqttPublishSFEvent(const char* event, const char* payload);  // forward
 static inline void sfTouch(SFModule* m) {
   if (!m) return;
   m->lastSeen = millis();
+  m->probeMs  = 0;   // any activity means it's alive -> cancel any pending probe
   unsigned long ep = rtcEpochNow();
   if (ep) m->lastSeenEpoch = ep;
 }
@@ -1415,18 +1514,49 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       m = sfUpsert(255, sn);
       if (m) m->provisioned = false;
       DBG("[SF] Unprovisioned adv: %s\n", sn);
+    } else if (m->provisioned || m->id != 255) {
+      // The module is advertising (so it has NO assigned id) but we still hold a
+      // provisioned/old-id entry for this serial -- e.g. it was just
+      // deprovisioned, or a stale in-flight frame re-created an id entry. The
+      // serial is the true identity, so reclaim this same entry in place rather
+      // than leaving a duplicate: mark it unprovisioned and clear the stale id.
+      m->provisioned = false;
+      m->id = 255;
+      sfModulesDirty = true;
+      DBG("[SF] Re-advertised known SN %s -- reset to unprovisioned\n", sn);
     }
     if (m) sfTouch(m);
+    if (sfDedupeBySNLocked(sn)) sfModulesDirty = true;
+    // Purge any "ghost" entries: a provisioned record with an EMPTY serial is
+    // invalid (every provisioned module has a serial) -- it's the residue of a
+    // stale in-flight frame that re-created an id entry for a module that has
+    // since been deprovisioned and is now advertising. Drop them so they don't
+    // show as blank/duplicate cards in the grid.
+    for (int k = 0; k < sfModuleCount; ) {
+      if (sfModules[k].provisioned && sfModules[k].serialNum[0] == '\0') {
+        for (int j = k; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+        sfModuleCount--;
+        memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
+        sfModulesDirty = true;
+      } else k++;
+    }
     xSemaphoreGive(sfMutex);
     mqttPublishSFEvent("adv", sn);
     return;
   }
 
-  // -- Provisioning ack: mXack:<sn>:<id>
-  if (strncmp(buf, "mXack:", 6) == 0) {
+  // -- Provisioning ack. The module replies mXack<sn>:<id>. Some firmware
+  // revisions insert a colon after the token (mXack:<sn>:<id>); accept BOTH.
+  // Match the 5-char "mXack" token, then skip an optional ':' before the serial.
+  // (A strict "mXack:" match missed the colon-less form the modules actually
+  // send -- so the ack handler, and the post-provision version query inside it,
+  // never ran, leaving a blank entry with no serial number or firmware version.)
+  if (strncmp(buf, "mXack", 5) == 0) {
+    const char* rest = buf + 5;
+    if (*rest == ':') rest++;            // tolerate optional colon after "mXack"
     char tmp[48];
-    strlcpy(tmp, buf + 6, sizeof(tmp));
-    char* colon = strrchr(tmp, ':');
+    strlcpy(tmp, rest, sizeof(tmp));
+    char* colon = strrchr(tmp, ':');     // separates <sn> from <id>
     if (colon) {
       *colon = 0;
       const char* sn = tmp;
@@ -1439,11 +1569,23 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       xSemaphoreTake(sfMutex, portMAX_DELAY);
       SFModule* m = sfFindBySN(sn);
       if (!m) m = sfUpsert((uint8_t)newId, sn);
-      if (m) { m->id = (uint8_t)newId; m->provisioned = true; sfTouch(m); sfModulesDirty = true; }
+      if (m) {
+        m->id = (uint8_t)newId;
+        m->provisioned = true;
+        m->acked = true;                         // acked provisioning -> never legacy
+        m->verDueMs = millis() + MODULE_POSTPROV_VER_MS;  // schedule deferred version query
+        m->verTries = 0;
+        sfTouch(m);
+        sfModulesDirty = true;
+      }
       xSemaphoreGive(sfMutex);
       char payload[64];
       snprintf(payload, sizeof(payload), "{\"sn\":\"%s\",\"id\":%d}", sn, newId);
       mqttPublishSFEvent("ack", payload);
+      // The post-provision version query is issued by taskRS485 once verDueMs
+      // passes (see the deferred-query sweep) -- NOT inline here. Sending it
+      // immediately fires before the module is ready to answer on its new ID, so
+      // no reply comes back. The short delay lets it settle first.
     }
     return;
   }
@@ -1502,9 +1644,24 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     xSemaphoreTake(sfMutex, portMAX_DELAY);
     SFModule* mm = sfFindById((uint8_t)id);
     if (mm) {
+      if (strcmp(mm->fwVersion, fwCopy) != 0) sfModulesDirty = true;  // persist new fw
       strlcpy(mm->fwVersion, fwCopy, sizeof(mm->fwVersion));
       if (field[2] && field[2][0]) {
         strlcpy(mm->serialNum, field[2], sizeof(mm->serialNum));
+        // Collapse any other entry that already held this serial (e.g. a stale
+        // id=255 advertiser for the same physical module), so a serial maps to
+        // exactly one registry entry. Remove the OTHER one, keeping mm (the
+        // id-confirmed entry). Re-find mm afterward is unnecessary: we only drop
+        // entries after mm's slot or shift the tail, and mm is used no further.
+        for (int k = 0; k < sfModuleCount; k++) {
+          if (&sfModules[k] != mm && strcmp(sfModules[k].serialNum, field[2]) == 0) {
+            for (int j = k; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+            sfModuleCount--;
+            memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
+            sfModulesDirty = true;
+            break;
+          }
+        }
       }
     }
     xSemaphoreGive(sfMutex);
@@ -2215,7 +2372,7 @@ void handleRoot() {
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ntp\">-</div><div class=\"k\">NTP Sync</div></div>");
   server.sendContent("</div></div></div>");
   server.sendContent("<script>");
-  server.sendContent("function show(id,el){document.querySelectorAll(\".pane\").forEach(function(p){p.classList.remove(\"on\");});document.querySelectorAll(\"nav a\").forEach(function(a){a.classList.remove(\"on\");});document.getElementById(\"pane-\"+id).classList.add(\"on\");el.classList.add(\"on\");if(id===\"display\"){startWall();}else{stopWall();}if(id===\"calib\"){calLoadModules();}}");
+  server.sendContent("function show(id,el){document.querySelectorAll(\".pane\").forEach(function(p){p.classList.remove(\"on\");});document.querySelectorAll(\"nav a\").forEach(function(a){a.classList.remove(\"on\");});document.getElementById(\"pane-\"+id).classList.add(\"on\");el.classList.add(\"on\");if(id===\"display\"){startWall();}else{stopWall();}if(id===\"calib\"){calLoadModules();}if(id===\"modules\"){loadModules();}}");
   server.sendContent("var _wallTimer=null;function buildWall(s){var w=document.getElementById(\"wall\");if(!w)return;var cells=s.cells||[];var html=\"\";var idx=0;for(var r=0;r<s.rows;r++){html+=\"<div class='wallrow'>\";for(var c=0;c<s.cols;c++){var v=(idx<cells.length)?cells[idx]:null;var cls=\"flap\",disp=\"\";if(v===null){cls+=\" empty\";disp=\"\";}else if(v===\"?\"){cls+=\" unknown\";disp=\"?\";}else{disp=v===\" \"?\"&nbsp;\":v;}html+=\"<div class='\"+cls+\"'>\"+disp+\"</div>\";idx++;}html+=\"</div>\";}w.innerHTML=html;var known=cells.filter(function(x){return x!==null;}).length;document.getElementById(\"wallMeta\").textContent=s.rows+\" x \"+s.cols+\" grid - \"+known+\" module(s) mapped\";}");
   server.sendContent("function refreshWall(){fetch(\"/api/display/state\").then(function(r){return r.json();}).then(buildWall).catch(function(){var m=document.getElementById(\"wallMeta\");if(m)m.textContent=\"Could not load display state\";});}");
   server.sendContent("function startWall(){refreshWall();if(_wallTimer)clearInterval(_wallTimer);_wallTimer=setInterval(function(){if(document.getElementById(\"pane-display\").classList.contains(\"on\"))refreshWall();},1500);}");
@@ -2232,13 +2389,13 @@ void handleRoot() {
   server.sendContent("function parseDump(raw){if(!raw)return{error:\"No data\"};var parts=raw.split(\":\");if(parts.length<2)return{error:\"Invalid format\",raw:raw};var r={homeOffset:parseInt(parts[0]),totalSteps:parseInt(parts[1]),map:{}};if(parts[2])parts[2].split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\")r.map[parseInt(kv[0])]=parseInt(kv[1]);});return r;}");
   server.sendContent("function refreshModules(){var el=document.getElementById(\"refreshR\");el.textContent=\"Identifying...\";fetch(\"/api/flap/identify\",{method:\"POST\"}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"List cleared, identifying all modules -- refreshing in 2s\":\"Error: \"+j.error;if(j.ok)setTimeout(function(){loadModules();},2000);setTimeout(function(){loadModules();el.textContent=\"\";},7000);}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function doBackup(){var prog=document.getElementById(\"backupProg\");var res=document.getElementById(\"backupR\");res.textContent=\"\";prog.textContent=\"Loading module list...\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(mods){var targets=mods.filter(function(m){return m.sn&&m.sn.length>0;});if(!targets.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules with serial numbers found. Run Identify All first.</span>\";return;}var out={version:1,created:new Date().toISOString(),modules:[]};var i=0,okN=0,failN=0;function next(){if(i>=targets.length){prog.textContent=\"\";if(!out.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No calibration data could be read.</span>\";return;}var blob=new Blob([JSON.stringify(out,null,2)],{type:\"application/json\"});var url=URL.createObjectURL(blob);var a=document.createElement(\"a\");var ts=new Date().toISOString().replace(/[:.]/g,\"-\").slice(0,19);a.href=url;a.download=\"splitflap-backup-\"+ts+\".json\";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Backup created: \"+okN+\" module(s) saved\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\";return;}var m=targets[i];prog.textContent=\"Reading module \"+(i+1)+\" of \"+targets.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:m.id})}).then(function(r){return r.json();}).then(function(d){if(d.ok&&d.dump){out.modules.push({sn:m.sn,id:m.id,dump:d.dump});okN++;}else{failN++;}i++;next();}).catch(function(){failN++;i++;next();});}next();}).catch(function(e){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Error: \"+e+\"</span>\";});}function parseBackupDump(raw){var parts=raw.split(\":\");if(parts.length<2)return null;var ho=parseInt(parts[0]),ts=parseInt(parts[1]);if(isNaN(ho)||isNaN(ts))return null;var map=parts.length>2?parts.slice(2).join(\":\"):\"\";return {homeOffset:ho,totalSteps:ts,map:map};}function doRestore(){var prog=document.getElementById(\"restoreProg\");var res=document.getElementById(\"restoreR\");var fileInput=document.getElementById(\"restoreFile\");var preserve=document.getElementById(\"preserveId\").checked;res.textContent=\"\";if(!fileInput.files||!fileInput.files.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Choose a backup file first.</span>\";return;}var reader=new FileReader();reader.onload=function(){var data;try{data=JSON.parse(reader.result);}catch(e){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Invalid JSON file.</span>\";return;}if(!data||!Array.isArray(data.modules)||!data.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules found in backup file.</span>\";return;}var mods=data.modules,i=0,okN=0,failN=0;function next(){if(i>=mods.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Restore complete: \"+okN+\" module(s)\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\"+(preserve?\"\":\" IDs were reassigned from the backup.\");return;}var m=mods[i];if(!m.sn){failN++;i++;next();return;}var p=parseBackupDump(m.dump||\"\");if(!p){failN++;i++;next();return;}prog.textContent=\"Restoring module \"+(i+1)+\" of \"+mods.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/restorebysn\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,homeOffset:p.homeOffset,totalSteps:p.totalSteps,map:p.map})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){failN++;i++;next();return;}if(!preserve&&typeof m.id===\"number\"&&m.id>=0){fetch(\"/api/flap/provision\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,id:m.id})}).then(function(r){return r.json();}).then(function(){okN++;i++;next();}).catch(function(){okN++;i++;next();});}else{okN++;i++;next();}}).catch(function(){failN++;i++;next();});}next();};reader.onerror=function(){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Could not read file.</span>\";};reader.readAsText(fileInput.files[0]);}");
-  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion;var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?(\"ID: <span class='mid'>\"+m.id+\"</span>\"+(legacy?\"<span class='mlegacy' title='Firmware v7 or earlier: no serial number, no provisioning, no factory reset. Homing and calibration are fully supported.'>LEGACY</span>\":\"\")):\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var delBtn=legacy?(\"<button class='micon del dis' title='Not available on legacy (v7) modules' onclick=\\\"event.stopPropagation()\\\">&#x1f5d1;</button>\"):(\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\");var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+delBtn+\"</div>\"):\"\";var snStr=legacy?\"SN: <span style='color:var(--dim)'>n/a (legacy)</span>\":(\"SN: \"+m.sn);var fwStr=legacy?\"<br><span class='mc'>FW: v7 or earlier</span>\":(m.fwVersion?\"<br><span class='mc'>FW: v\"+m.fwVersion+\"</span>\":\"\");h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>\"+snStr+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+fwStr+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
+  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?(\"ID: <span class='mid'>\"+m.id+\"</span>\"+(legacy?\"<span class='mlegacy' title='Firmware v7 or earlier: no serial number, no provisioning, no factory reset. Homing and calibration are fully supported.'>LEGACY</span>\":\"\")):\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var delBtn=legacy?(\"<button class='micon del dis' title='Not available on legacy (v7) modules' onclick=\\\"event.stopPropagation()\\\">&#x1f5d1;</button>\"):(\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\");var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+delBtn+\"</div>\"):\"\";var snStr=legacy?\"SN: <span style='color:var(--dim)'>n/a (legacy)</span>\":(\"SN: \"+m.sn);var fwStr=legacy?\"<br><span class='mc'>FW: v7 or earlier</span>\":(m.fwVersion?\"<br><span class='mc'>FW: \"+(m.fwVersion==\"<18\"?\"older (pre-v18)\":(\"v\"+m.fwVersion))+\"</span>\":\"\");h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>\"+snStr+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+fwStr+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
   server.sendContent("loadModules();setInterval(loadModules,5000);");
   server.sendContent("function loadUnprovisioned(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var el=document.getElementById(\"unprovList\");var up=arr.filter(function(m){return !m.provisioned;});if(!up.length){el.innerHTML=\"<p style=\\\"color:var(--dim)\\\">No unprovisioned modules seen yet.</p>\";return;}var h=\"\";up.forEach(function(m){h+=\"<div style=\\\"display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap\\\">\"+\"<code style=\\\"color:var(--ylw);flex:1;min-width:160px\\\">\"+m.sn+\"</code>\"+\"<button class=\\\"sec\\\" style=\\\"margin:0;padding:4px 10px;font-size:.78rem\\\" onclick=\\\"doHomeSN('\"+m.sn+\"')\\\" title=\\\"Home this module to identify it\\\">Home</button>\"+\"</div>\";});el.innerHTML=h;}).catch(function(){});}");
   server.sendContent("setInterval(loadUnprovisioned,10000);loadUnprovisioned();");
   server.sendContent("function modHome(id){apiFlapCmd(\"/api/flap/home\",{id:id}).then(function(j){loadModules();});}var _infoId=-1;var _delId=-1;function openInfo(id){_infoId=id;document.getElementById(\"modModalTitle\").textContent=\"Module #\"+id;document.getElementById(\"modModal\").style.display=\"flex\";fetchInfo(id);}function refreshDump(){if(_infoId>=0)fetchInfo(_infoId);}function closeModal(){document.getElementById(\"modModal\").style.display=\"none\";_infoId=-1;}");
-  server.sendContent("function fetchInfo(id){var b=document.getElementById(\"modModalBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading module #\"+id+\" ...</p>\";document.getElementById(\"modModalStatus\").textContent=\"\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var m=null;arr.forEach(function(x){if(x.id===id)m=x;});fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){b.innerHTML=renderInfo(m,d);document.getElementById(\"modModalStatus\").textContent=d.stale?\"EEPROM is cached -- click Refresh for a fresh read\":\"EEPROM read fresh from module\";}).catch(function(e){b.innerHTML=renderInfo(m,{ok:false,error:String(e)});});}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
-  server.sendContent("function mrow(k,v){return \"<div class='mfield'><span class='mk'>\"+k+\"</span><span class='mv'>\"+v+\"</span></div>\";}function renderInfo(m,d){var h=\"\";if(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion;h+=mrow(\"Module ID\",m.id)+mrow(\"Serial Number\",legacy?\"n/a (legacy module)\":(m.sn||\"-\"))+mrow(\"Provisioned\",m.provisioned?(legacy?\"yes (hardcoded ID)\":\"yes\"):\"no\")+mrow(\"Firmware\",m.fwVersion?(\"v\"+m.fwVersion):(legacy?\"v7 or earlier\":\"unknown\"))+mrow(\"Last Char\",m.flapChar?m.flapChar:\"-\")+mrow(\"Last Seen\",m.lastSeenEpoch?new Date(m.lastSeenEpoch*1000).toLocaleString():(m.lastSeen?\"seen (clock not set)\":\"-\"));}else{h+=mrow(\"Module ID\",\"(not in registry)\");}h+=\"<div class='sgh' style='margin-top:12px'>EEPROM</div>\";if(!d||!d.ok){h+=\"<p style='color:var(--hi)'>\"+((d&&d.error)?d.error:\"No EEPROM data\")+\"</p>\";return h;}var p=parseDump(d.dump||\"\");if(p.error){h+=\"<p style='color:var(--hi)'>\"+p.error+\"</p>\";return h;}h+=mrow(\"Home Offset\",p.homeOffset+\" steps\")+mrow(\"Steps / Rev\",p.totalSteps);var keys=Object.keys(p.map);h+=mrow(\"Calibrated Flaps\",keys.length+\" / 64\");if(keys.length){h+=\"<div class='mmap'>\";keys.forEach(function(k){h+=\"[\"+k+\"]=\"+p.map[k]+\" \";});h+=\"</div>\";}h+=mrow(\"Raw\",\"<span style='word-break:break-all;color:var(--dim);font-size:.72rem'>\"+d.dump+\"</span>\");return h;}");
+  server.sendContent("function fetchInfo(id){var b=document.getElementById(\"modModalBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading module #\"+id+\" ...</p>\";document.getElementById(\"modModalStatus\").textContent=\"\";fetch(\"/api/flap/version\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).catch(function(){}).then(function(){return fetch(\"/api/flap/modules\");}).then(function(r){return r.json();}).then(function(arr){var m=null;arr.forEach(function(x){if(x.id===id)m=x;});fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){b.innerHTML=renderInfo(m,d);document.getElementById(\"modModalStatus\").textContent=d.stale?\"EEPROM is cached -- click Refresh for a fresh read\":\"EEPROM read fresh from module\";}).catch(function(e){b.innerHTML=renderInfo(m,{ok:false,error:String(e)});});}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
+  server.sendContent("function mrow(k,v){return \"<div class='mfield'><span class='mk'>\"+k+\"</span><span class='mv'>\"+v+\"</span></div>\";}function renderInfo(m,d){var h=\"\";if(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;h+=mrow(\"Module ID\",m.id)+mrow(\"Serial Number\",legacy?\"n/a (legacy module)\":(m.sn||\"-\"))+mrow(\"Provisioned\",m.provisioned?(legacy?\"yes (hardcoded ID)\":\"yes\"):\"no\")+mrow(\"Firmware\",m.fwVersion?(\"v\"+m.fwVersion):(legacy?\"v7 or earlier\":\"unknown\"))+mrow(\"Last Char\",m.flapChar?m.flapChar:\"-\")+mrow(\"Last Seen\",m.lastSeenEpoch?new Date(m.lastSeenEpoch*1000).toLocaleString():(m.lastSeen?\"seen (clock not set)\":\"-\"));}else{h+=mrow(\"Module ID\",\"(not in registry)\");}h+=\"<div class='sgh' style='margin-top:12px'>EEPROM</div>\";if(!d||!d.ok){h+=\"<p style='color:var(--hi)'>\"+((d&&d.error)?d.error:\"No EEPROM data\")+\"</p>\";return h;}var p=parseDump(d.dump||\"\");if(p.error){h+=\"<p style='color:var(--hi)'>\"+p.error+\"</p>\";return h;}h+=mrow(\"Home Offset\",p.homeOffset+\" steps\")+mrow(\"Steps / Rev\",p.totalSteps);var keys=Object.keys(p.map);h+=mrow(\"Calibrated Flaps\",keys.length+\" / 64\");if(keys.length){h+=\"<div class='mmap'>\";keys.forEach(function(k){h+=\"[\"+k+\"]=\"+p.map[k]+\" \";});h+=\"</div>\";}h+=mrow(\"Raw\",\"<span style='word-break:break-all;color:var(--dim);font-size:.72rem'>\"+d.dump+\"</span>\");return h;}");
   server.sendContent("function openDel(id){_delId=id;document.getElementById(\"delModalTitle\").textContent=\"Module #\"+id+\" -- Destructive Actions\";document.getElementById(\"delModalStatus\").textContent=\"\";document.getElementById(\"delModal\").style.display=\"flex\";}function closeDelModal(){document.getElementById(\"delModal\").style.display=\"none\";_delId=-1;}function delAction(kind){if(_delId<0)return;var names={erase:\"Erase EEPROM\",factoryreset:\"Factory Reset\",deprovision:\"De-provision\"};if(!confirm(names[kind]+\" on module #\"+_delId+\"? This cannot be undone.\"))return;var st=document.getElementById(\"delModalStatus\");st.textContent=names[kind]+\" in progress...\";apiFlapCmd(\"/api/flap/\"+kind,{id:_delId}).then(function(j){st.textContent=j.ok?(names[kind]+\" sent.\"):(\"Error: \"+(j.error||\"failed\"));if(j.ok){setTimeout(function(){closeDelModal();loadModules();},900);}}).catch(function(e){st.textContent=\"Error: \"+e;});}");
   server.sendContent("function sendChar(){var id=parseInt(document.getElementById(\"scId\").value);var ch=document.getElementById(\"scChar\").value.toUpperCase().slice(0,1);var r=document.getElementById(\"scr\");if(!ch){r.textContent=\"Enter a character\";return;}apiFlapCmd(\"/api/flap/char\",{id:id,\"char\":ch}).then(function(j){r.textContent=j.ok?(\"Sent '\"+ch+\"' to \"+(id<0?\"all modules\":\"module #\"+id)):(\"Error: \"+(j.error||\"failed\"));}).catch(function(e){r.textContent=\"Error: \"+e;});}");
   server.sendContent("function sendText(){var text=document.getElementById(\"dispText\").value.toUpperCase();var start=parseInt(document.getElementById(\"dispStart\").value);apiFlapCmd(\"/api/flap/text\",{text:text,start:start}).then(function(j){document.getElementById(\"dr\").textContent=j.ok?\"Sent \"+j.chars+\" chars\":\"Error: \"+j.error;});}");
@@ -2246,7 +2403,7 @@ void handleRoot() {
   server.sendContent("function sendIndex(){var id=parseInt(document.getElementById(\"idxId\").value);var idx=parseInt(document.getElementById(\"idxVal\").value);apiFlapCmd(\"/api/flap/index\",{id:id,index:idx}).then(function(j){document.getElementById(\"dr\").textContent=j.ok?\"Sent\":\"Error: \"+j.error;});}");
   server.sendContent("function doHomeSN(sn){document.getElementById(\"provSN\").value=sn;apiFlapCmd(\"/api/flap/homebysn\",{sn:sn}).then(function(j){var el=document.getElementById(\"provR\");if(el)el.textContent=j.ok?\"Homing SN: \"+sn+\" - check which module moves\":\"Error: \"+j.error;});}");
   server.sendContent("function doProvision(){var sn=document.getElementById(\"provSN\").value;var id=parseInt(document.getElementById(\"provId\").value);apiFlapCmd(\"/api/flap/provision\",{sn:sn,id:id}).then(function(j){document.getElementById(\"provR\").textContent=j.ok?\"Provisioning sent\":\"Error: \"+j.error;});}");
-  server.sendContent("function doDeprovision(){var id=parseInt(document.getElementById(\"deprovId\").value);apiFlapCmd(\"/api/flap/deprovision\",{id:id}).then(function(j){document.getElementById(\"deprovR\").textContent=j.ok?(\"De-provisioned \"+(id<0?\"all modules\":\"module \"+id)):\"Error: \"+j.error;});}");
+  server.sendContent("function doDeprovision(){var id=parseInt(document.getElementById(\"deprovId\").value);apiFlapCmd(\"/api/flap/deprovision\",{id:id}).then(function(j){document.getElementById(\"deprovR\").textContent=j.ok?(\"De-provisioned \"+(id<0?\"all modules\":\"module \"+id)):\"Error: \"+j.error;if(j.ok){loadModules();loadUnprovisioned();}});}");
   server.sendContent("function saveWifi(){fetch(\"/api/config/wifi\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({ssid:document.getElementById(\"wSSID\").value,pass:document.getElementById(\"wPASS\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"wr\").textContent=j.ok?\"WiFi saved - reconnecting...\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"wr\").textContent=\"Error: \"+e;});}");
   server.sendContent("function testMqtt(){var el=document.getElementById(\"mr\");el.textContent=\"Testing...\";fetch(\"/api/mqtt/test\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({host:document.getElementById(\"mqH\").value,port:parseInt(document.getElementById(\"mqP\").value)||1883,user:document.getElementById(\"mqU\").value,pass:document.getElementById(\"mqPw\").value})}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"Broker OK - connected and authenticated\":\"Failed: \"+(j.detail||j.error||\"unknown\");}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function saveMqtt(){fetch(\"/api/config/mqtt\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({host:document.getElementById(\"mqH\").value,port:parseInt(document.getElementById(\"mqP\").value),user:document.getElementById(\"mqU\").value,pass:document.getElementById(\"mqPw\").value,prefix:document.getElementById(\"mqPfx\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"mr\").textContent=j.ok?\"MQTT saved - reconnecting...\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"mr\").textContent=\"Error: \"+e;});}");
@@ -2264,7 +2421,7 @@ void handleRoot() {
   server.sendContent("var _calId=-1,_calTotal=4096,_calHo=0,_calMap={},_tuneIdx=-1;var CAL_UNSET=65535,CAL_DEF_HO=2832,CAL_DEF_TS=4096;var _wizIdx=-1,_wizTarget=0;");
   server.sendContent("function calDefault(i){var ts=(_calTotal&&_calTotal>0)?_calTotal:CAL_DEF_TS;return Math.floor((i*ts)/64);}");
   server.sendContent("function calParseDump(raw){var r={homeOffset:0,totalSteps:4096,map:{}};if(!raw)return r;var parts=raw.split(\":\");r.homeOffset=parseInt(parts[0]);r.totalSteps=parseInt(parts[1]);if(isNaN(r.totalSteps))r.totalSteps=4096;if(parts.length>2){var rest=parts.slice(2).join(\":\");rest.split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\"){var k=parseInt(kv[0]),v=parseInt(kv[1]);if(!isNaN(k)&&!isNaN(v)&&v!==CAL_UNSET)r.map[k]=v;}});}return r;}");
-  server.sendContent("function calLoadModules(){var el=document.getElementById(\"calMods\");el.textContent=\"Loading layout...\";Promise.all([fetch(\"/api/display/state\").then(function(r){return r.json();}),fetch(\"/api/flap/modules\").then(function(r){return r.json();})]).then(function(res){var st=res[0]||{},arr=res[1]||[];var rows=st.rows||1,cols=st.cols||16;var count=rows*cols;el.classList.remove(\"single\");el.style.gridTemplateColumns=\"repeat(\"+cols+\",minmax(0,1fr))\";var byId={};arr.forEach(function(m){if(m.provisioned)byId[m.id]=m;});var h=\"\";for(var id=0;id<count;id++){var m=byId[id];var legacy=m&&m.lastSeen>0&&!m.fwVersion;var known=m&&m.fwVersion;var cls=\"cmod\";if(id===_calId)cls+=\" sel\";if(legacy)cls+=\" legacy\";else if(known)cls+=\" known\";else if(!m)cls+=\" unknown\";var sub=legacy?\"<span class='csn lg'>v7</span>\":(m&&m.sn?\"<span class='csn'>\"+m.sn.slice(-4)+\"</span>\":\"<span class='csn'>--</span>\");h+=\"<div class='\"+cls+\"' data-id='\"+id+\"' onclick='calSelect(\"+id+\")'>\"+id+sub+\"</div>\";}el.innerHTML=h;}).catch(function(){el.innerHTML=\"<span style='color:var(--hi)'>Error loading layout</span>\";});}");
+  server.sendContent("function calLoadModules(){var el=document.getElementById(\"calMods\");el.textContent=\"Loading layout...\";Promise.all([fetch(\"/api/display/state\").then(function(r){return r.json();}),fetch(\"/api/flap/modules\").then(function(r){return r.json();})]).then(function(res){var st=res[0]||{},arr=res[1]||[];var rows=st.rows||1,cols=st.cols||16;var count=rows*cols;el.classList.remove(\"single\");el.style.gridTemplateColumns=\"repeat(\"+cols+\",minmax(0,1fr))\";var byId={};arr.forEach(function(m){if(m.provisioned)byId[m.id]=m;});var h=\"\";for(var id=0;id<count;id++){var m=byId[id];var legacy=m&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var known=m&&m.fwVersion;var cls=\"cmod\";if(id===_calId)cls+=\" sel\";if(legacy)cls+=\" legacy\";else if(known)cls+=\" known\";else if(!m)cls+=\" unknown\";var sub=legacy?\"<span class='csn lg'>v7</span>\":(m&&m.sn?\"<span class='csn'>\"+m.sn.slice(-4)+\"</span>\":\"<span class='csn'>--</span>\");h+=\"<div class='\"+cls+\"' data-id='\"+id+\"' onclick='calSelect(\"+id+\")'>\"+id+sub+\"</div>\";}el.innerHTML=h;}).catch(function(){el.innerHTML=\"<span style='color:var(--hi)'>Error loading layout</span>\";});}");
   server.sendContent("function calSelectAny(){var v=parseInt(document.getElementById(\"calAnyId\").value);if(isNaN(v)||v<0||v>254){alert(\"Enter an ID from 0 to 254.\");return;}calSelect(v);}");
   server.sendContent("function calSelect(id){_calId=id;document.querySelectorAll(\"#calMods .cmod\").forEach(function(el){el.classList.toggle(\"sel\",parseInt(el.dataset.id)===id);});var cell=document.querySelector(\"#calMods .cmod[data-id='\"+id+\"']\");var tag=\"\";if(cell){if(cell.classList.contains(\"legacy\"))tag=\" (legacy v7)\";else if(cell.classList.contains(\"unknown\"))tag=\" (not yet seen)\";}document.getElementById(\"calDetail\").style.display=\"block\";document.getElementById(\"calTitle\").textContent=\"Module \"+id+tag;calRefresh();}");
   server.sendContent("function calRefresh(){if(_calId<0)return;var st=document.getElementById(\"calStatus\");st.textContent=\"Reading EEPROM from module \"+_calId+\"...\";document.getElementById(\"calHoIn\").value=\"\";document.getElementById(\"calTsIn\").value=\"\";document.getElementById(\"calMap\").innerHTML=\"\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:_calId})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){st.textContent=\"Error: \"+(d.error||\"no response from module\");return;}var p=calParseDump(d.dump||\"\");_calHo=p.homeOffset;_calTotal=p.totalSteps;_calMap=p.map;document.getElementById(\"calHoIn\").value=isNaN(p.homeOffset)?\"\":p.homeOffset;document.getElementById(\"calTsIn\").value=p.totalSteps;st.textContent=d.stale?\"Cached EEPROM -- click Re-read for a fresh value\":\"EEPROM read fresh from module\";calRenderMap();}).catch(function(e){st.textContent=\"Error: \"+e;});}");
@@ -2346,28 +2503,47 @@ void handleApiModules() {
   server.send(200, "application/json", "");
   server.sendContent("[");
 
+  // Emit modules sorted by ID so the grid is always ordered (newly provisioned
+  // modules slot into place instead of appearing at the end). Build a sorted
+  // index order under the lock first; unprovisioned entries (id==255) naturally
+  // sort to the end. Then snapshot+send each entry, re-checking under the lock.
+  static uint8_t order[MAX_MODULES];
+  int count = 0;
   xSemaphoreTake(sfMutex, portMAX_DELAY);
-  int count = sfModuleCount;
+  count = sfModuleCount;
+  for (int i = 0; i < count; i++) order[i] = (uint8_t)i;
+  // Insertion sort the index array by the modules' IDs (stable, small N).
+  for (int a = 1; a < count; a++) {
+    uint8_t key = order[a];
+    uint8_t keyId = sfModules[key].id;
+    int b = a - 1;
+    while (b >= 0 && sfModules[order[b]].id > keyId) { order[b + 1] = order[b]; b--; }
+    order[b + 1] = key;
+  }
   xSemaphoreGive(sfMutex);
 
-  for (int i = 0; i < count; i++) {
+  int emitted = 0;
+  for (int k = 0; k < count; k++) {
+    int idx = order[k];
     // Snapshot this entry under the lock, then release before formatting/sending.
     SFModule m;
     bool valid = false;
     xSemaphoreTake(sfMutex, portMAX_DELAY);
-    if (i < sfModuleCount) { m = sfModules[i]; valid = true; }
+    if (idx < sfModuleCount) { m = sfModules[idx]; valid = true; }
     xSemaphoreGive(sfMutex);
-    if (!valid) break;   // list shrank (prune/deprovision) mid-iteration
+    if (!valid) continue;   // list shrank (prune/deprovision) mid-iteration
 
     char flapBuf[2] = {0, 0};
     if (m.flapChar >= 32 && m.flapChar <= 126 && m.flapChar != '"') flapBuf[0] = m.flapChar;
     char obj[256];
     snprintf(obj, sizeof(obj),
-      "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"flapIndex\":%d,"
+      "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"acked\":%s,\"flapIndex\":%d,"
       "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"lastSeen\":%lu,\"lastSeenEpoch\":%lu}",
-      i ? "," : "", (int)m.id, m.serialNum, m.provisioned ? "true" : "false",
+      emitted ? "," : "", (int)m.id, m.serialNum, m.provisioned ? "true" : "false",
+      m.acked ? "true" : "false",
       m.flapIndex, flapBuf, m.fwVersion, m.lastSeen, m.lastSeenEpoch);
     server.sendContent(obj);
+    emitted++;
   }
   server.sendContent("]");
   server.sendContent("");   // terminate the chunked response
@@ -2611,12 +2787,11 @@ void handleApiVersion() {
   // Send the version query onto the bus
   sfQueryVersion(id);
 
-  // Wait for a fresh version response (lastSeen advances when sfParseResponse
-  // processes the reply and writes fwVersion). v18+ modules STAGGER their
-  // version responses by ~100ms per ID slot (observed train: id5 @ +100ms,
-  // id9 @ +200ms, id10 @ +300ms after the first), so a fixed 500ms window can
-  // never catch high-ID modules even when they are healthy. Scale the window
-  // with the queried ID, capped so the handler stays bounded.
+  // Wait for a fresh version response. A DIRECT version query is answered
+  // synchronously by the module (typically within ~35-70ms once the trailing
+  // newline no longer collides with the reply -- see sfQueryVersion), so a
+  // modest window is plenty. lastSeen advances when sfParseResponse processes
+  // the reply and writes fwVersion.
   char          fwVer[8]     = "";
   char          sn[21]       = "";
   int           repId        = -1;
@@ -2657,6 +2832,15 @@ void handleApiVersion() {
     SFModule* mc = sfFindById((uint8_t)id);
     if (mc && mc->fwVersion[0]) {
       strlcpy(cachedVer, mc->fwVersion, sizeof(cachedVer));
+      strlcpy(cachedSn,  mc->serialNum, sizeof(cachedSn));
+      cachedId      = mc->id;
+      cachedLastSeen = mc->lastSeen;
+    } else if (mc) {
+      // Known module, no cached version yet, and this query timed out. Do NOT
+      // stamp any sentinel: a direct version query is reliable now that the
+      // newline-collision is fixed, so a timeout here is a transient miss (bus
+      // busy, momentary contention), not evidence the module lacks the command.
+      // Return what we have (id/sn) and let the next poll re-query.
       strlcpy(cachedSn,  mc->serialNum, sizeof(cachedSn));
       cachedId      = mc->id;
       cachedLastSeen = mc->lastSeen;
@@ -3658,6 +3842,22 @@ void taskRS485(void* pv) {
   static uint8_t lineBuf[TX_MAX_BYTES];
   static size_t  lineLen = 0;
 
+  // Startup discovery: if we booted with an empty registry (first boot, or after
+  // an Identify-All / cleared list), broadcast m*v so every module on the bus
+  // reports its version + serial and populates the initial list. Delayed briefly
+  // so the bus driver and the RX path here are fully up before we transmit.
+  {
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    bool empty;
+    if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+    empty = (sfModuleCount == 0);
+    if (sfMutex) xSemaphoreGive(sfMutex);
+    if (empty) {
+      printf("[MOD] empty registry at boot -- broadcasting m*v to discover modules\n");
+      rs485SendStr("m*v\n");
+    }
+  }
+
   while (true) {
     while (rs485.available()) {
       int b = rs485.read();
@@ -3715,6 +3915,49 @@ void taskRS485(void* pv) {
         lineLen = 0;
       }
     }
+
+    // Deferred post-provision version queries (with retry). When a module's
+    // verDueMs arrives we query its version; if no version has come back yet we
+    // re-arm for another attempt, up to MODULE_VER_MAX_TRIES. A module is
+    // considered done the moment its fwVersion is populated (the version-response
+    // handler fills it). Done here (not inline in the ack handler) so the module
+    // has settled on its new ID and will actually reply. IDs to query are
+    // collected under the lock and sent unlocked (rs485Send re-takes sfMutex via
+    // frame tracking -> querying under it would deadlock).
+    {
+      unsigned long nowMs = millis();
+      static uint8_t verDue[MAX_MODULES];
+      int verN = 0;
+      if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        for (int i = 0; i < sfModuleCount && verN < MAX_MODULES; i++) {
+          SFModule& m = sfModules[i];
+          if (!m.verDueMs || nowMs < m.verDueMs) continue;   // not due
+          if (m.fwVersion[0]) { m.verDueMs = 0; continue; }  // already known -> stop
+          if (m.verTries >= MODULE_VER_MAX_TRIES) {          // gave up
+            m.verDueMs = 0;
+            // Exhausted the post-provision retries without a version reply. With
+            // the newline-collision fixed a direct version query is reliable, so
+            // reaching this point is rare (a module that was busy/off-bus the
+            // whole window). Just stop the deferred sweep and leave fwVersion
+            // empty; the Info dialog or the next Identify will re-query and fill
+            // it in. No sentinel is stamped -- mislabeling a healthy module as
+            // "older" was a workaround for the (now-fixed) collision bug.
+            DBG("[MOD] module %d: no version after %d post-provision tries -- will re-query on demand\n",
+                m.id, m.verTries);
+            continue;
+          }
+          verDue[verN++] = m.id;
+          m.verTries++;
+          m.verDueMs = nowMs + MODULE_VER_RETRY_MS;           // re-arm for a retry
+        }
+        xSemaphoreGive(sfMutex);
+      }
+      for (int i = 0; i < verN; i++) {
+        DBG("[MOD] post-provision version query -> module %d\n", verDue[i]);
+        sfQueryVersion(verDue[i]);
+      }
+    }
+
     wdgRS485Ms = millis();
     vTaskDelay(pdMS_TO_TICKS(5));
   }
