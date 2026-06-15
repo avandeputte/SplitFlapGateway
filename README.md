@@ -1,6 +1,6 @@
 # Split-Flap Gateway
 
-**Firmware version: 1.4**
+**Firmware version: 1.6**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
@@ -73,16 +73,19 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 - **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs
 - **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
 - **Health metrics** — the Status tab shows minimum-ever free heap and per-task stack high-water marks, surfacing memory pressure before it causes a crash
-- **Diagnostic boot/telemetry log** — on boot the gateway prints its reset reason (POWERON / PANIC / TASK_WDT / BROWNOUT, etc.) and a chip/heap snapshot; the periodic `[WDG]` line reports heap, min-ever heap, largest free block, heap-fragmentation %, per-task stack watermarks, RX/TX/parse-reject counters, WiFi RSSI, and MQTT state
+- **Diagnostic boot/telemetry log** — on boot the gateway prints its reset reason (POWERON / PANIC / TASK_WDT / BROWNOUT, etc.), a chip/heap snapshot, and where its large buffers were allocated (`[MEM] … in PSRAM`); the periodic `[WDG]` line reports heap, min-ever heap, largest free block, heap-fragmentation %, per-task stack watermarks, RX/TX/parse-reject counters, WiFi station and fallback-AP state, WiFi RSSI, and MQTT state
+- **PSRAM-backed buffers** — the bus-monitor ring, MQTT publish queue, and module registry (~60 KB combined) live in the board's PSRAM, keeping internal RAM free for the WiFi/TCP stack (which makes large over-the-air updates reliable); falls back to internal RAM if PSRAM is unavailable
 - **mDNS** — the web UI is reachable at `http://splitflap-gw.local` (no IP lookup needed)
 - **Maintenance mode** — a header toggle that makes the gateway ignore all externally-originated MQTT commands (the web UI keeps working), so calibration and backup work isn't disturbed by home-automation traffic; always resets to off on reboot
+- **Quiet time** — a header toggle (and REST/MQTT/Home Assistant control) that keeps the gateway responsive to commands but stops it from moving any flaps for normal display updates; deliberate calibration moves still work. When turned off, the reels resync to the last requested display. Always resets to off on reboot
+- **Home Assistant integration** — optional MQTT auto-discovery (opt-in on the Settings tab) that exposes the gateway as a Home Assistant device: a display text control, Maintenance and Quiet Time switches, an availability sensor (via MQTT LWT), and the full `[WDG]` diagnostic set as sensors, plus a clickable Gateway URL
 - **Real-time bus monitor** — live RS-485 traffic with protocol decoding and local timestamps
 - **NTP time sync** — RTC backed by PCF85063; syncs on WiFi connect and persists through power loss. The NTP server is configurable in Settings (default `pool.ntp.org`)
 - **DST-aware timezone** — POSIX TZ string support covering 20 regions, takes effect immediately
 - **MQTT integration** — publishes bus frames and module events; subscribes to control topics
 - **REST API** — full JSON API for programmatic control (OpenAPI spec included)
 - **OTA updates** — flash new firmware over WiFi from a browser or Arduino IDE; no USB cable required after first flash
-- **AP fallback** — creates its own access point when WiFi is unavailable
+- **Fallback AP** — when no network is configured (or the WiFi connection is lost for ~20 s), the gateway brings up its own access point for setup; once connected to your WiFi it runs station-only and shuts the AP down automatically
 - **Configurable serial debug** — verbose logging toggled from the web UI Settings tab
 - **Watchdog** — detects stalled FreeRTOS tasks and auto-reboots; emergency reboot on low heap
 
@@ -162,12 +165,15 @@ The firmware outputs diagnostic messages at **115200 baud** via the native USB C
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v1.4
+[Boot] Split-Flap Gateway v1.6
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
+[MEM] monitor ring in PSRAM (18944 bytes)
+[MEM] MQTT queue in PSRAM (26240 bytes)
+[MEM] module registry in PSRAM (15300 bytes)
 [MQTT] Connecting to broker:1883...
-[WDG] up=30s heap=187432 min=171008 maxblk=110580 frag=41% stk(485/web/net/ota/rtc)=3120/5240/2980/2400/900 rx=12 tx=9 rej=0 wifi=1 rssi=-58 mqtt=1 mods=11
+[WDG] up=30s heap=164484 min=84632 maxblk=118772 frag=28% stk(485/web/net/ota/rtc)=4724/4756/2684/2812/748 rx=12 tx=9 rej=0 wifi=1 ap=0 rssi=-58 mqtt=1 mods=11
 ```
 
 The boot line's `reset=` field is the first thing to check after an unexpected reboot:
@@ -180,7 +186,9 @@ The boot line's `reset=` field is the first thing to check after an unexpected r
 | `TASK_WDT` / `INT_WDT` | a task or interrupt blocked too long |
 | `BROWNOUT` | supply voltage dipped — a power problem, not firmware |
 
-The periodic `[WDG]` fields: `heap` (free now), `min` (lowest free heap ever — catches transient dips), `maxblk` (largest allocatable block), `frag` (heap fragmentation %; a high value with adequate `heap` warns of fragmentation before an allocation fails), `stk(...)` (per-task minimum-ever free stack in bytes — a value trending toward 0 predicts a stack-overflow crash), `rx`/`tx` (bus frame counters), `rej` (corrupt/garbled frames rejected at parse — a rising count signals bus collisions or wiring noise), `rssi` (WiFi signal), and `mqtt` (broker connected). A stall reboot logs which task stalled and its age; a low-heap reboot logs the heap value.
+The `[MEM]` lines report where the three large runtime buffers landed — PSRAM when available (preferred, to keep internal RAM free for the WiFi/TCP stack during OTA), or internal RAM as a fallback.
+
+The periodic `[WDG]` fields: `heap` (free now), `min` (lowest free heap ever — catches transient dips), `maxblk` (largest allocatable block), `frag` (heap fragmentation %; a high value with adequate `heap` warns of fragmentation before an allocation fails), `stk(...)` (per-task minimum-ever free stack in bytes — a value trending toward 0 predicts a stack-overflow crash), `rx`/`tx` (bus frame counters), `rej` (corrupt/garbled frames rejected at parse — a rising count signals bus collisions or wiring noise), `wifi` (station connected to your network), `ap` (fallback access point currently up — should be `0` whenever `wifi=1`), `rssi` (WiFi signal), and `mqtt` (broker connected). A stall reboot logs which task stalled and its age; a low-heap reboot logs the heap value.
 
 **Debug messages** (enable in Settings → Serial Debug):
 ```
@@ -200,7 +208,7 @@ The periodic `[WDG]` fields: `heap` (free now), `min` (lowest free heap ever —
 
 ## First Boot
 
-On first boot the gateway starts in Access Point mode:
+With no WiFi configured, the gateway brings up a fallback Access Point so you can reach the setup page:
 
 | Setting | Value |
 |---|---|
@@ -208,7 +216,9 @@ On first boot the gateway starts in Access Point mode:
 | Password | `12345678` |
 | Web UI | http://192.168.4.1 |
 
-Connect to the AP, open the web UI, go to **Settings → WiFi**, enter your network credentials, and click **Save WiFi**. The gateway reconnects and displays its IP in the status badge. NTP syncs automatically on first WiFi connection.
+Connect to the AP, open the web UI, go to **Settings → WiFi**, enter your network credentials, and click **Save WiFi**. The gateway connects to your network and displays its IP in the status badge. NTP syncs automatically on first WiFi connection.
+
+The Access Point is **fallback-only**: once the gateway is connected to your WiFi it runs station-only and the AP is shut down (so it can't be joined by mistake, and its resources stay free). The AP only comes back if the station connection is lost for more than ~20 seconds, and it drops again automatically when the connection returns. You can confirm the AP is off in the `[WDG]` serial log — `ap=0` whenever `wifi=1`.
 
 ---
 
@@ -406,22 +416,24 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
-| `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap, maintenance flag |
+| `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap, maintenance and quiet flags |
 | `GET` | `/api/maintenance` | — | Returns `{ok,on}` — current maintenance-mode state |
 | `POST` | `/api/mqtt/test` | `{"host":"...","port":1883,"user":"...","pass":"..."}` (all optional, defaults to saved config) | Test broker reachability + credentials without touching the live connection |
 | `POST` | `/api/maintenance` | `{"on":true}` | Enable/disable maintenance mode (ignores external MQTT commands) |
+| `GET` | `/api/quiet` | — | Returns `{ok,on}` — current quiet-time state |
+| `POST` | `/api/quiet` | `{"on":true}` | Enable/disable quiet time (flaps stop moving for display updates; reels resync when disabled) |
 | `GET` | `/api/config` | — | Current configuration (passwords excluded) |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
-| `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"otaPassword":"..."}` | Timezone, serial debug, or OTA password |
+| `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"haEnabled":true}` or `{"otaPassword":"..."}` | Timezone, serial debug, Home Assistant integration, or OTA password |
 
 ### OTA Firmware Update
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/ota` | Browser-based firmware upload page |
-| `POST` | `/api/ota/upload` | Upload compiled `.bin` file (multipart) |
+| `POST` | `/api/ota/upload` | Upload the compiled application image `SplitFlapGateway.ino.bin` (multipart). See [OTA Firmware Updates](#ota-firmware-updates) for which file to use |
 
 ---
 
@@ -456,12 +468,18 @@ Default topic prefix: **`splitflap`** (configurable in Settings → MQTT).
 |---|---|---|
 | `splitflap/rx` | `{"ts":...,"wt":"...","command":"m5-A"}` | Frame received from bus |
 | `splitflap/tx` | `{"ts":...,"wt":"...","command":"m5-A"}` | Frame transmitted to bus |
-| `splitflap/status` | `{"uptime":...,"rx":...,"tx":...,"modules":...,"time":"...","ntpSynced":true,"heap":...}` | Heartbeat, published once per minute |
+| `splitflap/status` | `{"uptime":...,"rx":...,"tx":...,"rej":...,"modules":...,"time":"...","ntpSynced":true,"heap":...,"minheap":...,"maxblk":...,"frag":...,"rssi":...,"wifi":true,"stk485":...,"stkweb":...,"stknet":...,"stkota":...,"stkrtc":...,"ip":"...","url":"http://.../","version":"...","maintenance":false,"quiet":false}` | Heartbeat with the full `[WDG]` diagnostic set, published once per minute |
 | `splitflap/flap/adv` | `"AABBCCDD..."` | Unprovisioned module advertisement |
 | `splitflap/flap/ack` | `{"id":5,"sn":"..."}` | Provisioning acknowledgement |
 | `splitflap/flap/version` | `{"id":5,"ver":"12","reportedId":5,"sn":"..."}` | Version response |
 | `splitflap/flap/calibrated` | `{"id":5,"stepsPerRev":4096}` | Calibration result |
 | `splitflap/flap/dump` | `{"id":5,"dump":"..."}` | EEPROM dump response |
+| `splitflap/availability` | `online` / `offline` | Gateway availability (retained; `offline` set via MQTT Last Will). Used by Home Assistant |
+| `splitflap/display/state` | `HELLO   WORLD` | Best-known display contents assembled from tracked flap characters (`?` = unknown). Published on change |
+| `splitflap/maintenance/state` | `ON` / `OFF` | Maintenance mode state (Home Assistant switch) |
+| `splitflap/quiet/state` | `ON` / `OFF` | Quiet time state (Home Assistant switch) |
+
+> The `availability`, `display/state`, `maintenance/state`, and `quiet/state` topics, plus the Home Assistant discovery configs, are only published when Home Assistant integration is enabled on the Settings tab. The `rx`/`tx`/`status`/`flap/*` topics always publish when MQTT is connected.
 
 ### Subscribed topics
 
@@ -471,6 +489,19 @@ Default topic prefix: **`splitflap`** (configurable in Settings → MQTT).
 | `splitflap/flap/set` | `{"id":5,"char":"A"}` | Show character |
 | `splitflap/flap/home` | `{"id":5}` | Home module |
 | `splitflap/flap/provision` | `{"sn":"AABBCC...","id":5}` | Provision module |
+| `splitflap/display/set` | `HELLO` | Show a plain string across the display from module 0 (Home Assistant text entity) |
+| `splitflap/maintenance/set` | `ON` / `OFF` / `true` / `1` | Set maintenance mode (reachable even while maintenance is on) |
+| `splitflap/quiet/set` | `ON` / `OFF` / `true` / `1` | Set quiet time |
+
+### Home Assistant
+
+Enable **Home Assistant integration** on the Settings tab (MQTT must be configured). On connect the gateway publishes retained [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery) configs under `homeassistant/<component>/sfgw_<chip-id>/...`, so Home Assistant auto-creates a single device with:
+
+- a **Display** text entity (set/read the display string),
+- **Maintenance Mode** and **Quiet Time** switches,
+- diagnostic **sensors** mirroring the `[WDG]` heartbeat — modules, uptime, free/min heap, largest free block, fragmentation %, WiFi signal, frames received/sent, parse rejects, the five per-task stack watermarks, IP address, firmware version, and a clickable **Gateway URL**.
+
+Availability is backed by an MQTT Last Will, so entities are marked unavailable if the gateway drops off. Turning the integration off publishes empty discovery payloads to remove the entities cleanly.
 
 ---
 
@@ -497,14 +528,27 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
 
 ### Browser upload (recommended)
 
-1. In Arduino IDE: **Sketch → Export Compiled Binary** → saves `SplitFlapGateway.ino.bin`
-2. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
-3. Select the `.bin` file and click **Upload Firmware**
-4. The gateway reboots automatically on success
+1. In Arduino IDE: **Sketch → Export Compiled Binary** (Ctrl/Cmd+Alt+S). The files land in a `build/<board-fqbn>/` subfolder next to your sketch.
+2. From that folder, choose **`SplitFlapGateway.ino.bin`** — the plain application image. **This is the only file to upload over OTA.**
+3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
+4. Select `SplitFlapGateway.ino.bin` and click **Upload Firmware**
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v1.6**).
+
+> **Which file?** The compiler emits several files alongside the app image — pick the right one:
+>
+> | File | Use for OTA? | What it is |
+> |---|---|---|
+> | `SplitFlapGateway.ino.bin` | ✅ **Yes** | The application image — what the OTA updater writes to the app partition |
+> | `SplitFlapGateway.ino.merged.bin` | ❌ No | Full-flash image (bootloader + partitions + app) for flashing at offset 0x0 with esptool — **not** an OTA image |
+> | `SplitFlapGateway.ino.bootloader.bin` | ❌ No | Bootloader; USB flash only |
+> | `SplitFlapGateway.ino.partitions.bin` | ❌ No | Partition table; USB flash only |
+> | `SplitFlapGateway.ino.elf` / `.map` | ❌ No | Debug symbols / linker map — not firmware |
+>
+> The common mistake is grabbing `*.merged.bin`. For OTA you always want the plain `*.ino.bin`.
 
 ### Arduino IDE / command line
 
-The gateway advertises as `splitflap-gw` on the network:
+As an alternative to the browser upload, you can flash over the network with `espota`. The gateway advertises as `splitflap-gw`:
 
 ```bash
 # Arduino IDE: Tools → Port → Network ports → splitflap-gw
