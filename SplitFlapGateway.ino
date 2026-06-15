@@ -78,7 +78,7 @@
 #define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
 
 /* ---- Firmware identity ---- */
-#define FW_VERSION           "1.4"            // gateway firmware version (UI + boot log)
+#define FW_VERSION           "1.6"            // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -137,6 +137,30 @@ static volatile bool gSerialDebug = false;
 // continue to work normally. Always OFF at boot -- never persisted -- so a
 // reboot is a guaranteed return to normal operation.
 static volatile bool gMaintenanceMode = false;
+// Quiet Time: when true the gateway still accepts and acknowledges every command,
+// but does NOT transmit normal display-motion frames to the bus (show character,
+// show index, and home), so the flaps stay still during quiet hours. Deliberate
+// calibration moves (calibrate, goto, nudge) are still allowed, since those only
+// come from an operator actively calibrating. Display tracking is left unchanged
+// (it reflects the physically-shown flap). The latest requested display per
+// module is remembered so the reels can resync when Quiet Time turns off.
+// Runtime-only -- OFF at boot, never persisted -- like maintenance mode.
+static volatile bool gQuietTime = false;
+// Set when display tracking changes (in rs485Send); the network task publishes
+// the HA display-state topic (rate-limited) so HA reflects what's shown without
+// spamming. Declared here so rs485Send, defined earlier, can reference it.
+static volatile bool gDisplayDirty = false;
+// Set for the duration of a web OTA upload. While true the network task skips
+// MQTT status/display/discovery publishes so the upload has the heap and CPU it
+// needs (these reduce the contiguous heap the WiFi/TCP stack relies on, a known
+// cause of mid-upload connection drops). Declared early so the OTA handler and
+// the network task can both see it.
+static volatile bool gOtaInProgress = false;
+// Fallback SoftAP: the AP is only brought up when the station is NOT connected
+// to a configured network (so the config page stays reachable). Once the station
+// connects, the AP is dropped and the gateway runs STA-only. Tracks whether the
+// AP is currently up so we only switch WiFi modes on actual state transitions.
+static bool gApActive = false;
 #define DBG(...) do { if (gSerialDebug) printf(__VA_ARGS__); } while(0)
 
 struct RtcTime {
@@ -167,6 +191,7 @@ struct GwConfig {
   char          posixTZ[64];   // POSIX TZ string e.g. "EST5EDT,M3.2.0,M11.1.0"
   char          ntpServer[64]; // NTP server hostname (default pool.ntp.org)
   bool          serialDebug;   // enable verbose serial output
+  bool          haEnabled;     // publish Home Assistant MQTT discovery + entity state
   char          otaPassword[32]; // OTA update password (blank = no auth)
   uint8_t       gridRows;      // visual display wall: rows (>=1)
   uint8_t       gridCols;      // visual display wall: columns (>=1)
@@ -327,7 +352,11 @@ static unsigned long rtcEpochNow() {
 }
 
 struct MqttQItem { char topic[48]; char payload[MQTT_BUF_SIZE]; size_t len; };
-static MqttQItem             mqttQueue[MQTT_Q_SIZE];
+// Outbound MQTT publish queue (~25 KB). Lives in PSRAM -- it's drained by the
+// network task and written under mqttQMutex, never from an ISR or DMA, so the
+// slightly slower PSRAM is fine and it frees ~25 KB of internal RAM. Allocated
+// in psramAllocInit(); falls back to internal RAM if PSRAM is unavailable.
+static MqttQItem*            mqttQueue     = NULL;
 static volatile int          mqttQHead     = 0;
 static volatile int          mqttQTail     = 0;
 static SemaphoreHandle_t     mqttQMutex    = NULL;
@@ -346,9 +375,20 @@ struct SFModule {
   char     fwVersion[8];     // firmware version string
   unsigned long lastSeen;    // millis() of last activity (resets on reboot)
   unsigned long lastSeenEpoch; // RTC wall-clock epoch of last activity (survives reboot)
+  // Quiet Time: the display the host last requested while quiet (not yet shown).
+  // pendChar holds a requested character, or pendIndex a requested flap index;
+  // hasPend marks one is waiting. On Quiet Time -> off these drive the resync.
+  char     pendChar;         // requested char while quiet (0 = none / index-based)
+  int      pendIndex;        // requested flap index while quiet (-1 = none)
+  bool     hasPend;          // a deferred display request is waiting
 };
 
-static SFModule sfModules[MAX_MODULES];
+// Module registry (~14 KB). Lives in PSRAM -- accessed only under sfMutex from
+// normal tasks (never an ISR, never DMA, and not during flash writes), and the
+// 9600-baud bus is far from a hot loop, so PSRAM latency is negligible while it
+// frees ~14 KB of internal RAM. Allocated in psramAllocInit(); falls back to
+// internal RAM if PSRAM is unavailable.
+static SFModule*            sfModules     = NULL;
 static SemaphoreHandle_t sfMutex = NULL;
 static StaticSemaphore_t sfMutexBuf;
 // Explicit prototypes to prevent Arduino IDE inserting them before SFModule is defined.
@@ -398,6 +438,7 @@ void cfgSetDefaults() {
   cfg.gridCols = 16;
   cfg.serialDebug = false;
   gSerialDebug    = false;
+  cfg.haEnabled   = false;
   strlcpy(cfg.otaPassword, "", sizeof(cfg.otaPassword));
   strlcpy(gPosixTZ,    "UTC0", sizeof(gPosixTZ));
 }
@@ -425,6 +466,7 @@ void loadConfig() {
   if (cfg.gridCols < 1) cfg.gridCols = 1;
   cfg.serialDebug = prefs.getBool("dbgSerial", false);
   gSerialDebug    = cfg.serialDebug;
+  cfg.haEnabled   = prefs.getBool("haEnabled", false);
   strlcpy(cfg.otaPassword, prefs.getString("otaPass", "").c_str(), sizeof(cfg.otaPassword));
   strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
   setenv("TZ", gPosixTZ, 1);
@@ -450,6 +492,7 @@ void saveConfig() {
   prefs.putUChar ("sbits",  cfg.rs485StopBits);
   prefs.putString("tz",     cfg.posixTZ);
   prefs.putBool  ("dbgSerial", cfg.serialDebug);
+  prefs.putBool  ("haEnabled", cfg.haEnabled);
   prefs.putString("otaPass",   cfg.otaPassword);
   prefs.end();
 }
@@ -474,16 +517,53 @@ bool sfValidSN(const char* sn);
 void ringPush(const RS485Msg& m);
 String ringDrain();
 void mqttPublishMsg(const RS485Msg& m);
+static void mqttPublishStateTopics();          // HA entity state (display/maint/quiet)
+static void mqttPublishDisplayState();         // current display string
+static void haPublishDiscovery(bool enable);   // HA MQTT discovery (or removal)
 void rs485Send(const uint8_t* data, size_t len);
 
-static RS485Msg          msgRing[MSG_RING_SIZE];
+// The bus-monitor ring (64 x ~296 bytes ~= 19 KB) lives in PSRAM, not internal
+// RAM. It's a diagnostic log on no hot path, so the slightly slower PSRAM is
+// fine, and freeing ~19 KB of internal DRAM gives the WiFi/TCP stack the
+// headroom it needs during a large web-OTA upload (which otherwise exhausts the
+// heap as receive buffers pile up). Allocated in setup() via ringInit(); falls
+// back to internal RAM if PSRAM is unavailable. Never freed.
+static RS485Msg*         msgRing       = NULL;
 static volatile int      msgHead       = 0;
 static volatile int      msgPollCursor = 0;
 static StaticSemaphore_t msgMutexBuf;
 static SemaphoreHandle_t msgMutex = NULL;
 
+// Allocate the monitor ring (PSRAM preferred). Call once from setup() before
+// any task that pushes to the ring is started.
+// Allocate a large buffer in PSRAM (preferred) or internal RAM (fallback),
+// zeroed. Logs where it landed. Returns NULL only if both allocations fail.
+static void* psramAlloc(const char* name, size_t bytes) {
+  void* p = NULL;
+  if (psramFound()) p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+  if (p) {
+    printf("[MEM] %s in PSRAM (%u bytes)\n", name, (unsigned)bytes);
+  } else {
+    p = malloc(bytes);   // fallback: internal RAM
+    printf("[MEM] %s in internal RAM (%u bytes)%s\n", name, (unsigned)bytes,
+           psramFound() ? " -- PSRAM alloc failed" : " -- no PSRAM");
+  }
+  if (p) memset(p, 0, bytes);
+  return p;
+}
+
+// Allocate the large runtime buffers in PSRAM to free internal RAM (which the
+// WiFi/TCP stack needs during a web-OTA upload). Call once from setup() before
+// any task or registry init touches these buffers. ~58 KB moved off internal
+// RAM in total (monitor ring + MQTT queue + module registry).
+static void psramAllocInit() {
+  msgRing   = (RS485Msg*) psramAlloc("monitor ring", sizeof(RS485Msg) * MSG_RING_SIZE);
+  mqttQueue = (MqttQItem*) psramAlloc("MQTT queue",   sizeof(MqttQItem) * MQTT_Q_SIZE);
+  sfModules = (SFModule*) psramAlloc("module registry", sizeof(SFModule) * MAX_MODULES);
+}
+
 void ringPush(const RS485Msg& m) {
-  if (!msgMutex) return;
+  if (!msgMutex || !msgRing) return;
   xSemaphoreTake(msgMutex, portMAX_DELAY);
   msgRing[msgHead] = m;
   msgHead = (msgHead + 1) % MSG_RING_SIZE;
@@ -491,7 +571,7 @@ void ringPush(const RS485Msg& m) {
 }
 
 String ringDrain() {
-  if (!msgMutex) return "[]";
+  if (!msgMutex || !msgRing) return "[]";
   xSemaphoreTake(msgMutex, portMAX_DELAY);
   int head = msgHead;
   xSemaphoreGive(msgMutex);
@@ -650,8 +730,95 @@ static void sfTrackFromFrame(const uint8_t* data, size_t len) {
   }
 }
 
+// Parse the address + command of an outbound frame for Quiet Time. Returns the
+// command char (or 0 if not a normal addressed display frame) and sets *outAddr
+// to the module id, or -1 for broadcast ('*'). Mirrors sfTrackFromFrame's
+// address parsing. Used only to classify display-motion frames.
+static char sfFrameCmd(const uint8_t* data, size_t len, int* outAddr) {
+  *outAddr = -2;
+  if (len < 3 || data[0] != 'm') return 0;
+  if (data[1] == 'X') return 0;          // by-serial provisioning frame
+  size_t i = 1;
+  int addr;
+  if (data[i] == '*') { addr = -1; i++; }
+  else if (data[i] >= '0' && data[i] <= '9') {
+    long v = 0;
+    while (i < len && data[i] >= '0' && data[i] <= '9') {
+      v = v * 10 + (data[i] - '0'); i++;
+      if (v > 254) return 0;
+    }
+    addr = (int)v;
+  } else return 0;
+  if (i >= len) return 0;
+  *outAddr = addr;
+  return (char)data[i];
+}
+
+// True if the frame is normal display motion that Quiet Time should suppress:
+// show character ('-'), show index ('+'), or home ('h'). Deliberate calibration
+// moves (calibrate 'c', goto 'g', nudge 's') are intentionally NOT suppressed,
+// since they only originate from an operator actively calibrating.
+static bool sfFrameIsDisplayMotion(const uint8_t* data, size_t len) {
+  int addr;
+  char cmd = sfFrameCmd(data, len, &addr);
+  if (cmd == 0) return false;
+  if (cmd == '-' || cmd == '+') return true;
+  if (cmd == 'h') {
+    // 'h' must be the whole command (mXh / m*h), not a prefix of something else.
+    size_t i = 1;
+    if (data[i] == '*') i++;
+    else { while (i < len && data[i] >= '0' && data[i] <= '9') i++; }
+    size_t after = i + 1;   // byte after the 'h'
+    if (after >= len || data[after] == '\n' || data[after] == '\r') return true;
+  }
+  return false;
+}
+
+// Remember the display the host requested while Quiet Time is on, so the reels
+// can resync when it turns off. Only show-char/show-index frames carry display
+// intent worth replaying; home is suppressed but not queued.
+static void sfQuietCapturePending(const uint8_t* data, size_t len) {
+  int addr;
+  char cmd = sfFrameCmd(data, len, &addr);
+  size_t i = 1; if (data[i]=='*') i++; else { while (i<len && data[i]>='0' && data[i]<='9') i++; }
+  if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  if (cmd == '-') {
+    if (i + 1 < len) {
+      char c = (char)data[i + 1];
+      if (addr < 0) {
+        for (int k = 0; k < sfModuleCount; k++)
+          if (sfModules[k].provisioned) { sfModules[k].pendChar=c; sfModules[k].pendIndex=-1; sfModules[k].hasPend=true; }
+      } else {
+        SFModule* m = sfFindById((uint8_t)addr);
+        if (m) { m->pendChar=c; m->pendIndex=-1; m->hasPend=true; }
+      }
+    }
+  } else if (cmd == '+') {
+    long idx = 0; size_t j = i + 1; bool got=false;
+    while (j < len && data[j] >= '0' && data[j] <= '9') { idx = idx*10 + (data[j]-'0'); j++; got=true; if (idx>63){idx=-1;break;} }
+    if (got) {
+      if (addr < 0) {
+        for (int k = 0; k < sfModuleCount; k++)
+          if (sfModules[k].provisioned) { sfModules[k].pendChar=0; sfModules[k].pendIndex=(int)idx; sfModules[k].hasPend=true; }
+      } else {
+        SFModule* m = sfFindById((uint8_t)addr);
+        if (m) { m->pendChar=0; m->pendIndex=(int)idx; m->hasPend=true; }
+      }
+    }
+  }
+  xSemaphoreGive(sfMutex);
+}
+
 void rs485Send(const uint8_t* data, size_t len) {
   if (!len || len > TX_MAX_BYTES) return;
+  // Quiet Time: swallow normal display-motion frames so the flaps stay still.
+  // The request is acknowledged (we return as if sent) and the desired display
+  // is remembered for resync; nothing reaches the bus and tracking is unchanged.
+  if (gQuietTime && sfFrameIsDisplayMotion(data, len)) {
+    sfQuietCapturePending(data, len);
+    DBG("[QUIET] suppressed display frame (%u bytes)\n", (unsigned)len);
+    return;
+  }
   // Collision avoidance on the half-duplex bus: if modules are mid-response
   // (e.g. the staggered reply train after a broadcast m*v), transmitting now
   // would fight their drivers, corrupting bytes and destroying the newline
@@ -672,6 +839,7 @@ void rs485Send(const uint8_t* data, size_t len) {
   // single point every outbound frame passes through -- means raw sends are
   // tracked exactly like the high-level helpers, with no per-path duplication.
   sfTrackFromFrame(data, len);
+  gDisplayDirty = true;   // HA display sensor refresh (network task, rate-limited)
   // Log the transmitted frame (strip trailing newline for readability).
   // Cap the debug buffer at MSG_MAX_BYTES; long frames are truncated in the log.
   { char dbg[MSG_MAX_BYTES];
@@ -889,7 +1057,7 @@ static void sfModulesLoad() {
 static void sfModulesClear() {
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   sfModuleCount = 0;
-  memset(sfModules, 0, sizeof(sfModules));
+  memset(sfModules, 0, sizeof(SFModule) * MAX_MODULES);
   if (sfMutex) xSemaphoreGive(sfMutex);
   if (sfFsReady) FFat.remove(MODULES_FILE);
   sfModulesDirty = false;
@@ -1145,6 +1313,40 @@ void sfSendText(int startAddr, const char* text, bool blankUnused) {
   (void)blankUnused; // extensible for future use
 }
 
+// Set Quiet Time on/off. On the falling edge (on -> off) the reels are resynced
+// to the last display each module was asked to show while quiet, so the physical
+// display catches up to the most recent request. Safe to call from any task; the
+// resync sends through rs485Send, which now transmits normally (quiet is off).
+void sfSetQuietTime(bool on) {
+  bool was = gQuietTime;
+  gQuietTime = on;
+  if (was && !on) {
+    // Snapshot pending requests under the lock, clear them, then send unlocked
+    // (rs485Send must not be called while holding sfMutex).
+    struct Pend { int id; char ch; int idx; };
+    static Pend list[MAX_MODULES];
+    int n = 0;
+    if (xSemaphoreTake(sfMutex, portMAX_DELAY) == pdTRUE) {
+      for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {
+        if (sfModules[i].hasPend) {
+          list[n].id  = sfModules[i].id;
+          list[n].ch  = sfModules[i].pendChar;
+          list[n].idx = sfModules[i].pendIndex;
+          n++;
+          sfModules[i].hasPend = false;
+        }
+      }
+      xSemaphoreGive(sfMutex);
+    }
+    for (int i = 0; i < n; i++) {
+      if (list[i].ch) sfSendChar(list[i].id, list[i].ch);
+      else if (list[i].idx >= 0) sfSendIndex(list[i].id, list[i].idx);
+    }
+    if (n) printf("[QUIET] off -- resynced %d module(s) to last requested display\n", n);
+  }
+  printf("[QUIET] Quiet Time %s\n", on ? "ENABLED" : "disabled");
+}
+
 /* ----------------------------------------------------------
    Parse responses from modules (called from the RS485 receive task)
    Format examples:
@@ -1359,12 +1561,13 @@ WiFiClient   mqttWifiClient;        // persistent client for PubSubClient
 PubSubClient mqtt(mqttWifiClient);  // mqttInit() configures timeouts on this
 
 static unsigned long lastStatusMs = 0;
+static unsigned long          lastDispPubMs   = 0;
 static unsigned long mqttRetryMs  = 0;
 
 // mqttTopic() removed -- all call sites use snprintf char arrays
 // Safe MQTT publish from any task -- enqueues for the network task to drain.
 static void mqttEnqueue(const char* topic, const char* payload, size_t len) {
-  if (!mqttQMutex) return;
+  if (!mqttQMutex || !mqttQueue) return;
   if (xSemaphoreTake(mqttQMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
   int next = (mqttQHead + 1) % MQTT_Q_SIZE;
   if (next != mqttQTail) {
@@ -1413,29 +1616,207 @@ static void mqttPublishStatus() {
   if (!mqtt.connected()) return;
   char timeBuf[24];
   rtcFormatTime(timeBuf, sizeof(timeBuf));
-  char buf[320];
+  char ip[20];
+  IPAddress lip = WiFi.localIP();
+  snprintf(ip, sizeof(ip), "%u.%u.%u.%u", lip[0], lip[1], lip[2], lip[3]);
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  // Full diagnostic set -- mirrors the [WDG] heartbeat so Home Assistant can
+  // surface the same health signals (min heap, largest block, fragmentation,
+  // parse rejects, and per-task stack high-water marks).
+  unsigned freeHeap = ESP.getFreeHeap();
+  unsigned minHeap  = ESP.getMinFreeHeap();
+  unsigned maxBlk   = ESP.getMaxAllocHeap();
+  unsigned frag     = freeHeap ? (unsigned)(100 - (maxBlk * 100UL / freeHeap)) : 0;
+  unsigned s485 = hTaskRS485 ? uxTaskGetStackHighWaterMark(hTaskRS485) : 0;
+  unsigned sWeb = hTaskWeb   ? uxTaskGetStackHighWaterMark(hTaskWeb)   : 0;
+  unsigned sNet = hTaskNet   ? uxTaskGetStackHighWaterMark(hTaskNet)   : 0;
+  unsigned sOta = hTaskOTA   ? uxTaskGetStackHighWaterMark(hTaskOTA)   : 0;
+  unsigned sRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
+  char buf[640];
   size_t n = (size_t)snprintf(buf, sizeof(buf),
-    "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"modules\":%d,"
-    "\"time\":\"%s\",\"ntpSynced\":%s,\"heap\":%u}",
-    millis()/1000, rxCount, txCount, sfModuleCount,
-    timeBuf, ntpSynced?"true":"false", ESP.getFreeHeap());
+    "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"rej\":%lu,\"modules\":%d,"
+    "\"time\":\"%s\",\"ntpSynced\":%s,\"heap\":%u,\"minheap\":%u,"
+    "\"maxblk\":%u,\"frag\":%u,\"rssi\":%d,\"wifi\":%s,"
+    "\"stk485\":%u,\"stkweb\":%u,\"stknet\":%u,\"stkota\":%u,\"stkrtc\":%u,"
+    "\"ip\":\"%s\",\"url\":\"http://%s/\",\"version\":\"%s\","
+    "\"maintenance\":%s,\"quiet\":%s}",
+    millis()/1000, rxCount, txCount, sfParseRejects, sfModuleCount,
+    timeBuf, ntpSynced?"true":"false", freeHeap, minHeap,
+    maxBlk, frag, rssi, (WiFi.status()==WL_CONNECTED)?"true":"false",
+    s485, sWeb, sNet, sOta, sRtc,
+    ip, ip, FW_VERSION, gMaintenanceMode?"true":"false", gQuietTime?"true":"false");
   if (n >= sizeof(buf)) n = sizeof(buf) - 1;
   char _t[80];
   snprintf(_t, sizeof(_t), "%s/status", cfg.mqttPrefix);
   mqttEnqueue(_t, buf, n);
 }
 
-// MQTT incoming message handler
-// Supports:
-//   <prefix>/send          {"data":"..."}  raw RS485 send
+// Assemble the best-known display string from per-module tracked characters,
+// in module-id order across the configured grid. Unknown chars render as '?'.
+static void mqttPublishDisplayState() {
+  if (!mqtt.connected()) return;
+  int cells = (int)cfg.gridRows * (int)cfg.gridCols;
+  if (cells < 1) cells = 1;
+  if (cells > MAX_MODULES) cells = MAX_MODULES;
+  char str[MAX_MODULES + 1];
+  int outLen = 0;
+  if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    for (int id = 0; id < cells; id++) {
+      SFModule* m = sfFindById((uint8_t)id);
+      char c = ' ';
+      if (m && m->provisioned) {
+        if (m->flapChar >= 0x20 && m->flapChar <= 0x7E) c = m->flapChar;
+        else c = '?';   // present but char unknown (e.g. after home / index set)
+      }
+      str[outLen++] = c;
+    }
+    xSemaphoreGive(sfMutex);
+  }
+  str[outLen] = '\0';
+  char _t[80];
+  snprintf(_t, sizeof(_t), "%s/display/state", cfg.mqttPrefix);
+  mqttEnqueue(_t, str, outLen);
+}
+
+// Publish the HA-facing entity state topics (maintenance + quiet switches, and
+// the display string). Called on connect, on any toggle, and when display
+// tracking changes. No-op unless HA integration is enabled.
+static void mqttPublishStateTopics() {
+  if (!mqtt.connected() || !cfg.haEnabled) return;
+  char t[80];
+  snprintf(t, sizeof(t), "%s/maintenance/state", cfg.mqttPrefix);
+  mqttEnqueue(t, gMaintenanceMode ? "ON" : "OFF", gMaintenanceMode ? 2 : 3);
+  snprintf(t, sizeof(t), "%s/quiet/state", cfg.mqttPrefix);
+  mqttEnqueue(t, gQuietTime ? "ON" : "OFF", gQuietTime ? 2 : 3);
+  mqttPublishDisplayState();
+}
+
+// Publish (or remove) Home Assistant MQTT discovery configs. When enable is
+// true, retained config messages are sent under homeassistant/<comp>/<node>/...
+// so HA auto-creates the entities; when false, empty retained payloads are sent
+// to the same topics to delete them. Uses HA's abbreviated discovery keys and a
+// shared base-topic (~) to keep each payload within MQTT_BUF_SIZE. All entities
+// share one device block (linked by the gateway's chip id) so they group under a
+// single HA device. Diagnostic sensors read fields from the <prefix>/status JSON.
+static void haPublishDiscovery(bool enable) {
+  if (!mqtt.connected()) return;
+  char node[24];
+  snprintf(node, sizeof(node), "sfgw_%08X", (uint32_t)ESP.getEfuseMac());
+  const char* pfx = cfg.mqttPrefix;
+  char topic[160];
+  char pl[MQTT_BUF_SIZE];
+
+  // Shared fragments: device block + availability. avty_t uses <prefix>/availability.
+  // Kept compact; HA merges the device block across entities by identifier.
+  char dev[200];
+  snprintf(dev, sizeof(dev),
+    "\"dev\":{\"ids\":[\"%s\"],\"name\":\"Split-Flap Gateway\",\"mf\":\"Anthropic SFGW\",\"mdl\":\"ESP32-S3 RS485\",\"sw\":\"%s\"},"
+    "\"avty_t\":\"%s/availability\"", node, FW_VERSION, pfx);
+
+  // Helper macro-like lambda is not available; emit each entity inline.
+  // 1) Display text entity: set/echo the whole display string.
+  snprintf(topic, sizeof(topic), "homeassistant/text/%s/display/config", node);
+  if (enable) {
+    snprintf(pl, sizeof(pl),
+      "{\"name\":\"Display\",\"uniq_id\":\"%s_display\",\"cmd_t\":\"%s/display/set\","
+      "\"stat_t\":\"%s/display/state\",\"max\":255,%s}", node, pfx, pfx, dev);
+    mqttEnqueue(topic, pl, strlen(pl));
+  } else mqttEnqueue(topic, "", 0);
+
+  // 2) Maintenance mode switch.
+  snprintf(topic, sizeof(topic), "homeassistant/switch/%s/maintenance/config", node);
+  if (enable) {
+    snprintf(pl, sizeof(pl),
+      "{\"name\":\"Maintenance Mode\",\"uniq_id\":\"%s_maint\",\"cmd_t\":\"%s/maintenance/set\","
+      "\"stat_t\":\"%s/maintenance/state\",\"ic\":\"mdi:wrench\",%s}", node, pfx, pfx, dev);
+    mqttEnqueue(topic, pl, strlen(pl));
+  } else mqttEnqueue(topic, "", 0);
+
+  // 3) Quiet Time switch.
+  snprintf(topic, sizeof(topic), "homeassistant/switch/%s/quiet/config", node);
+  if (enable) {
+    snprintf(pl, sizeof(pl),
+      "{\"name\":\"Quiet Time\",\"uniq_id\":\"%s_quiet\",\"cmd_t\":\"%s/quiet/set\","
+      "\"stat_t\":\"%s/quiet/state\",\"ic\":\"mdi:volume-off\",%s}", node, pfx, pfx, dev);
+    mqttEnqueue(topic, pl, strlen(pl));
+  } else mqttEnqueue(topic, "", 0);
+
+  // 4) Diagnostic sensors -- all read the <prefix>/status JSON via value_template.
+  //    Mirrors the [WDG] heartbeat: heap/min/maxblk/frag, parse rejects, the five
+  //    per-task stack high-water marks, plus connectivity and identity.
+  struct DiagS { const char* obj; const char* name; const char* fld; const char* unit; const char* dc; const char* ic; };
+  static const DiagS diags[] = {
+    {"modules", "Modules",        "modules", NULL,  NULL,              "mdi:view-grid"},
+    {"uptime",  "Uptime",         "uptime",  "s",   "duration",        NULL},
+    {"heap",    "Free Heap",      "heap",    "B",   NULL,              "mdi:memory"},
+    {"minheap", "Min Free Heap",  "minheap", "B",   NULL,              "mdi:memory"},
+    {"maxblk",  "Max Alloc Block","maxblk",  "B",   NULL,              "mdi:memory"},
+    {"frag",    "Heap Fragmentation","frag", "%",   NULL,              "mdi:chart-donut"},
+    {"rssi",    "WiFi Signal",    "rssi",    "dBm", "signal_strength", NULL},
+    {"rx",      "Frames Received","rx",      NULL,  NULL,              "mdi:download-network"},
+    {"tx",      "Frames Sent",    "tx",      NULL,  NULL,              "mdi:upload-network"},
+    {"rej",     "Parse Rejects",  "rej",     NULL,  NULL,              "mdi:alert-circle"},
+    {"stk485",  "Stack RS485",    "stk485",  "B",   NULL,              "mdi:layers"},
+    {"stkweb",  "Stack Web",      "stkweb",  "B",   NULL,              "mdi:layers"},
+    {"stknet",  "Stack Network",  "stknet",  "B",   NULL,              "mdi:layers"},
+    {"stkota",  "Stack OTA",      "stkota",  "B",   NULL,              "mdi:layers"},
+    {"stkrtc",  "Stack RTC",      "stkrtc",  "B",   NULL,              "mdi:layers"},
+    {"ip",      "IP Address",     "ip",      NULL,  NULL,              "mdi:ip-network"},
+    {"url",     "Gateway URL",    "url",     NULL,  NULL,              "mdi:web"},
+    {"version", "Firmware",       "version", NULL,  NULL,              "mdi:chip"},
+  };
+  for (unsigned i = 0; i < sizeof(diags)/sizeof(diags[0]); i++) {
+    const DiagS& d = diags[i];
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", node, d.obj);
+    if (enable) {
+      int p = snprintf(pl, sizeof(pl),
+        "{\"name\":\"%s\",\"uniq_id\":\"%s_%s\",\"stat_t\":\"%s/status\","
+        "\"val_tpl\":\"{{ value_json.%s }}\",\"ent_cat\":\"diagnostic\"",
+        d.name, node, d.obj, pfx, d.fld);
+      if (d.unit) p += snprintf(pl+p, sizeof(pl)-p, ",\"unit_of_meas\":\"%s\"", d.unit);
+      if (d.dc)   p += snprintf(pl+p, sizeof(pl)-p, ",\"dev_cla\":\"%s\"", d.dc);
+      if (d.ic)   p += snprintf(pl+p, sizeof(pl)-p, ",\"ic\":\"%s\"", d.ic);
+      snprintf(pl+p, sizeof(pl)-p, ",%s}", dev);
+      mqttEnqueue(topic, pl, strlen(pl));
+    } else mqttEnqueue(topic, "", 0);
+  }
+
+  printf("[HA] Discovery %s (node %s)\n", enable ? "published" : "removed", node);
+}
 //   <prefix>/flap/set      {"id":5,"char":"A"}  or  {"id":5,"index":3}
 //                          {"id":-1,"text":"HELLO","start":0}  multi-module text
 //   <prefix>/flap/home     {"id":5}  or  {"id":-1}  (broadcast)
 //   <prefix>/flap/provision {"sn":"AABBCC...","id":5}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Maintenance mode: ignore all externally-originated commands. Nothing from
-  // MQTT is relayed to the bus while this is on; only the gateway's own web UI
-  // / REST API can drive the display.
+  // Control topics are handled FIRST, before the maintenance-mode gate, so the
+  // maintenance and quiet switches remain reachable over MQTT/HA even while
+  // maintenance mode is on (otherwise you could never turn it back off remotely).
+  if (length < MQTT_BUF_SIZE) {
+    static char cbuf[64];
+    size_t cl = length < sizeof(cbuf) - 1 ? length : sizeof(cbuf) - 1;
+    memcpy(cbuf, payload, cl); cbuf[cl] = 0;
+    // Trim trailing whitespace/newline and detect on/off
+    while (cl && (cbuf[cl-1]=='\n'||cbuf[cl-1]=='\r'||cbuf[cl-1]==' ')) cbuf[--cl]=0;
+    bool on = (strcasecmp(cbuf, "ON") == 0 || strcasecmp(cbuf, "true") == 0 ||
+               strcasecmp(cbuf, "1") == 0);
+    char ctl[80];
+    snprintf(ctl, sizeof(ctl), "%s/maintenance/set", cfg.mqttPrefix);
+    if (strcmp(topic, ctl) == 0) {
+      gMaintenanceMode = on;
+      printf("[MAINT] Maintenance mode %s (MQTT)\n", on ? "ENABLED" : "disabled");
+      mqttPublishStateTopics();
+      return;
+    }
+    snprintf(ctl, sizeof(ctl), "%s/quiet/set", cfg.mqttPrefix);
+    if (strcmp(topic, ctl) == 0) {
+      sfSetQuietTime(on);
+      mqttPublishStateTopics();
+      return;
+    }
+  }
+  // Maintenance mode: ignore all externally-originated DISPLAY commands. Nothing
+  // from MQTT is relayed to the bus while this is on; only the gateway's own web
+  // UI / REST API can drive the display.
   if (gMaintenanceMode) {
     DBG("[MQTT] ignored (maintenance mode): %s\n", topic);
     return;
@@ -1455,6 +1836,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   snprintf(setTopic,  sizeof(setTopic),  "%s/flap/set",       cfg.mqttPrefix);
   snprintf(homeTopic, sizeof(homeTopic), "%s/flap/home",      cfg.mqttPrefix);
   snprintf(provTopic, sizeof(provTopic), "%s/flap/provision", cfg.mqttPrefix);
+  char dispTopic[80];
+  snprintf(dispTopic, sizeof(dispTopic), "%s/display/set", cfg.mqttPrefix);
+
+  // HA display text entity: a plain string to show across the whole display,
+  // starting at module 0. Handled before JSON parse since the payload is text.
+  if (strcmp(topic, dispTopic) == 0) {
+    // strip a single trailing newline if present
+    size_t L = strlen(buf);
+    if (L && (buf[L-1]=='\n'||buf[L-1]=='\r')) buf[L-1]=0;
+    DBG("[MQTT] display set: %s\n", buf);
+    sfSendText(0, buf, false);
+    mqttPublishDisplayState();
+    return;
+  }
 
   // Handle the raw send topic before attempting JSON parse:
   // Accept either a plain ASCII frame ("m9h\n") or JSON ({"data":"m9h\n"}).
@@ -1537,17 +1932,32 @@ static void mqttConnect() {
   char clientId[32];
   snprintf(clientId, sizeof(clientId), "splitflap-%08X", (uint32_t)ESP.getEfuseMac());
   printf("[MQTT] Connecting to %s:%d...\n", cfg.mqttHost, cfg.mqttPort);
+  // Last Will & Testament: the broker publishes "offline" to <prefix>/availability
+  // (retained) if we drop without a clean disconnect. HA uses this to mark every
+  // entity unavailable. We publish "online" ourselves on connect (the birth).
+  char availT[80];
+  snprintf(availT, sizeof(availT), "%s/availability", cfg.mqttPrefix);
   bool ok = strlen(cfg.mqttUser)
-    ? mqtt.connect(clientId, cfg.mqttUser, cfg.mqttPass)
-    : mqtt.connect(clientId);
+    ? mqtt.connect(clientId, cfg.mqttUser, cfg.mqttPass, availT, 0, true, "offline")
+    : mqtt.connect(clientId, NULL, NULL, availT, 0, true, "offline");
   if (ok) {
     printf("[MQTT] Connected\n");
+    // Birth: mark available (retained).
+    mqtt.publish(availT, "online", true);
     // Use char arrays not String to avoid heap fragmentation
     char t[80];
     snprintf(t,sizeof(t),"%s/send",           cfg.mqttPrefix); mqtt.subscribe(t);
     snprintf(t,sizeof(t),"%s/flap/set",       cfg.mqttPrefix); mqtt.subscribe(t);
     snprintf(t,sizeof(t),"%s/flap/home",      cfg.mqttPrefix); mqtt.subscribe(t);
     snprintf(t,sizeof(t),"%s/flap/provision", cfg.mqttPrefix); mqtt.subscribe(t);
+    snprintf(t,sizeof(t),"%s/display/set",    cfg.mqttPrefix); mqtt.subscribe(t);
+    snprintf(t,sizeof(t),"%s/maintenance/set",cfg.mqttPrefix); mqtt.subscribe(t);
+    snprintf(t,sizeof(t),"%s/quiet/set",      cfg.mqttPrefix); mqtt.subscribe(t);
+    // Home Assistant integration: publish discovery + initial entity state.
+    if (cfg.haEnabled) {
+      haPublishDiscovery(true);
+      mqttPublishStateTopics();
+    }
   } else {
     int st = mqtt.state();
     const char* why;
@@ -1591,7 +2001,7 @@ void handleRoot() {
   server.sendContent("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
   server.sendContent("<title>Split-Flap Gateway</title>");
   server.sendContent("<style>");
-  server.sendContent(":root{--bg:#1a1a2e;--card:#16213e;--acc:#0f3460;--hi:#e94560;--txt:#eaeaea;--dim:#888;--grn:#4caf50;--ylw:#ffc107}");
+  server.sendContent(":root{--bg:#1a1a2e;--card:#16213e;--acc:#0f3460;--hi:#e94560;--txt:#eaeaea;--dim:#888;--grn:#4caf50;--ylw:#ffc107;--qt:#26c6da}");
   server.sendContent("*{box-sizing:border-box;margin:0;padding:0}");
   server.sendContent("body{background:var(--bg);color:var(--txt);font-family:\"Segoe UI\",sans-serif;font-size:14px}");
   server.sendContent("header{background:var(--acc);padding:12px 18px;display:flex;align-items:center;justify-content:space-between}");
@@ -1639,6 +2049,7 @@ void handleRoot() {
   server.sendContent(".dbtn{display:block;width:100%;text-align:left;margin:6px 0;padding:10px;border-radius:6px;border:1px solid var(--hi);background:#1a0d0d;color:var(--txt);cursor:pointer}.dbtn:hover{background:#2a1414}.dbtn small{display:block;color:var(--dim);font-size:.74rem;margin-top:2px}");
   server.sendContent(".mod .mid{font-size:1rem;font-weight:bold;color:var(--ylw)}.mod .mc{font-size:.75rem;color:var(--dim)}");
   server.sendContent(".hdr-right{display:flex;align-items:center;gap:14px}.maint-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.82rem;color:var(--dim);user-select:none}.maint-toggle input{width:auto;margin:0;cursor:pointer}.maint-toggle.active{color:var(--ylw);font-weight:bold}body.maint-on{box-shadow:inset 0 0 0 3px var(--ylw)}.maint-banner{display:none;background:var(--ylw);color:#1a1206;text-align:center;padding:5px;font-size:.82rem;font-weight:bold}body.maint-on .maint-banner{display:block}");
+  server.sendContent(".quiet-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.82rem;color:var(--dim);user-select:none}.quiet-toggle input{width:auto;margin:0;cursor:pointer}.quiet-toggle.active{color:var(--qt);font-weight:bold}body.quiet-on{box-shadow:inset 0 0 0 3px var(--qt)}body.maint-on.quiet-on{box-shadow:inset 0 0 0 3px var(--ylw),inset 0 0 0 6px var(--qt)}.quiet-banner{display:none;background:var(--qt);color:#06222a;text-align:center;padding:5px;font-size:.82rem;font-weight:bold}body.quiet-on .quiet-banner{display:block}");
   server.sendContent(".unprovisioned{border-color:var(--hi)}");
   server.sendContent("#sr{font-size:.8rem;color:var(--grn);min-height:16px;margin-top:5px}");
   server.sendContent(".cmods{display:grid;gap:5px;grid-template-columns:repeat(auto-fill,minmax(48px,1fr))}.cmod{text-align:center;padding:6px 4px;background:#0d1b2a;border:1px solid var(--acc);border-radius:5px;cursor:pointer;font-family:monospace;font-size:.85rem;color:var(--txt)}.cmod:hover{border-color:var(--hi)}.cmod.sel{background:var(--hi);border-color:var(--hi);color:#fff;font-weight:bold}.cmod .csn{display:block;font-size:.6rem;color:var(--dim)}.cmod.sel .csn{color:#ffd}.cmod.known{border-color:var(--grn)}.cmod.legacy{border-color:var(--ylw)}.cmod.unknown{opacity:.6}.cmod .csn.lg{color:var(--ylw)}.cmods.single{display:flex;flex-wrap:wrap}");
@@ -1652,8 +2063,9 @@ void handleRoot() {
   server.sendContent(".wizbtn{background:var(--grn);margin:8px 0 0}.wizbox{background:var(--card);border:2px solid var(--grn);border-radius:10px;padding:20px;max-width:380px;width:92%;text-align:center}.wizbox h3{color:var(--grn);font-size:1.1rem;margin:0 0 4px}.wizprog{font-size:.78rem;color:var(--dim);margin-bottom:10px}.wizbar{height:6px;background:#0a0a0a;border-radius:3px;overflow:hidden;margin-bottom:14px}.wizbar>div{height:100%;background:var(--grn);width:0;transition:width .2s}.wizchar{font-size:3.4rem;font-weight:bold;font-family:monospace;line-height:1.1;margin:6px 0}.wizchar .wsw{display:inline-block;width:56px;height:56px;border-radius:6px;vertical-align:middle;border:1px solid #555}.wizsub{font-size:.82rem;color:var(--dim);margin-bottom:10px}.wiztarget{font-size:.9rem;color:var(--ylw);font-family:monospace;margin-bottom:8px}.wiznudge{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;margin:8px 0}.wiznudge button{flex:1;min-width:36px;margin:0;padding:8px 3px;font-size:.8rem}.wiznudge button.neg{background:#5a2030}.wiznudge button.pos{background:#1f5a2a}.wizbox .wconfirm{width:100%;margin-top:10px;padding:11px;background:var(--grn);font-weight:bold}.wizbox .wreset{width:100%;margin-top:8px;padding:9px;background:var(--hi)}.wizrow{display:flex;gap:6px;margin-top:8px}.wizrow button{flex:1;margin:0;padding:9px}.wizrow .wback{background:var(--acc)}.wizrow .wskip{background:#444}.wizrow .wexit{background:var(--hi)}.wizstat{margin-top:8px;font-size:.76rem;color:var(--ylw);min-height:14px}");
   server.sendContent("</style></head><body>");
   wdgWebMs = millis();  // touch WDG during long page send
-  server.sendContent("<header><h1>Split-Flap Gateway <span class=\"verbadge\">v" FW_VERSION "</span></h1><div class=\"hdr-right\"><label class=\"maint-toggle\" title=\"When on, commands received via MQTT are ignored and not relayed to the bus. The web UI keeps working.\"><input id=\"maintChk\" type=\"checkbox\" onchange=\"toggleMaint()\"><span class=\"maint-lbl\">Maintenance</span></label><span id=\"badge\">...</span></div></header>");
+  server.sendContent("<header><h1>Split-Flap Gateway <span class=\"verbadge\">v" FW_VERSION "</span></h1><div class=\"hdr-right\"><label class=\"quiet-toggle\" title=\"When on, the gateway accepts commands but does not move any flaps for normal display updates (calibration still works). Reels resync when turned off.\"><input id=\"quietChkHdr\" type=\"checkbox\" onchange=\"toggleQuietHdr()\"><span class=\"quiet-lbl\">Quiet Time</span></label><label class=\"maint-toggle\" title=\"When on, commands received via MQTT are ignored and not relayed to the bus. The web UI keeps working.\"><input id=\"maintChk\" type=\"checkbox\" onchange=\"toggleMaint()\"><span class=\"maint-lbl\">Maintenance</span></label><span id=\"badge\">...</span></div></header>");
   server.sendContent("<div class=\"maint-banner\">MAINTENANCE MODE - external MQTT commands are being ignored</div>");
+  server.sendContent("<div class=\"quiet-banner\">QUIET TIME - display updates are paused; flaps will not move (calibration still works)</div>");
   server.sendContent("<nav>");
   server.sendContent("<a class=\"on\" onclick=\"show('modules',this)\">Modules</a>");
   server.sendContent("<a onclick=\"show('display',this)\">Display</a>");
@@ -1777,6 +2189,8 @@ void handleRoot() {
   server.sendContent("</div>");
   server.sendContent("<div class=\"card\"><h2>Display Layout</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">How the modules are physically arranged, for the Live Display on the Display tab. Modules map left-to-right, top-to-bottom by ID (module 0 = top-left).</p><div class=\"row\"><div><label>Rows</label><input id=\"gRows\" type=\"number\" value=\"1\" min=\"1\" max=\"64\"></div><div><label>Columns</label><input id=\"gCols\" type=\"number\" value=\"16\" min=\"1\" max=\"64\"></div></div><button onclick=\"saveGrid()\">Save Layout</button><div id=\"gridR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("<div class=\"card\"><h2>Serial Debug</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Enable verbose serial output on the native USB serial port (115200 baud). Shows every RX/TX frame, MQTT events, and module activity.</p><label style=\"display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--txt)\"><input type=\"checkbox\" id=\"dbgChk\" style=\"width:auto\">Enable Serial Debug Output</label><button onclick=\"saveDebug()\" style=\"margin-top:10px\">Save</button><div id=\"dbgR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
+  server.sendContent("<div class=\"card\"><h2>Home Assistant</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Publish MQTT auto-discovery so the gateway appears in Home Assistant as a device with a display text control, Maintenance and Quiet Time switches, and diagnostic sensors. Requires MQTT to be configured. Leave off to avoid publishing discovery/state topics you don't need.</p><label style=\"display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--txt)\"><input type=\"checkbox\" id=\"haChk\" style=\"width:auto\">Enable Home Assistant integration</label><button onclick=\"saveHa()\" style=\"margin-top:10px\">Save</button><div id=\"haR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
+  server.sendContent("<div class=\"card\"><h2>Quiet Time</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">When on, the gateway still accepts and acknowledges commands but does not move any flaps for normal display updates (calibration still works). When turned off, the reels resync to the last requested display. Not saved across reboots.</p><label style=\"display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--txt)\"><input type=\"checkbox\" id=\"quietChk\" style=\"width:auto\" onchange=\"toggleQuiet()\">Quiet Time enabled</label><div id=\"quietR\" style=\"margin-top:6px;font-size:.82rem;color:var(--ylw)\"></div></div>");
   server.sendContent("<div class=\"card\"><h2>OTA Firmware Update</h2><p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Upload new firmware directly from your browser ? no USB cable or Arduino IDE required.</p><a href=\"/ota\" target=\"_blank\" style=\"display:inline-block;margin-bottom:12px;padding:7px 16px;background:var(--hi);color:#fff;border-radius:4px;text-decoration:none;font-size:.9rem\">Open Firmware Updater &rarr;</a><label style=\"margin-top:8px\">OTA Password</label><input id=\"otaPw\" type=\"password\" placeholder=\"Leave blank for no password\"><p style=\"font-size:.77rem;color:var(--dim);margin-top:4px\">Protects ArduinoOTA (IDE/command-line) uploads. The web updater above is always accessible.</p><button onclick=\"saveOTA()\" style=\"margin-top:6px\">Save OTA Password</button><div id=\"otaR\" style=\"margin-top:6px;font-size:.82rem;color:var(--grn)\"></div></div>");
   server.sendContent("</div>");
   server.sendContent("<div id=\"pane-statusp\" class=\"pane\">");
@@ -1840,9 +2254,12 @@ void handleRoot() {
   server.sendContent("function saveGrid(){var rows=parseInt(document.getElementById(\"gRows\").value)||1;var cols=parseInt(document.getElementById(\"gCols\").value)||1;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({gridRows:rows,gridCols:cols})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"gridR\").textContent=j.ok?\"Layout saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"gridR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveOTA(){fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({otaPassword:document.getElementById(\"otaPw\").value})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"otaR\").textContent=j.ok?\"OTA password saved\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"otaR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function saveDebug(){var v=document.getElementById(\"dbgChk\").checked;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({serialDebug:v})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"dbgR\").textContent=j.ok?(v?\"Debug enabled\":\"Debug disabled\"):\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"dbgR\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function saveHa(){var v=document.getElementById(\"haChk\").checked;fetch(\"/api/config/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({haEnabled:v})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"haR\").textContent=j.ok?(v?\"Home Assistant integration enabled\":\"Home Assistant integration disabled\"):\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"haR\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function toggleQuiet(){var v=document.getElementById(\"quietChk\").checked;fetch(\"/api/quiet\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:v})}).then(function(r){return r.json();}).then(function(j){if(typeof setQuietUI===\"function\")setQuietUI(j.on);document.getElementById(\"quietR\").textContent=j.on?\"Quiet Time ON -- flaps will not move for display updates\":\"Quiet Time off -- reels resynced to last requested display\";}).catch(function(e){document.getElementById(\"quietChk\").checked=!v;document.getElementById(\"quietR\").textContent=\"Error: \"+e;});}");
   server.sendContent("function setMaintUI(on){var chk=document.getElementById(\"maintChk\");if(chk)chk.checked=!!on;var lbl=document.querySelector(\".maint-toggle\");if(lbl)lbl.classList.toggle(\"active\",!!on);document.body.classList.toggle(\"maint-on\",!!on);}function toggleMaint(){var chk=document.getElementById(\"maintChk\");var on=chk.checked;fetch(\"/api/maintenance\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:on})}).then(function(r){return r.json();}).then(function(j){setMaintUI(j.on);}).catch(function(){chk.checked=!on;setMaintUI(!on);});}function calEnableMaint(){var chk=document.getElementById(\"maintChk\");if(chk&&!chk.checked){chk.checked=true;toggleMaint();}}");
-  server.sendContent("function pollStatus(){fetch(\"/api/status\").then(function(r){return r.json();}).then(function(s){var up=s.uptime,ud=Math.floor(up/86400),uh=Math.floor(up%86400/3600),um=Math.floor(up%3600/60),us=up%60;document.getElementById(\"s-up\").textContent=(ud?ud+\"d \":\"\")+(uh||ud?uh+\"h \":\"\")+um+\"m \"+us+\"s\";document.getElementById(\"s-rx\").textContent=s.rx;document.getElementById(\"s-tx\").textContent=s.tx;document.getElementById(\"s-ip\").textContent=s.ip;document.getElementById(\"s-ap\").textContent=s.apip;var hp=document.getElementById(\"s-hp\");hp.textContent=Math.round(s.heap/1024)+\" KB\";hp.className=\"v \"+(s.heap>=40000?\"vok\":(s.heap>=25000?\"vwarn\":\"vbad\"));var mq=document.getElementById(\"s-mq\");mq.textContent=s.mqtt?\"Connected\":\"Off\";mq.className=\"v \"+(s.mqtt?\"vok\":\"\");document.getElementById(\"s-mod\").textContent=s.modules;if(s.minheap){var mh=document.getElementById(\"s-mh\");mh.textContent=Math.round(s.minheap/1024)+\" KB\";mh.className=\"v \"+(s.minheap>=40000?\"vok\":(s.minheap>=25000?\"vwarn\":\"vbad\"));}if(s.stk){var sm=null,sn=\"\";for(var k in s.stk){if(sm===null||s.stk[k]<sm){sm=s.stk[k];sn=k;}}var st=document.getElementById(\"s-stk\");st.textContent=sm+\" B (\"+sn+\")\";st.className=\"v \"+(sm>=800?\"vok\":(sm>=400?\"vwarn\":\"vbad\"));}if(document.getElementById(\"s-rtc\"))document.getElementById(\"s-rtc\").textContent=s.time||\"--\";var ntp=document.getElementById(\"s-ntp\");if(ntp){ntp.textContent=s.ntpSynced?\"Synced\":\"Pending\";ntp.className=\"v \"+(s.ntpSynced?\"vok\":\"vwarn\");}var b=document.getElementById(\"badge\");b.textContent=s.wifi?\"WiFi: \"+s.ip:\"AP only\";b.className=s.wifi?\"ok\":\"\";if(typeof s.maint!==\"undefined\")setMaintUI(s.maint);}).catch(function(){});}setInterval(pollStatus,3000);pollStatus();");
-  server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}if(c.gridRows){document.getElementById(\"gRows\").value=c.gridRows;}if(c.gridCols){document.getElementById(\"gCols\").value=c.gridCols;}});");
+  server.sendContent("function setQuietUI(on){var chk=document.getElementById(\"quietChkHdr\");if(chk)chk.checked=!!on;var lbl=document.querySelector(\".quiet-toggle\");if(lbl)lbl.classList.toggle(\"active\",!!on);document.body.classList.toggle(\"quiet-on\",!!on);var sc=document.getElementById(\"quietChk\");if(sc)sc.checked=!!on;}function toggleQuietHdr(){var chk=document.getElementById(\"quietChkHdr\");var on=chk.checked;fetch(\"/api/quiet\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({on:on})}).then(function(r){return r.json();}).then(function(j){setQuietUI(j.on);}).catch(function(){chk.checked=!on;setQuietUI(!on);});}");
+  server.sendContent("function pollStatus(){fetch(\"/api/status\").then(function(r){return r.json();}).then(function(s){var up=s.uptime,ud=Math.floor(up/86400),uh=Math.floor(up%86400/3600),um=Math.floor(up%3600/60),us=up%60;document.getElementById(\"s-up\").textContent=(ud?ud+\"d \":\"\")+(uh||ud?uh+\"h \":\"\")+um+\"m \"+us+\"s\";document.getElementById(\"s-rx\").textContent=s.rx;document.getElementById(\"s-tx\").textContent=s.tx;document.getElementById(\"s-ip\").textContent=s.ip;document.getElementById(\"s-ap\").textContent=s.apip;var hp=document.getElementById(\"s-hp\");hp.textContent=Math.round(s.heap/1024)+\" KB\";hp.className=\"v \"+(s.heap>=40000?\"vok\":(s.heap>=25000?\"vwarn\":\"vbad\"));var mq=document.getElementById(\"s-mq\");mq.textContent=s.mqtt?\"Connected\":\"Off\";mq.className=\"v \"+(s.mqtt?\"vok\":\"\");document.getElementById(\"s-mod\").textContent=s.modules;if(s.minheap){var mh=document.getElementById(\"s-mh\");mh.textContent=Math.round(s.minheap/1024)+\" KB\";mh.className=\"v \"+(s.minheap>=40000?\"vok\":(s.minheap>=25000?\"vwarn\":\"vbad\"));}if(s.stk){var sm=null,sn=\"\";for(var k in s.stk){if(sm===null||s.stk[k]<sm){sm=s.stk[k];sn=k;}}var st=document.getElementById(\"s-stk\");st.textContent=sm+\" B (\"+sn+\")\";st.className=\"v \"+(sm>=800?\"vok\":(sm>=400?\"vwarn\":\"vbad\"));}if(document.getElementById(\"s-rtc\"))document.getElementById(\"s-rtc\").textContent=s.time||\"--\";var ntp=document.getElementById(\"s-ntp\");if(ntp){ntp.textContent=s.ntpSynced?\"Synced\":\"Pending\";ntp.className=\"v \"+(s.ntpSynced?\"vok\":\"vwarn\");}var b=document.getElementById(\"badge\");b.textContent=s.wifi?\"WiFi: \"+s.ip:\"AP only\";b.className=s.wifi?\"ok\":\"\";if(typeof s.maint!==\"undefined\")setMaintUI(s.maint);if(typeof s.quiet!==\"undefined\")setQuietUI(s.quiet);}).catch(function(){});}setInterval(pollStatus,3000);pollStatus();");
+  server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}if(c.gridRows){document.getElementById(\"gRows\").value=c.gridRows;}if(c.gridCols){document.getElementById(\"gCols\").value=c.gridCols;}var hc=document.getElementById(\"haChk\");if(hc)hc.checked=!!c.haEnabled;var dc=document.getElementById(\"dbgChk\");if(dc)dc.checked=!!c.serialDebug;});fetch(\"/api/quiet\").then(function(r){return r.json();}).then(function(q){var qc=document.getElementById(\"quietChk\");if(qc)qc.checked=!!q.on;}).catch(function(){});");
   server.sendContent("var CAL_CHARS=\" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\";var CAL_COLORS={r:\"#e23b3b\",o:\"#ff9f0a\",y:\"#ffd60a\",g:\"#2fb84a\",b:\"#3b82f6\",p:\"#a855f7\",w:\"#e8e8e8\"};");
   server.sendContent("var _calId=-1,_calTotal=4096,_calHo=0,_calMap={},_tuneIdx=-1;var CAL_UNSET=65535,CAL_DEF_HO=2832,CAL_DEF_TS=4096;var _wizIdx=-1,_wizTarget=0;");
   server.sendContent("function calDefault(i){var ts=(_calTotal&&_calTotal>0)?_calTotal:CAL_DEF_TS;return Math.floor((i*ts)/64);}");
@@ -2324,7 +2741,7 @@ void handleApiStatus() {
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
     "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
-    "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s}",
+    "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -2335,7 +2752,8 @@ void handleApiStatus() {
     stk485, stkWeb, stkNet, stkOta, stkRtc,
     rtcBuf,
     ntpSynced?"true":"false",
-    gMaintenanceMode?"true":"false");
+    gMaintenanceMode?"true":"false",
+    gQuietTime?"true":"false");
   server.send(200, "application/json", out);
 }
 
@@ -2356,6 +2774,7 @@ void handleApiConfigGet() {
   doc["gridRows"]   = cfg.gridRows;
   doc["gridCols"]   = cfg.gridCols;
   doc["serialDebug"]   = cfg.serialDebug;
+  doc["haEnabled"]     = cfg.haEnabled;
   doc["otaPasswordSet"] = (strlen(cfg.otaPassword) > 0);
   char out[640];
   serializeJson(doc, out, sizeof(out));
@@ -2455,6 +2874,19 @@ void handleApiConfigSettings() {
     gSerialDebug    = cfg.serialDebug;
     saveConfig();
     printf("[CFG] Serial debug %s\n", cfg.serialDebug ? "enabled" : "disabled");
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  // Home Assistant integration toggle
+  if (doc["haEnabled"].is<bool>()) {
+    bool was = cfg.haEnabled;
+    cfg.haEnabled = doc["haEnabled"].as<bool>();
+    saveConfig();
+    printf("[CFG] Home Assistant integration %s\n", cfg.haEnabled ? "enabled" : "disabled");
+    if (mqtt.connected()) {
+      if (cfg.haEnabled && !was) { haPublishDiscovery(true); mqttPublishStateTopics(); }
+      else if (!cfg.haEnabled && was) { haPublishDiscovery(false); }  // remove entities
+    }
     server.send(200, "application/json", "{\"ok\":true}");
     return;
   }
@@ -2612,9 +3044,41 @@ void handleOTAPage() {
   server.send(200, "text/html", html);
 }
 
+// Bring the fallback SoftAP up or down, switching WiFi mode accordingly.
+//   AP up   -> WIFI_AP_STA (AP for config + station keeps trying/holding link)
+//   AP down -> WIFI_STA    (station only; no AP buffers/beacons)
+// Only acts on an actual change so we never thrash the radio. The AP is a
+// fallback: callers bring it up when the station is down (or no credentials are
+// configured) and drop it once the station connects.
+static void wifiSetApActive(bool up) {
+  if (up == gApActive) return;
+  if (up) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(DEFAULT_AP_SSID, DEFAULT_AP_PASS);
+    IPAddress b = WiFi.softAPIP();
+    printf("[WiFi] Fallback AP up: %s  %d.%d.%d.%d\n", DEFAULT_AP_SSID, b[0],b[1],b[2],b[3]);
+  } else {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    printf("[WiFi] Fallback AP down -- station-only\n");
+  }
+  gApActive = up;
+}
+
 // Tracks whether the in-progress OTA upload has hit a fatal error, so we can
 // reject cleanly at the end instead of rebooting into a half-written image.
 static bool otaUploadFailed = false;
+
+// Restore normal WiFi after a failed/aborted OTA. During an upload we force
+// modem sleep off and (if it was up) the AP down to free RAM; afterwards we
+// reconcile to the correct state: AP stays down while the station is connected,
+// and comes back as a fallback only if the station is not connected.
+static void otaRestoreWifi() {
+  WiFi.setSleep(true);
+  // AP is a fallback: bring it back only if the station is not connected.
+  bool staUp = (WiFi.status() == WL_CONNECTED);
+  wifiSetApActive(!staUp);
+}
 
 void handleOTAUpload() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -2627,12 +3091,38 @@ void handleOTAUpload() {
   if (upload.status == UPLOAD_FILE_START) {
     otaUploadFailed = false;
     printf("[OTA] Web upload start: %s\n", upload.filename.c_str());
+    // Quiesce the gateway for the duration of the upload: stop MQTT publishing
+    // and free its buffers so the WiFi/TCP stack has the contiguous heap the
+    // upload needs. gOtaInProgress also makes the network task skip its periodic
+    // status/display/discovery publishes. This addresses mid-upload connection
+    // drops seen under heap fragmentation (esp. with Home Assistant enabled).
+    gOtaInProgress = true;
+    if (mqtt.connected()) { mqtt.disconnect(); printf("[OTA] MQTT paused during upload\n"); }
+    // Free internal RAM for the transfer. A large firmware streams in faster than
+    // flash can absorb it, so WiFi/lwIP receive buffers pile up; on this already
+    // heap-constrained, fragmented gateway that can exhaust the heap mid-upload
+    // (observed min-free-heap dropping to ~512 bytes -> connection reset). Two
+    // levers help: (a) drop the SoftAP so its interface buffers/housekeeping are
+    // released (only safe when the station is connected, else we'd lose access),
+    // and (b) disable modem sleep so the station drains the RX queue at full
+    // speed, reducing buffer buildup. Both are restored if the upload fails.
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSetApActive(false);   // drop fallback AP if it happens to be up
+      WiFi.setSleep(false);
+      printf("[OTA] AP down + modem sleep off for upload (heap=%u)\n", ESP.getFreeHeap());
+    }
     // UPDATE_SIZE_UNKNOWN lets the Update library size the partition itself.
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       otaUploadFailed = true;
+      gOtaInProgress = false;
+      otaRestoreWifi();
       printf("[OTA] Begin failed (%s) -- aborting upload\n", Update.errorString());
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    // handleClient() does not return during a multipart upload, so the web task
+    // can't touch its watchdog from its loop -- feed it here on every chunk so a
+    // large/slow upload can't trip the 30s web-stall reboot.
+    wdgWebMs = millis();
     // Skip writing once we've failed, so we don't keep feeding a dead Update.
     if (!otaUploadFailed) {
       if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
@@ -2644,19 +3134,26 @@ void handleOTAUpload() {
   } else if (upload.status == UPLOAD_FILE_END) {
     if (otaUploadFailed) {
       Update.abort();
+      gOtaInProgress = false;
+      otaRestoreWifi();
       printf("[OTA] Upload ended in failed state -- image discarded\n");
       // Response is sent by the POST body handler (sendOTAUploadResult).
     } else if (Update.end(true)) {   // true = set the new image as bootable
       printf("[OTA] Web upload complete (%u bytes) -- verified, rebooting\n",
              upload.totalSize);
+      // gOtaInProgress stays set: we reboot momentarily; no need to resume.
     } else {
       otaUploadFailed = true;
+      gOtaInProgress = false;
+      otaRestoreWifi();
       printf("[OTA] Update.end failed (%s) -- incomplete or corrupt image\n",
              Update.errorString());
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     otaUploadFailed = true;
+    gOtaInProgress = false;
     Update.abort();
+    otaRestoreWifi();
     printf("[OTA] Upload aborted by client -- image discarded\n");
   }
 }
@@ -3039,10 +3536,29 @@ void handleApiMaintenance() {
     if (!doc["on"].is<bool>()) { sendJsonError(400, "'on' (bool) required"); return; }
     gMaintenanceMode = doc["on"].as<bool>();
     printf("[MAINT] Maintenance mode %s\n", gMaintenanceMode ? "ENABLED" : "disabled");
+    mqttPublishStateTopics();
   }
   char out[40];
   snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s}",
            gMaintenanceMode ? "true" : "false");
+  server.send(200, "application/json", out);
+}
+
+// GET returns Quiet Time state; POST {"on":true|false} sets it.
+void handleApiQuiet() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_POST) {
+    if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+      sendJsonError(400, "Bad JSON"); return;
+    }
+    if (!doc["on"].is<bool>()) { sendJsonError(400, "'on' (bool) required"); return; }
+    sfSetQuietTime(doc["on"].as<bool>());
+    mqttPublishStateTopics();
+  }
+  char out[40];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s}", gQuietTime ? "true" : "false");
   server.send(200, "application/json", out);
 }
 
@@ -3106,6 +3622,9 @@ void webInit() {
   server.on("/api/maintenance",      HTTP_GET,     handleApiMaintenance);
   server.on("/api/maintenance",      HTTP_POST,    handleApiMaintenance);
   server.on("/api/maintenance",      HTTP_OPTIONS, handleOptions);
+  server.on("/api/quiet",            HTTP_GET,     handleApiQuiet);
+  server.on("/api/quiet",            HTTP_POST,    handleApiQuiet);
+  server.on("/api/quiet",            HTTP_OPTIONS, handleOptions);
   server.on("/api/config",           HTTP_GET,     handleApiConfigGet);
   server.on("/api/config/wifi",      HTTP_POST,    handleApiConfigWifi);
   server.on("/api/config/wifi",      HTTP_OPTIONS, handleOptions);
@@ -3234,6 +3753,7 @@ void taskWeb(void* pv) {
 
 static bool          staWasUp    = false;
 static unsigned long wifiRetryMs = 0;
+static unsigned long staDownSince = 0;   // millis() the station last dropped (0 = up/never)
 
 void taskNetwork(void* pv) {
   // WiFi init done in setup() - this task only polls and reconnects
@@ -3241,19 +3761,30 @@ void taskNetwork(void* pv) {
     bool staUp = (WiFi.status() == WL_CONNECTED);
     if (staUp && !staWasUp) {
       staWasUp = true;
+      wifiSetApActive(false);   // station is up -> drop the fallback AP
       if (!ntpSynced) ntpSynced = rtcNTPSync();
       { IPAddress _a = WiFi.localIP();
   printf("[WiFi] Connected IP=%d.%d.%d.%d\n", _a[0],_a[1],_a[2],_a[3]); }
     } else if (!staUp && staWasUp) {
       staWasUp = false;
+      staDownSince = millis();
       printf("[WiFi] Disconnected\n");
+    }
+    // Fallback AP: if the station has been down for a grace period (and a
+    // network is configured), bring the AP up so the gateway stays reachable.
+    // If no network is configured the AP was already raised at boot. Skipped
+    // during OTA (the AP is intentionally down to free RAM for the upload).
+    if (!staUp && !gApActive && !gOtaInProgress && strlen(cfg.wifiSSID) &&
+        staDownSince && millis() - staDownSince > 20000UL) {
+      printf("[WiFi] Station down 20s -- raising fallback AP\n");
+      wifiSetApActive(true);
     }
     if (!staUp && strlen(cfg.wifiSSID) && millis() - wifiRetryMs > 15000UL) {
       wifiRetryMs = millis();
       WiFi.disconnect();
       WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
     }
-    if (staUp && strlen(cfg.mqttHost)) {
+    if (staUp && strlen(cfg.mqttHost) && !gOtaInProgress) {
       if (!mqtt.connected() && millis() - mqttRetryMs > 30000UL) {
         mqttRetryMs = millis();
         mqttConnect();
@@ -3277,7 +3808,7 @@ void taskNetwork(void* pv) {
       if (mqtt.connected()) {
         mqtt.loop();
         // Drain the outbound queue -- all mqtt.publish calls happen here
-        if (mqttQMutex && xSemaphoreTake(mqttQMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (mqttQMutex && mqttQueue && xSemaphoreTake(mqttQMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           while (mqttQTail != mqttQHead) {
             MqttQItem& item = mqttQueue[mqttQTail];
             mqtt.publish(item.topic, (uint8_t*)item.payload, item.len, false);
@@ -3287,9 +3818,17 @@ void taskNetwork(void* pv) {
         }
       }
     }
-    if (millis() - lastStatusMs > STATUS_INTERVAL_MS) {
+    if (!gOtaInProgress && millis() - lastStatusMs > STATUS_INTERVAL_MS) {
       lastStatusMs = millis();
       mqttPublishStatus();
+    }
+    // Refresh the HA display sensor when tracking changed, rate-limited to avoid
+    // spamming HA's recorder. No-op unless HA integration is enabled. Skipped
+    // during an OTA upload to keep heap/CPU free for the transfer.
+    if (!gOtaInProgress && gDisplayDirty && cfg.haEnabled && millis() - lastDispPubMs > 1500) {
+      gDisplayDirty = false;
+      lastDispPubMs = millis();
+      mqttPublishDisplayState();
     }
 
     // Persist the module registry if it changed (debounced to limit NVS wear).
@@ -3322,6 +3861,7 @@ void setup() {
   sfMutex    = xSemaphoreCreateMutexStatic(&sfMutexBuf);
   timeMutex  = xSemaphoreCreateMutexStatic(&timeMutexBuf);
   mqttQMutex = xSemaphoreCreateMutexStatic(&mqttQMutexBuf);
+  psramAllocInit();   // allocate large buffers (ring + MQTT queue + registry) in PSRAM
 
   // Debug output via native USB CDC (USB CDC On Boot: Enabled).
   // Port appears as /dev/cu.usbmodem* on macOS, COMx on Windows, /dev/ttyACM0 on Linux.
@@ -3355,7 +3895,7 @@ void setup() {
   // 2. Load config and init module registry
   cfgSetDefaults();
   loadConfig();
-  memset(sfModules, 0, sizeof(sfModules));
+  memset(sfModules, 0, sizeof(SFModule) * MAX_MODULES);
   for (int i = 0; i < MAX_MODULES; i++) sfModules[i].id = 255;
   sfModuleCount = 0;
 
@@ -3372,15 +3912,22 @@ void setup() {
   // 4. RS485
   rs485Begin();
 
-  // 5. WiFi - MUST be initialised here on the main Arduino task
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(DEFAULT_AP_SSID, DEFAULT_AP_PASS);
-  { IPAddress _b = WiFi.softAPIP();
-    printf("[WiFi] AP: %s  %s  %d.%d.%d.%d\n",
-           DEFAULT_AP_SSID, DEFAULT_AP_PASS, _b[0],_b[1],_b[2],_b[3]); }
+  // 5. WiFi - MUST be initialised here on the main Arduino task.
+  // The SoftAP is a FALLBACK only: start in station mode and connect to the
+  // configured network. If no network is configured, bring the fallback AP up
+  // immediately so the gateway is reachable for first-time setup. If a network
+  // is configured but the station fails to connect, the network task brings the
+  // fallback AP up after a grace period (and drops it again once the station
+  // connects), so a working WiFi link never leaves the AP running.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);
   if (strlen(cfg.wifiSSID)) {
     WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
+    staDownSince = millis();   // start the fallback grace timer from boot
     printf("[WiFi] STA connecting to %s...\n", cfg.wifiSSID);
+  } else {
+    wifiSetApActive(true);   // no credentials -> fallback AP for setup
+    printf("[WiFi] No network configured -- fallback AP only\n");
   }
 
   // 6. Web server
@@ -3418,12 +3965,13 @@ void loop() {
     unsigned sRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
     printf("[WDG] up=%lus heap=%u min=%u maxblk=%u frag=%u%% "
            "stk(485/web/net/ota/rtc)=%u/%u/%u/%u/%u "
-           "rx=%lu tx=%lu rej=%lu wifi=%d rssi=%d mqtt=%d mods=%d\n",
+           "rx=%lu tx=%lu rej=%lu wifi=%d ap=%d rssi=%d mqtt=%d mods=%d\n",
            now/1000, freeHeap, minHeap, maxBlk,
            freeHeap ? (unsigned)(100 - (maxBlk * 100UL / freeHeap)) : 0,
            s485, sWeb, sNet, sOta, sRtc,
            rxCount, txCount, sfParseRejects,
            (int)(WiFi.status()==WL_CONNECTED),
+           (int)gApActive,
            (WiFi.status()==WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
            (int)mqtt.connected(), sfModuleCount);
 
