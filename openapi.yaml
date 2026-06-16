@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "2.3"
+  version: "2.4"
   description: |
     REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v1.3).
 

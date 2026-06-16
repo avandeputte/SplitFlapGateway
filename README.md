@@ -1,6 +1,6 @@
 # Split-Flap Gateway
 
-**Firmware version: 1.7**
+**Firmware version: 1.8**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
@@ -166,7 +166,7 @@ The firmware outputs diagnostic messages at **115200 baud** via the native USB C
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v1.7
+[Boot] Split-Flap Gateway v1.8
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -559,7 +559,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
 2. From that folder, choose **`SplitFlapGateway.ino.bin`** — the plain application image. **This is the only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `SplitFlapGateway.ino.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v1.7**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v1.8**).
 
 > **Which file?** The compiler emits several files alongside the app image — pick the right one:
 >
