@@ -126,6 +126,13 @@
    byte to a handful of commands, still far inside TX_MAX_BYTES. */
 #define MAX_MODULES         255   // module IDs 0-254
 
+// Duplicate-ID heuristic: two modules at the same ID both answer a by-ID version
+// or 'A' query and collide on the half-duplex bus -- the shared framing survives
+// but the serials garble, so sfParseResponse rejects the SN. Repeated such
+// rejects for ONE ID (within the window) are the signature of a duplicate ID.
+#define DUP_ID_REJECT_WINDOW_MS 60000UL   // rolling window for counting corrupt version/all replies
+#define DUP_ID_REJECT_THRESHOLD 3         // this many within the window -> flag a possible duplicate ID
+
 /* ---- Persisted module-registry file (FFat) ---- */
 #define MODULES_FILE     "/modules.dat"
 #define MODULES_MAGIC    0x53464732UL   // "SFG2" (bumped: PersistedModule gained 'acked')
@@ -401,6 +408,13 @@ struct SFModule {
   // and let taskRS485 issue the query once it passes. 0 = none pending.
   unsigned long verDueMs;    // millis() to issue the post-provision version query (0 = none)
   uint8_t       verTries;    // post-provision version-query attempts made so far
+  // Duplicate-ID heuristic (runtime only, NOT persisted -- re-evaluated each boot).
+  // Counts corrupt-SN version/all rejects for this ID within a rolling window;
+  // dupSuspect latches when the count crosses the threshold and clears on the
+  // next clean version/all parse for this ID.
+  uint8_t       dupRejectCount;  // corrupt version/all rejects in the current window
+  unsigned long dupRejectTs;     // millis() of the most recent corrupt reject (0 = none)
+  bool          dupSuspect;      // latched: likely duplicate ID on the bus
 };
 
 // Module registry (~14 KB). Lives in PSRAM -- accessed only under sfMutex from
@@ -411,6 +425,15 @@ struct SFModule {
 static SFModule*            sfModules     = NULL;
 static SemaphoreHandle_t sfMutex = NULL;
 static StaticSemaphore_t sfMutexBuf;
+// Serializes the bus-touching section of rs485Send. Without it, taskWeb (REST),
+// taskNetwork (MQTT command, core 1) and taskRS485 (discovery / post-provision,
+// core 0) can call rs485Send concurrently and interleave bytes on the shared
+// UART -- garbled frames, lost replies, poisoned serials. The collision guard
+// only protects TX-vs-RX; this protects TX-vs-TX. Lock order is ALWAYS
+// txMutex -> sfMutex (rs485Send -> sfTrackFromFrame): never call rs485Send while
+// holding sfMutex (sfTrackFromFrame would also re-take it and self-deadlock).
+static SemaphoreHandle_t txMutex = NULL;
+static StaticSemaphore_t txMutexBuf;
 // Explicit prototypes to prevent Arduino IDE inserting them before SFModule is defined.
 static SFModule* sfFindById(uint8_t id);
 static SFModule* sfFindBySN(const char* sn);
@@ -423,6 +446,13 @@ static int      sfModuleCount = 0;
 static volatile int           sfDumpWaitId   = -1;   // module id handleApiDump is waiting on
 static char                   sfDumpCapture[TX_MAX_BYTES] = "";  // raw dump after 'd:'
 static volatile unsigned long sfDumpCaptureTs = 0;   // millis() when captured (0=none)
+// Extra fields that ONLY an 'A' (combined) reply carries; a plain 'd' dump and
+// older firmware do not provide them. -99 = not provided (the module itself uses
+// -1=unknown and -2=released for curIndex, so the sentinel must avoid both). Set by the 'A' parse
+// branch BEFORE sfDumpCaptureTs (the ready flag), read by handleApiAll.
+static volatile int           sfCaptureAutoHome   = -99;  // 0/1, or -99 n/a
+static volatile int           sfCaptureCurIndex   = -99;  // flap index; -1 unknown, -2 released, -99 n/a
+static volatile int           sfCaptureReportedId = -99;  // module's self-reported id, -99 n/a
 static volatile int           sfCalibWaitId   = -1;  // module id handleApiCalibrate is waiting on
 static volatile int           sfCalibSteps    = 0;   // captured steps/rev from m<id>:<steps>
 static volatile unsigned long sfCalibCaptureTs = 0;  // millis() when captured (0=none)
@@ -434,6 +464,28 @@ static volatile bool          sfCalibJobActive   = false;  // a job is in flight
 static volatile int           sfCalibJobId       = -1;     // module being calibrated
 static volatile int           sfCalibJobSteps    = -1;     // measured result (-1 until done)
 static volatile unsigned long sfCalibJobDeadline = 0;      // millis() timeout
+// Self-diagnostics (module firmware v26+). Two tests run per request:
+//   'Q' snapshot  m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>
+//                 -- instant (no motor), captured synchronously like a dump.
+//   'M' mechanical m<id>M:<code>:<min>:<max>:<spreadTenthsPct>
+//                 -- drives the motor ~6 revolutions (can take 20-100s on a
+//                    large reel), so it uses an async job like calibrate.
+static volatile int           sfDiagQWaitId = -1;  // id the Q capture is waiting on
+static volatile unsigned long sfDiagQTs     = 0;   // ready flag (0=none)
+static volatile int           sfDiagQReset  = 0;
+static volatile int           sfDiagQBoot   = 0;
+static volatile int           sfDiagQVcc    = 0;
+static volatile int           sfDiagQEe     = 0;
+static volatile int           sfDiagQCur    = -1;
+static volatile int           sfDiagMWaitId = -1;  // id the parser captures M for
+static volatile unsigned long sfDiagMTs     = 0;   // M ready flag (0=none)
+static volatile int           sfDiagMCode   = -1;
+static volatile int           sfDiagMMin    = 0;
+static volatile int           sfDiagMMax    = 0;
+static volatile int           sfDiagMSpread = 0;
+static volatile bool          sfDiagMJobActive = false;  // an M test is in flight
+static volatile int           sfDiagMJobId     = -1;
+static volatile unsigned long sfDiagMDeadline  = 0;      // millis() timeout
 static volatile bool          sfModulesDirty   = false;  // pending NVS save
 static volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
 static bool          ntpSynced   = false; // declared early; also set in taskNetwork
@@ -523,6 +575,7 @@ void saveConfig() {
 struct RS485Msg {
   unsigned long timestamp;
   char          dir;
+  bool          sanitized;      // TX only: true if the gateway trimmed trailing junk past a complete command
   uint8_t       data[MSG_MAX_BYTES];
   size_t        len;
   char          wallTime[24];   // gateway-TZ string (MQTT / serial debug)
@@ -540,7 +593,7 @@ void mqttPublishMsg(const RS485Msg& m);
 static void mqttPublishStateTopics();          // HA entity state (display/maint/quiet)
 static void mqttPublishDisplayState();         // current display string
 static void haPublishDiscovery(bool enable);   // HA MQTT discovery (or removal)
-void rs485Send(const uint8_t* data, size_t len);
+void rs485Send(const uint8_t* data, size_t len, bool raw = false);
 void sfQueryVersion(int addr);                 // forward (used by stale-probe)
 
 // The bus-monitor ring (64 x ~296 bytes ~= 19 KB) lives in PSRAM, not internal
@@ -627,6 +680,7 @@ String ringDrain() {
     out += ",\"dir\":\"";   out += m.dir;       out += '"';
     out += ",\"command\":\""; out += ascii;       out += '"';
     out += ",\"len\":";     out += m.len;
+    if (m.sanitized) out += ",\"san\":1";
     out += '}';
     i = (i + 1) % MSG_RING_SIZE;
   }
@@ -830,14 +884,126 @@ static void sfQuietCapturePending(const uint8_t* data, size_t len) {
   xSemaphoreGive(sfMutex);
 }
 
-void rs485Send(const uint8_t* data, size_t len) {
+// True iff `data[0..len)` (caller strips trailing CR/LF first) is a DIRECT,
+// numeric-id firmware-version query "m<id>v" with no payload after the 'v'.
+// This is the one frame the gateway must transmit WITHOUT a newline terminator
+// (see sfQueryVersion() for the half-duplex turnaround reason). Broadcast "m*v",
+// by-serial "mX.." frames, and anything with bytes after the 'v' are NOT matched
+// and so keep their terminator.
+static bool sfIsDirectVersionQuery(const uint8_t* data, size_t len) {
+  int addr;
+  if (sfFrameCmd(data, len, &addr) != 'v') return false;   // command must be 'v'
+  if (addr < 0) return false;                              // numeric id only (reject m*v)
+  size_t i = 1;                                            // locate the command char:
+  while (i < len && data[i] >= '0' && data[i] <= '9') i++; //   skip 'm', then the digits
+  return (i + 1 == len);                                   // 'v' must be the final byte
+}
+
+// Given a frame `data[0..len)` (caller strips trailing CR/LF first), return the
+// length of the longest prefix that forms a COMPLETE, well-formed known command.
+// Bytes beyond that are extraneous and the caller may trim them -- so "m4vDSassa"
+// collapses to "m4v" instead of leaning on the module to ignore the junk. This is
+// grammar ENFORCEMENT, not guessing: each command's payload shape is fixed by the
+// (frozen) protocol. Frames we can't model confidently -- by-serial "mX.." frames
+// and any unrecognized command char -- return the full length UNCHANGED, so a
+// long restore map or a future command is never truncated. The raw-send bypass
+// skips this entirely.
+static size_t sfKnownCommandLen(const uint8_t* data, size_t len) {
+  if (len < 2 || data[0] != 'm') return len;        // not an m-frame: leave as-is
+  if (data[1] == 'X') return len;                   // by-serial frame: pass through untouched
+  size_t i = 1;
+  bool wildcard = false;
+  if (data[i] == '*') {                             // wildcard address
+    wildcard = true;
+    i++;
+  } else if (data[i] >= '0' && data[i] <= '9') {    // numeric id (0..254)
+    long v = 0;
+    while (i < len && data[i] >= '0' && data[i] <= '9') { v = v*10 + (data[i]-'0'); i++; }
+    if (v > 254) return len;                         // invalid id: don't touch
+  } else {
+    return len;                                      // malformed address: leave as-is
+  }
+  if (i >= len) return len;                           // no command char yet: leave as-is
+  char cmd = (char)data[i];
+  i++;                                                // consume the command char
+  switch (cmd) {
+    // Zero-payload commands: complete the instant the command char is read.
+    case 'h': case 'c': case 'd':
+    case 'e': case 'R': case 'F':
+      return i;                                       // trim anything after
+    // Version query and combined all-fields dump ('A', v25+): zero-payload when
+    // addressed by a numeric id, but a wildcard broadcast may carry an optional
+    // "<lo>-<hi>" range (m*v0-49 / m*A0-49) -- pass those through untrimmed.
+    case 'v': case 'A':
+      return wildcard ? len : i;
+    // Show one character: keep exactly one payload byte.
+    case '-':
+      if (i < len) i++;
+      return i;
+    // Numeric-payload commands: keep the leading run of digits.
+    case '+': case 'o': case 't': case 's':
+    case 'g': case 'a': case 'i': {
+      size_t d = i;
+      while (d < len && data[d] >= '0' && data[d] <= '9') d++;
+      return (d == i) ? len : d;                      // no digits where expected: leave as-is
+    }
+    // Write calibrated position "<index>:<pos>" -- two numeric fields.
+    case 'w': {
+      size_t d = i;
+      while (d < len && data[d] >= '0' && data[d] <= '9') d++;        // index
+      if (d == i || d >= len || data[d] != ':') return len;          // malformed: leave as-is
+      d++;                                                            // ':'
+      size_t p = d;
+      while (d < len && data[d] >= '0' && data[d] <= '9') d++;        // position
+      return (d == p) ? len : d;                                      // no position digits: leave
+    }
+    default:
+      return len;                                     // unknown command: pass through
+  }
+}
+
+void rs485Send(const uint8_t* data, size_t len, bool raw) {
   if (!len || len > TX_MAX_BYTES) return;
+
+  // --- Wire framing + sanitization (single choke point for every send path) --
+  // Normal path: the gateway owns wire correctness so callers never have to:
+  //   1) strip any trailing CR/LF the caller supplied,
+  //   2) trim anything past a complete, well-formed known command, so a stray
+  //      "m4vDSassa" becomes "m4v" rather than relying on the module to ignore
+  //      the junk (see sfKnownCommandLen), then
+  //   3) re-add exactly one '\n' terminator -- EXCEPT a direct numeric-id version
+  //      query "m<id>v", which must ship bare to dodge the half-duplex turnaround
+  //      collision (see sfQueryVersion). So "m1v", "m1v\n", "m1v\r\n", and even
+  //      "m1vJUNK" all leave as bare "m1v", while "m5-A" and "m9o2832" leave
+  //      correctly newline-terminated (which also spares payload commands the
+  //      module's 50 ms idle-timeout wait).
+  // Raw path (raw==true -- the Bus Monitor "Raw" toggle, or {"raw":true} on the
+  // REST/MQTT send): transmit the caller's exact bytes verbatim, with no trim and
+  // no terminator change -- a deliberate debugging escape hatch. Bus-collision
+  // guarding, Quiet Time, tracking, logging, and the monitor ring still apply.
+  size_t bare;
+  bool   appendNL;
+  bool   sanitized = false;     // true if sfKnownCommandLen trimmed trailing junk
+  if (raw) {
+    bare     = len;     // verbatim -- no stripping, no sanitizing
+    appendNL = false;   // no terminator added
+  } else {
+    bare = len;
+    while (bare > 0 && (data[bare-1] == '\n' || data[bare-1] == '\r')) bare--;
+    if (!bare) return;                                  // nothing but terminators
+    size_t preSan = bare;
+    bare      = sfKnownCommandLen(data, bare);          // trim trailing junk
+    sanitized = (bare < preSan);                        // bytes past a complete command were dropped
+    appendNL  = !sfIsDirectVersionQuery(data, bare);    // version query => ship bare
+  }
+  if (!bare) return;
+
   // Quiet Time: swallow normal display-motion frames so the flaps stay still.
   // The request is acknowledged (we return as if sent) and the desired display
   // is remembered for resync; nothing reaches the bus and tracking is unchanged.
-  if (gQuietTime && sfFrameIsDisplayMotion(data, len)) {
-    sfQuietCapturePending(data, len);
-    DBG("[QUIET] suppressed display frame (%u bytes)\n", (unsigned)len);
+  if (gQuietTime && sfFrameIsDisplayMotion(data, bare)) {
+    sfQuietCapturePending(data, bare);
+    DBG("[QUIET] suppressed display frame (%u bytes)\n", (unsigned)bare);
     return;
   }
   // Collision avoidance on the half-duplex bus: if modules are mid-response
@@ -846,6 +1012,13 @@ void rs485Send(const uint8_t* data, size_t len) {
   // terminators (observed as glued/garbled frames and poisoned serial numbers).
   // Hold off until the bus has been quiet for TX_BUS_GUARD_MS, bounded by
   // TX_BUS_WAIT_CAP_MS so we always make progress.
+  //
+  // From here through the monitor-ring push is the bus-touching critical section.
+  // txMutex serializes it across taskWeb / taskNetwork / taskRS485 so two senders
+  // can't interleave bytes on the UART. There are no early returns inside, so the
+  // mutex is always released. (Held across sfTrackFromFrame/ringPush, which take
+  // sfMutex/msgMutex -- order is txMutex -> {sfMutex,msgMutex}, never inverted.)
+  if (txMutex) xSemaphoreTake(txMutex, portMAX_DELAY);
   {
     unsigned long waitStart = millis();
     while (millis() - gLastRxMs < TX_BUS_GUARD_MS &&
@@ -853,33 +1026,40 @@ void rs485Send(const uint8_t* data, size_t len) {
       vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
-  rs485.write(data, len);
+  rs485.write(data, bare);                                  // the bare command...
+  if (appendNL) { const uint8_t nl = '\n'; rs485.write(&nl, 1); }  // ...+ terminator unless version query
   rs485.flush();
   txCount++;
   // Update per-module display tracking from this frame. Doing it here -- the
   // single point every outbound frame passes through -- means raw sends are
   // tracked exactly like the high-level helpers, with no per-path duplication.
-  sfTrackFromFrame(data, len);
+  sfTrackFromFrame(data, bare);
   gDisplayDirty = true;   // HA display sensor refresh (network task, rate-limited)
-  // Log the transmitted frame (strip trailing newline for readability).
-  // Cap the debug buffer at MSG_MAX_BYTES; long frames are truncated in the log.
+  // Log the transmitted frame (the command without a trailing terminator, for
+  // readability -- the raw path may carry one). The monitor ring below keeps the
+  // exact on-wire bytes. Cap the debug buffer at MSG_MAX_BYTES; long frames truncate.
   { char dbg[MSG_MAX_BYTES];
-    size_t dlen = (len > 0 && data[len-1] == '\n') ? len-1 : len;
+    size_t dlen = bare;
+    while (dlen > 0 && (data[dlen-1] == '\n' || data[dlen-1] == '\r')) dlen--;
     if (dlen > sizeof(dbg) - 1) dlen = sizeof(dbg) - 1;
     memcpy(dbg, data, dlen); dbg[dlen] = '\0';
-    DBG("[TX] %s\n", dbg); }
+    DBG("[TX] %s%s\n", dbg, sanitized ? "  (sanitized)" : ""); }
   RS485Msg m;
   m.timestamp = millis();
   m.dir = 'T';
-  // The monitor ring entry is fixed-size; store at most MSG_MAX_BYTES bytes.
-  // The full frame was already transmitted above -- this copy is for display only.
-  size_t ringLen = (len > MSG_MAX_BYTES) ? MSG_MAX_BYTES : len;
-  m.len = ringLen;
+  m.sanitized = sanitized;
+  // Reconstruct the on-wire frame for the monitor ring (bare command plus the
+  // terminator we actually sent), bounded to MSG_MAX_BYTES. This keeps TX ring
+  // entries consistent with RX entries, which carry their own '\n'.
+  size_t ringLen = (bare > MSG_MAX_BYTES) ? MSG_MAX_BYTES : bare;
   memcpy(m.data, data, ringLen);
+  if (appendNL && ringLen < MSG_MAX_BYTES) m.data[ringLen++] = '\n';
+  m.len = ringLen;
   rtcFormatTime(m.wallTime, sizeof(m.wallTime));
   m.epoch = rtcEpochNow();   // UTC epoch; web UI renders in browser-local time
   ringPush(m);
   mqttPublishMsg(m);
+  if (txMutex) xSemaphoreGive(txMutex);
 }
 
 // Send a null-terminated ASCII string on RS485
@@ -1305,36 +1485,112 @@ void sfCalibrate(int addr) {
 
 // Query firmware version of a DIRECT (single-id, never broadcast) module.
 //
-// IMPORTANT: deliberately NO trailing '\n'. A module answers a direct version
-// query SYNCHRONOUSLY, the instant it parses the 'v' command byte -- with zero
-// assembly delay (unlike a dump, which builds its EEPROM string before raising
-// DE). On this half-duplex bus the ESP32's hardware-managed DE keeps driving the
-// line until the WHOLE frame has clocked out, so a trailing '\n' keeps us
-// transmitting for one extra byte-time (~1 ms at 9600 baud) AFTER the module has
-// already begun its reply. The module's reply then collides with our trailing
-// '\n', and because our receiver is off while we transmit, its leading bytes are
-// lost and no [RX] frame is ever assembled -- the long-standing "version query
-// gets no reply (but a dump right after works)" symptom. Sending "m<id>v" with
-// no terminator releases the bus exactly as the module parses 'v', so the reply
-// lands cleanly (verified on hardware: a newline-less monitor send always
-// replies; the byte-identical "m<id>v\n" never did).
+// NOTE: the omitted trailing '\n' is NOT a module protocol requirement. The
+// module accepts BOTH "m<id>v" and "m<id>v\n" and answers either one -- it acts
+// on the 'v' byte itself. We drop the newline to work around a GATEWAY-SIDE
+// limitation in our half-duplex bus turnaround, as follows:
 //
-// The module's parser acts on the 'v' byte itself for a direct query and needs
-// no terminator. The BROADCAST "m*v\n" path is separate and MUST keep its
-// newline: a wildcard query enters the module's range-collector state and fires
-// its staggered reply on the '\n' (or a 50 ms idle timeout). sfQueryVersion is
-// only ever called with a concrete id, so dropping the newline here is safe.
+// A module answers a direct version query SYNCHRONOUSLY, the instant it parses
+// the 'v' byte -- with zero assembly delay (unlike a dump, which builds its
+// EEPROM string before raising DE, so its reply is naturally late enough to be
+// safe). Our problem is on the gateway: the ESP32's hardware-managed DE keeps us
+// driving the line until the WHOLE frame has clocked out, and our UART receiver
+// is off while we transmit, so we can't release the bus and flip to RX fast
+// enough to catch that immediate reply. A trailing '\n' keeps us transmitting
+// for one extra byte-time (~1 ms at 9600 baud) AFTER the module has already
+// started replying -- the reply's leading bytes land while we're still driving
+// the line (and deaf), so they're lost and no [RX] frame is ever assembled. That
+// was the long-standing "version query gets no reply, but a dump right after
+// works" symptom -- a gateway turnaround race, not a module quirk.
+//
+// Dropping the newline shortens our transmit window so we've already released
+// the bus and are listening by the time the module answers (verified on
+// hardware: a newline-less send always replies; the byte-identical "m<id>v\n"
+// never did). The BROADCAST "m*v\n" path is separate and keeps its newline: a
+// wildcard query collects an optional ID range and the module fires a staggered,
+// DEFERRED reply on the '\n' (or a 50 ms idle timeout), so there is no
+// turnaround race there. sfQueryVersion is only ever called with a concrete id.
+//
+// (Belt and suspenders: rs485Send() now normalizes framing for EVERY sender, so
+// even a hand-typed "m<id>v\n" from the bus monitor or a REST/MQTT raw send is
+// shipped bare. This helper still emits the bare form directly to document intent.)
 void sfQueryVersion(int addr) {
   char buf[16];
-  snprintf(buf, sizeof(buf), "m%dv", addr);   // no '\n' -- see note above
+  snprintf(buf, sizeof(buf), "m%dv", addr);   // no '\n' -- gateway turnaround workaround, see note
   rs485SendStr(buf);
 }
 
-// Query EEPROM dump of a module
-void sfQueryDump(int addr) {
-  char buf[16];
-  snprintf(buf, sizeof(buf), "m%dd\n", addr);
-  rs485SendStr(buf);
+// Arm the shared dump-capture slot for `id`, send `frame`, then wait up to
+// `timeoutMs` for the module's reply -- a 'd' or 'A' response that sfParseResponse
+// stores in sfDumpCapture. Returns true and copies the captured dump into `out`
+// if a reply arrived. Runs on taskWeb; touches wdgWebMs so a long wait is
+// watchdog-safe. The capture slot is single-use, which is safe because the
+// synchronous web server serves one request at a time.
+static bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs,
+                                 char* out, size_t outLen) {
+  sfDumpCapture[0] = 0;
+  sfDumpCaptureTs  = 0;
+  sfCaptureAutoHome = sfCaptureCurIndex = sfCaptureReportedId = -99;  // A-only; cleared per attempt
+  sfDumpWaitId     = id;
+  rs485SendStr(frame);
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    wdgWebMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    if (sfDumpCaptureTs != 0) { strlcpy(out, sfDumpCapture, outLen); return true; }
+  }
+  return false;
+}
+
+// Send a 'Q' diagnostics snapshot to `id` and wait up to `timeoutMs` for the
+// instant reply (no motor movement). Result lands in the sfDiagQ* globals via
+// sfParseResponse. Returns true on a reply. Runs on taskWeb; watchdog-safe.
+static bool sfSendAndCaptureQ(int id, unsigned long timeoutMs) {
+  sfDiagQTs     = 0;
+  sfDiagQWaitId = id;
+  char frame[16];
+  snprintf(frame, sizeof(frame), "m%dQ\n", id);
+  rs485SendStr(frame);
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    wdgWebMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    if (sfDiagQTs != 0) { sfDiagQWaitId = -1; return true; }
+  }
+  sfDiagQWaitId = -1;
+  return false;
+}
+
+// Send a direct version query to `id` and wait up to `timeoutMs` for the reply
+// to land in the registry (lastSeen advances AND fwVersion populated). On a
+// reply, fills any non-NULL out params and returns true. Runs on taskWeb.
+static bool sfSendVersionAndWait(int id, unsigned long timeoutMs,
+                                 char* fwOut, size_t fwLen,
+                                 char* snOut, size_t snLen,
+                                 unsigned long* lastSeenOut) {
+  unsigned long seenBefore = 0;
+  xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* mb = sfFindById((uint8_t)id);
+  if (mb) seenBefore = mb->lastSeen;
+  xSemaphoreGive(sfMutex);
+  sfQueryVersion(id);   // bare 'v' -- collision-safe
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    wdgWebMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    bool got = false;
+    xSemaphoreTake(sfMutex, portMAX_DELAY);
+    SFModule* mx = sfFindById((uint8_t)id);
+    if (mx && mx->lastSeen != seenBefore && mx->fwVersion[0]) {
+      if (fwOut) strlcpy(fwOut, mx->fwVersion, fwLen);
+      if (snOut) strlcpy(snOut, mx->serialNum, snLen);
+      if (lastSeenOut) *lastSeenOut = mx->lastSeen;
+      got = true;
+    }
+    xSemaphoreGive(sfMutex);
+    if (got) return true;
+  }
+  return false;
 }
 
 // Set module ID (address it by current ID, give it a new one)
@@ -1484,6 +1740,70 @@ bool sfValidSN(const char* sn) {
   return true;
 }
 
+// Apply the version-bearing fields from a 'v' or 'A' response to the registry.
+// Validates the serial (a glued/garbled frame yields a corrupt SN whose storage
+// would poison the registry and FATFS); returns false if so, so the caller can
+// reject the whole frame. `fwCopy` is the already-normalized firmware string
+// ("?" when empty); `sn` may be empty (legacy version-only reply), in which case
+// only the firmware is updated. The entry is re-found by id under sfMutex (the
+// upsert pointer can be invalidated by concurrent compaction), and any other
+// entry holding the same serial is collapsed so a serial maps to one record.
+static bool sfApplyVersionFields(uint8_t id, const char* fwCopy, const char* sn) {
+  if (sn && sn[0] && !sfValidSN(sn)) return false;
+  xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* mm = sfFindById(id);
+  if (mm) {
+    if (strcmp(mm->fwVersion, fwCopy) != 0) sfModulesDirty = true;  // persist new fw
+    strlcpy(mm->fwVersion, fwCopy, sizeof(mm->fwVersion));
+    // A clean version/all reply parsed for this ID -> the duplicate-ID suspicion
+    // (if any) is resolved; reset the heuristic.
+    mm->dupRejectCount = 0;
+    mm->dupRejectTs    = 0;
+    mm->dupSuspect     = false;
+    if (sn && sn[0]) {
+      strlcpy(mm->serialNum, sn, sizeof(mm->serialNum));
+      for (int k = 0; k < sfModuleCount; k++) {
+        if (&sfModules[k] != mm && strcmp(sfModules[k].serialNum, sn) == 0) {
+          for (int j = k; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+          sfModuleCount--;
+          memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
+          sfModulesDirty = true;
+          break;
+        }
+      }
+    }
+  }
+  xSemaphoreGive(sfMutex);
+  return true;
+}
+
+// Record a corrupt-SN version/all reject for `id` and advance the duplicate-ID
+// heuristic. Returns true EXACTLY ONCE -- the moment the suspicion first latches
+// -- so the caller emits a single warning rather than spamming. Counts within a
+// rolling window so isolated transient collisions decay instead of accumulating;
+// only persistent same-ID corruption (the duplicate-ID signature) crosses the
+// threshold. Runs under sfMutex internally.
+static bool sfNoteCorruptVersionReply(uint8_t id) {
+  bool newlyLatched = false;
+  xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* m = sfFindById(id);
+  if (m) {
+    unsigned long now = millis();
+    if (m->dupRejectTs && (now - m->dupRejectTs) <= DUP_ID_REJECT_WINDOW_MS) {
+      if (m->dupRejectCount < 255) m->dupRejectCount++;
+    } else {
+      m->dupRejectCount = 1;   // first reject, or the window lapsed -> restart
+    }
+    m->dupRejectTs = now;
+    if (!m->dupSuspect && m->dupRejectCount >= DUP_ID_REJECT_THRESHOLD) {
+      m->dupSuspect = true;
+      newlyLatched = true;
+    }
+  }
+  xSemaphoreGive(sfMutex);
+  return newlyLatched;
+}
+
 void sfParseResponse(const uint8_t* data, size_t len) {
   if (len < 2 || data[0] != 'm') return;
 
@@ -1491,7 +1811,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
   // Sized for long inbound frames (a full dump response is ~590 bytes).
   // NOTE: static (not stack) -- sfParseResponse is called only from taskRS485
   // (single caller, no reentrancy), and a 768-byte stack buffer here would
-  // overflow that task's 4KB stack. Keeping it in .bss avoids the overflow.
+  // overflow that task's 6KB stack. Keeping it in .bss avoids the overflow.
   static char buf[TX_MAX_BYTES + 1];
   size_t copyLen = (len < TX_MAX_BYTES) ? len : TX_MAX_BYTES;
   memcpy(buf, data, copyLen);
@@ -1622,49 +1942,25 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     for (char* cp = verBuf; *cp && fi < 3; cp++) {
       if (*cp == ':') { *cp = '\0'; field[fi++] = cp + 1; }
     }
-    // A glued/garbled frame (bus collision destroying the newline between two
-    // responses) shows up here as an SN token with embedded ':' or raw garbage
-    // bytes. Reject the WHOLE response: a frame with a corrupt tail cannot be
-    // trusted, and storing its SN would poison the registry and FATFS, breaking
-    // every SN-addressed command for that module from then on.
-    if (field[2] && field[2][0] && !sfValidSN(field[2])) {
-      DBG("[SF] rejecting corrupt version response for module %d (sn:%s)\n",
-          id, field[2]);
-      sfParseRejects++;
-      return;
-    }
     int reportedId = (field[1] && field[1][0]) ? atoi(field[1]) : -1;
-    // Write registry fields under the mutex, re-finding the entry by id: the
-    // pointer from the earlier upsert can be invalidated by concurrent array
-    // compaction (sfModulesPruneStale runs every 60s on taskNetwork, and
-    // deprovision can run from taskWeb) -- writing through a stale pointer
-    // would corrupt a DIFFERENT module's record.
     char fwCopy[8] = "?";
     if (field[0] && field[0][0]) strlcpy(fwCopy, field[0], sizeof(fwCopy));
-    xSemaphoreTake(sfMutex, portMAX_DELAY);
-    SFModule* mm = sfFindById((uint8_t)id);
-    if (mm) {
-      if (strcmp(mm->fwVersion, fwCopy) != 0) sfModulesDirty = true;  // persist new fw
-      strlcpy(mm->fwVersion, fwCopy, sizeof(mm->fwVersion));
-      if (field[2] && field[2][0]) {
-        strlcpy(mm->serialNum, field[2], sizeof(mm->serialNum));
-        // Collapse any other entry that already held this serial (e.g. a stale
-        // id=255 advertiser for the same physical module), so a serial maps to
-        // exactly one registry entry. Remove the OTHER one, keeping mm (the
-        // id-confirmed entry). Re-find mm afterward is unnecessary: we only drop
-        // entries after mm's slot or shift the tail, and mm is used no further.
-        for (int k = 0; k < sfModuleCount; k++) {
-          if (&sfModules[k] != mm && strcmp(sfModules[k].serialNum, field[2]) == 0) {
-            for (int j = k; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
-            sfModuleCount--;
-            memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
-            sfModulesDirty = true;
-            break;
-          }
-        }
+    // Validate + write fwVersion/serial under the lock (re-finds the entry by id,
+    // collapses any duplicate-serial record). A corrupt SN rejects the frame.
+    if (!sfApplyVersionFields((uint8_t)id, fwCopy, field[2])) {
+      DBG("[SF] rejecting corrupt version response for module %d (sn:%s)\n",
+          id, field[2] ? field[2] : "");
+      sfParseRejects++;
+      if (sfNoteCorruptVersionReply((uint8_t)id)) {
+        DBG("[SF] *** possible DUPLICATE ID %d on the bus: %d corrupt version replies "
+            "(framing intact, serial garbled) -- two modules may share this ID ***\n",
+            id, DUP_ID_REJECT_THRESHOLD);
+        char wpl[72];
+        snprintf(wpl, sizeof(wpl), "{\"id\":%d,\"reason\":\"duplicate_id_suspected\"}", id);
+        mqttPublishSFEvent("warning", wpl);
       }
+      return;
     }
-    xSemaphoreGive(sfMutex);
     DBG("[SF] Module %d fw:%s reportedId:%d sn:%s\n",
                   id, fwCopy, reportedId, field[2] ? field[2] : "");
     char payload[96];
@@ -1692,7 +1988,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     // waiting for this module id (set by handleApiDump). No per-module cache.
     // Buffers sized for a full dump response (~590 bytes for a 64-flap map).
     // static (not stack): only taskRS485 reaches here, and 768-byte stack
-    // buffers would overflow its 4KB stack.
+    // buffers would overflow its 6KB stack.
     static char clean[TX_MAX_BYTES];
     strlcpy(clean, p + 1, sizeof(clean));
     size_t dl = strlen(clean);
@@ -1707,6 +2003,108 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     static char payload[MQTT_BUF_SIZE];
     snprintf(payload, sizeof(payload), "{\"id\":%d,\"dump\":\"%s\"}", id, clean);
     mqttPublishSFEvent("dump", payload);
+  }
+  // Combined all-fields dump (firmware v25+): a single reply carrying everything
+  // the 'v' and 'd' responses do, plus autoHome and the live current index:
+  //   m<id>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<map>
+  // We update fwVersion + serialNum exactly like the version response, and
+  // reconstruct the "<homeOffset>:<totalSteps>:<map>" dump portion into the same
+  // capture slot the 'd' path uses -- so a single 'A' satisfies both a version
+  // refresh and a dump read in one bus transaction (see handleApiAll).
+  else if (cmd == 'A' && *p == ':') {
+    static char aBuf[TX_MAX_BYTES];     // static: taskRS485's 6KB stack can't hold this
+    strlcpy(aBuf, p + 1, sizeof(aBuf));
+    for (int k = (int)strlen(aBuf)-1; k >= 0 && (aBuf[k]=='\n'||aBuf[k]=='\r'||aBuf[k]==' '); k--) aBuf[k] = 0;
+    // Split into the 7 scalar fields plus the trailing map (which has no ':').
+    // f: 0 ver, 1 modId, 2 sn, 3 homeOffset, 4 totalSteps, 5 autoHome, 6 curIndex, 7 map
+    char* f[8] = {0}; f[0] = aBuf; int fi = 1;
+    for (char* cp = aBuf; *cp && fi < 8; cp++) { if (*cp == ':') { *cp = 0; f[fi++] = cp + 1; } }
+    char fwCopy[8] = "?";
+    if (f[0] && f[0][0]) strlcpy(fwCopy, f[0], sizeof(fwCopy));
+    int reportedId = (f[1] && f[1][0]) ? atoi(f[1]) : -1;
+    // Validate + write fwVersion/serial under the lock (shared with the 'v' path).
+    if (!sfApplyVersionFields((uint8_t)id, fwCopy, f[2])) {
+      DBG("[SF] rejecting corrupt all-fields response for module %d (sn:%s)\n", id, f[2] ? f[2] : "");
+      sfParseRejects++;
+      if (sfNoteCorruptVersionReply((uint8_t)id)) {
+        DBG("[SF] *** possible DUPLICATE ID %d on the bus: %d corrupt version replies "
+            "(framing intact, serial garbled) -- two modules may share this ID ***\n",
+            id, DUP_ID_REJECT_THRESHOLD);
+        char wpl[72];
+        snprintf(wpl, sizeof(wpl), "{\"id\":%d,\"reason\":\"duplicate_id_suspected\"}", id);
+        mqttPublishSFEvent("warning", wpl);
+      }
+      return;
+    }
+    // Reconstruct the dump portion into the shared capture slot if a request is
+    // waiting (handleApiAll arms it), so the existing wait machinery works. The
+    // 'A'-only extras (autoHome, curIndex, self-reported id) ride along in
+    // dedicated globals -- they can't go in the dump string without breaking
+    // parseDump, which expects exactly ho:ts:map. All set BEFORE the ready flag.
+    if (sfDumpWaitId == (int)id) {
+      snprintf(sfDumpCapture, sizeof(sfDumpCapture), "%s:%s:%s",
+               f[3] ? f[3] : "", f[4] ? f[4] : "", f[7] ? f[7] : "");
+      sfCaptureAutoHome   = (f[5] && f[5][0]) ? atoi(f[5]) : -99;
+      sfCaptureCurIndex   = (f[6] && f[6][0]) ? atoi(f[6]) : -99;
+      sfCaptureReportedId = reportedId;   // module's self-reported id (f[1])
+      sfDumpCaptureTs = millis();
+    }
+    DBG("[SF] Module %d ALL fw:%s reportedId:%d sn:%s ho:%s ts:%s\n",
+        id, fwCopy, reportedId, f[2] ? f[2] : "", f[3] ? f[3] : "", f[4] ? f[4] : "");
+    // Publish both a version and a dump event, since 'A' carries both.
+    char vpl[96];
+    snprintf(vpl, sizeof(vpl), "{\"id\":%d,\"ver\":\"%s\",\"reportedId\":%d,\"sn\":\"%s\"}",
+             id, fwCopy, reportedId, f[2] ? f[2] : "");
+    mqttPublishSFEvent("version", vpl);
+    static char dpl[MQTT_BUF_SIZE];
+    snprintf(dpl, sizeof(dpl), "{\"id\":%d,\"dump\":\"%s:%s:%s\"}",
+             id, f[3] ? f[3] : "", f[4] ? f[4] : "", f[7] ? f[7] : "");
+    mqttPublishSFEvent("dump", dpl);
+  }
+  // Diagnostics snapshot (firmware v26+): m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>
+  else if (cmd == 'Q' && *p == ':') {
+    char qb[48];
+    strlcpy(qb, p + 1, sizeof(qb));
+    for (int k = (int)strlen(qb)-1; k >= 0 && (qb[k]=='\n'||qb[k]=='\r'||qb[k]==' '); k--) qb[k] = 0;
+    char* qf[5] = {0}; qf[0] = qb; int qi = 1;
+    for (char* cp = qb; *cp && qi < 5; cp++) { if (*cp == ':') { *cp = 0; qf[qi++] = cp + 1; } }
+    int rc   = (qf[0] && qf[0][0]) ? atoi(qf[0]) : 0;
+    int boot = (qf[1] && qf[1][0]) ? atoi(qf[1]) : 0;
+    int vcc  = (qf[2] && qf[2][0]) ? atoi(qf[2]) : 0;
+    int ee   = (qf[3] && qf[3][0]) ? atoi(qf[3]) : 0;
+    int cur  = (qf[4] && qf[4][0]) ? atoi(qf[4]) : -1;
+    DBG("[SF] Module %d diag Q: rc=%d boot=%d vcc=%d ee=%d cur=%d\n", id, rc, boot, vcc, ee, cur);
+    if (sfDiagQWaitId == (int)id) {
+      sfDiagQReset = rc; sfDiagQBoot = boot; sfDiagQVcc = vcc; sfDiagQEe = ee; sfDiagQCur = cur;
+      sfDiagQTs = millis();
+    }
+    char payload[96];
+    snprintf(payload, sizeof(payload),
+      "{\"id\":%d,\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d}",
+      id, rc, boot, vcc, ee, cur);
+    mqttPublishSFEvent("diag", payload);
+  }
+  // Mechanical self-test (firmware v26+): m<id>M:<code>:<min>:<max>:<spreadTenthsPct>
+  else if (cmd == 'M' && *p == ':') {
+    char mb[48];
+    strlcpy(mb, p + 1, sizeof(mb));
+    for (int k = (int)strlen(mb)-1; k >= 0 && (mb[k]=='\n'||mb[k]=='\r'||mb[k]==' '); k--) mb[k] = 0;
+    char* mf[4] = {0}; mf[0] = mb; int mi = 1;
+    for (char* cp = mb; *cp && mi < 4; cp++) { if (*cp == ':') { *cp = 0; mf[mi++] = cp + 1; } }
+    int code = (mf[0] && mf[0][0]) ? atoi(mf[0]) : -1;
+    int mn   = (mf[1] && mf[1][0]) ? atoi(mf[1]) : 0;
+    int mx   = (mf[2] && mf[2][0]) ? atoi(mf[2]) : 0;
+    int spr  = (mf[3] && mf[3][0]) ? atoi(mf[3]) : 0;
+    DBG("[SF] Module %d diag M: code=%d min=%d max=%d spread=%d\n", id, code, mn, mx, spr);
+    if (sfDiagMWaitId == (int)id) {
+      sfDiagMCode = code; sfDiagMMin = mn; sfDiagMMax = mx; sfDiagMSpread = spr;
+      sfDiagMTs = millis();
+    }
+    char payload[80];
+    snprintf(payload, sizeof(payload),
+      "{\"id\":%d,\"code\":%d,\"min\":%d,\"max\":%d,\"spreadTenths\":%d}",
+      id, code, mn, mx, spr);
+    mqttPublishSFEvent("diag", payload);
   }
 }
 
@@ -2012,6 +2410,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Accept either a plain ASCII frame ("m9h\n") or JSON ({"data":"m9h\n"}).
   if (strcmp(topic, sendTopic) == 0) {
     const char* d = nullptr;
+    bool raw = false;   // optional {"raw":true} -> send verbatim, bypass sanitization
     // Sized for long commands (e.g. a full restore) sent as a plain frame.
     // static: see note on buf above (single-caller context, stack pressure).
     static char plainBuf[TX_MAX_BYTES + 1];
@@ -2020,6 +2419,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       JsonDocument doc;
       if (deserializeJson(doc, buf) == DeserializationError::Ok) {
         d = doc["data"] | "";
+        raw = doc["raw"] | false;
       }
     } else {
       // Plain string -- use as-is
@@ -2034,7 +2434,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       static uint8_t outBuf[TX_MAX_BYTES];  // static: see note on buf above
       size_t  outLen = min(strlen(d), (size_t)TX_MAX_BYTES);
       memcpy(outBuf, d, outLen);
-      rs485Send(outBuf, outLen);
+      rs485Send(outBuf, outLen, raw);
     }
     return;
   }
@@ -2209,6 +2609,7 @@ void handleRoot() {
   server.sendContent(".quiet-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.82rem;color:var(--dim);user-select:none}.quiet-toggle input{width:auto;margin:0;cursor:pointer}.quiet-toggle.active{color:var(--qt);font-weight:bold}body.quiet-on{box-shadow:inset 0 0 0 3px var(--qt)}body.maint-on.quiet-on{box-shadow:inset 0 0 0 3px var(--ylw),inset 0 0 0 6px var(--qt)}.quiet-banner{display:none;background:var(--qt);color:#06222a;text-align:center;padding:5px;font-size:.82rem;font-weight:bold}body.quiet-on .quiet-banner{display:block}");
   server.sendContent(".unprovisioned{border-color:var(--hi)}");
   server.sendContent("#sr{font-size:.8rem;color:var(--grn);min-height:16px;margin-top:5px}");
+  server.sendContent(".sendrow{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px}.raw-toggle{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:.82rem;color:var(--dim);user-select:none;margin:0}.raw-toggle input{width:auto;margin:0;cursor:pointer}.lsan{display:inline-block;margin-left:8px;padding:0 5px;border-radius:3px;background:var(--ylw);color:#1a1206;font-size:.66rem;font-weight:bold;letter-spacing:.03em;vertical-align:middle}");
   server.sendContent(".cmods{display:grid;gap:5px;grid-template-columns:repeat(auto-fill,minmax(48px,1fr))}.cmod{text-align:center;padding:6px 4px;background:#0d1b2a;border:1px solid var(--acc);border-radius:5px;cursor:pointer;font-family:monospace;font-size:.85rem;color:var(--txt)}.cmod:hover{border-color:var(--hi)}.cmod.sel{background:var(--hi);border-color:var(--hi);color:#fff;font-weight:bold}.cmod .csn{display:block;font-size:.6rem;color:var(--dim)}.cmod.sel .csn{color:#ffd}.cmod.known{border-color:var(--grn)}.cmod.legacy{border-color:var(--ylw)}.cmod.unknown{opacity:.6}.cmod .csn.lg{color:var(--ylw)}.cmods.single{display:flex;flex-wrap:wrap}");
   server.sendContent(".cedit{display:flex;gap:14px;flex-wrap:wrap;background:#0a0a0a;border-radius:6px;padding:10px 14px;margin-bottom:8px}.cedit .cb{flex:1;min-width:210px}.cedit .ck{font-size:.68rem;color:var(--dim);letter-spacing:.05em;margin-bottom:4px}.cedit .cer{display:flex;gap:5px;align-items:center}.cedit .cer input{flex:1;min-width:60px;font-family:monospace;font-size:1.15rem;font-weight:bold;text-align:center}.cedit .cer input.ho{color:var(--grn)}.cedit .cer input.ts{color:var(--ylw)}.cedit .cer button{margin:0;padding:7px 11px;white-space:nowrap;font-size:.82rem}");
   server.sendContent(".cnudge{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0;align-items:center}.cnudge button{margin:0;padding:5px 9px;font-size:.8rem;background:var(--acc)}.cnudge button.neg{background:#5a2030}.cnudge button.pos{background:#1f5a2a}.cnudge .lbl{font-size:.72rem;color:var(--dim);padding:0 4px}");
@@ -2268,8 +2669,10 @@ void handleRoot() {
   wdgWebMs = millis();
   server.sendContent("<div id=\"pane-calib\" class=\"pane\">");
   server.sendContent("<div class=\"calmaint\"><span class=\"cmtxt\">Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.</span><button onclick=\"calEnableMaint()\">Turn On Maintenance</button></div>");
-  server.sendContent("<div class=\"card\"><h2>Module Calibration</h2>");
-  server.sendContent("<p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Select any module -- known or not -- to view and adjust its home offset, total steps, and per-character flap positions. Changes are written to the module's EEPROM.</p>");
+  server.sendContent("<div class=\"card\"><h2>Calibration</h2>");
+  server.sendContent("<p style=\"font-size:.82rem;color:var(--dim);margin-bottom:8px\">Two ways to calibrate, both using the same nudge controls and writing to each module's EEPROM: sweep the <b>whole board</b> flap-by-flap (fast for a full wall -- every module shows the same flap at once and you nudge only the ones that look wrong), or pick a <b>single module</b> below to adjust it on its own.</p>");
+  server.sendContent("<button class=\"wizbtn\" onclick=\"bmStart()\">&#x1f3b4; Calibrate Whole Board (all modules at once)</button>");
+  server.sendContent("<p style=\"font-size:.78rem;color:var(--dim);margin:10px 0 4px\">Or pick one module to calibrate individually:</p>");
   server.sendContent("<div id=\"calMods\" class=\"cmods\">Loading modules...</div>");
   server.sendContent("<div style=\"display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px\"><button class=\"sec\" onclick=\"calLoadModules()\" style=\"margin:0\">&#x21bb; Refresh</button><span style=\"color:var(--dim);font-size:.8rem\">or tune any ID:</span><input id=\"calAnyId\" type=\"number\" min=\"0\" max=\"254\" placeholder=\"0-254\" style=\"width:90px;margin:0\"><button onclick=\"calSelectAny()\" style=\"margin:0\">Go</button></div></div>");
   server.sendContent("<div id=\"calDetail\" class=\"card\" style=\"display:none\">");
@@ -2292,6 +2695,7 @@ void handleRoot() {
   server.sendContent("<div class=\"wizbox\"><div id=\"wizStep1\"><h3>Before you start (1 of 2)</h3><p style=\"font-size:.86rem;color:var(--txt);margin:6px 0 4px\">Have you run <b>Calibrate (Count Steps)</b> on this module to confirm the reel's actual step count?</p><p style=\"font-size:.78rem;color:var(--dim);margin:0 0 14px\">The wizard relies on the measured step count to place each flap. If it is wrong, every flap will be off. Calibrate first if you haven't.</p><button class=\"wconfirm\" onclick=\"calWizStep2()\">Yes -- step count is confirmed</button><button class=\"wreset\" style=\"background:var(--acc)\" onclick=\"calWizIntroCalibrate()\">No -- run Calibrate now</button><button class=\"wskip\" style=\"width:100%;margin-top:8px;padding:9px;background:#444\" onclick=\"calWizIntroCancel()\">Cancel</button></div>");
   server.sendContent("<div id=\"wizStep2\" style=\"display:none\"><h3>Before you start (2 of 2)</h3><p style=\"font-size:.86rem;color:var(--txt);margin:6px 0 4px\">Has the <b>home position</b> been confirmed? When homed, the blank (black) flap should sit centered in the window.</p><p style=\"font-size:.78rem;color:var(--dim);margin:0 0 14px\">This is the home offset. If the blank flap is off-center, every character will be too. Confirm it now if you haven't.</p><button class=\"wconfirm\" onclick=\"calWizIntroYes()\">Yes -- home is confirmed, start wizard</button><button class=\"wreset\" style=\"background:var(--acc)\" onclick=\"calWizHomeStage()\">Confirm / adjust home position now</button><button class=\"wskip\" style=\"width:100%;margin-top:8px;padding:9px;background:#444\" onclick=\"calWizIntroCancel()\">Cancel</button></div>");
   server.sendContent("<div id=\"wizStep3\" style=\"display:none\"><h3>Confirm home position</h3><div style=\"font-size:.8rem;color:var(--dim)\">This flap should be showing on the reel (homed):</div><div class=\"wizchar\"><span class=\"wsw\" style=\"background:#000\"></span></div><div class=\"wizsub\">BLANK (home). Press Re-home, then nudge until the blank flap is centered. Nudges save instantly.</div><div class=\"wiztarget\" id=\"wizHoVal\">offset -</div><div class=\"wiznudge\"><button class=\"neg\" onclick=\"calWizHomeNudge(-32)\">-32</button><button class=\"neg\" onclick=\"calWizHomeNudge(-16)\">-16</button><button class=\"neg\" onclick=\"calWizHomeNudge(-4)\">-4</button><button class=\"neg\" onclick=\"calWizHomeNudge(-1)\">-1</button><button class=\"pos\" onclick=\"calWizHomeNudge(1)\">+1</button><button class=\"pos\" onclick=\"calWizHomeNudge(4)\">+4</button><button class=\"pos\" onclick=\"calWizHomeNudge(16)\">+16</button><button class=\"pos\" onclick=\"calWizHomeNudge(32)\">+32</button></div><button class=\"wreset\" style=\"background:var(--acc)\" onclick=\"calWizHomeRehome()\">Re-home (verify)</button><button class=\"wconfirm\" onclick=\"calWizIntroYes()\">Home is centered -- start wizard</button><button class=\"wskip\" style=\"width:100%;margin-top:8px;padding:9px;background:#444\" onclick=\"calWizStep2Back()\">Back</button><div class=\"wizstat\" id=\"wizHoStat\"></div></div></div></div>");
+  server.sendContent("<div id=\"bmModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:190;align-items:center;justify-content:center\"><div class=\"wizbox\" style=\"max-width:560px\"><h3>Calibrate Whole Board</h3><div class=\"wizprog\" id=\"bmProg\">-</div><div class=\"wizbar\"><div id=\"bmBar\"></div></div><div style=\"font-size:.8rem;color:var(--dim)\">Every module should be showing this flap:</div><div class=\"wizchar\" id=\"bmChar\">-</div><div class=\"wizsub\">Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.</div><div id=\"bmGrid\" class=\"cmods\" style=\"margin:10px 0\">Loading...</div><div class=\"wizrow\"><button class=\"wback\" onclick=\"bmPrev()\">&#x2190; Prev</button><button class=\"wskip\" onclick=\"bmSkip()\">Skip</button><button class=\"wconfirm\" style=\"margin-top:0\" onclick=\"bmNext()\">Next &#x2192;</button></div><div class=\"wizrow\" style=\"align-items:center\"><span style=\"font-size:.76rem;color:var(--dim)\">Jump to flap:</span><input id=\"bmJumpIn\" type=\"number\" min=\"1\" max=\"64\" style=\"width:64px;margin:0\"><button class=\"sec\" style=\"margin:0\" onclick=\"bmJump()\">Go</button><button class=\"wexit\" onclick=\"bmFinish()\">Finish</button></div><div class=\"wizstat\" id=\"bmStat\"></div></div></div>");
   server.sendContent("</div>");
   server.sendContent("<div id=\"pane-backup\" class=\"pane\">");
   server.sendContent("<div class=\"card\"><h2>Backup Calibration</h2>");
@@ -2316,7 +2720,7 @@ void handleRoot() {
   server.sendContent("<label style=\"margin:0;display:flex;align-items:center;gap:5px;color:var(--txt)\"><input type=\"checkbox\" id=\"asc\" checked style=\"width:auto\" onchange=\"saveMonPrefs()\"> Auto-scroll</label>");
   server.sendContent("<label style=\"margin:0;display:flex;align-items:center;gap:5px;color:var(--txt)\" title=\"Stops fetching new frames. Frames beyond the 64-entry ring are lost while paused.\"><input type=\"checkbox\" id=\"lpause\" style=\"width:auto\" onchange=\"saveMonPrefs()\"> Pause</label>");
   server.sendContent("<span id=\"logCount\" style=\"font-size:.74rem;color:var(--dim)\">0 frames</span></div></div>");
-  server.sendContent("<div class=\"card\"><h2>Send Frame</h2><label>Data (ASCII)</label><textarea id=\"sdata\" rows=\"2\" placeholder=\"m5-A\" onkeydown=\"if(event.key===&#39;Enter&#39;&&!event.shiftKey){event.preventDefault();doSend();}\"></textarea><div id=\"sr\"></div><button onclick=\"doSend()\">Send</button></div></div>");
+  server.sendContent("<div class=\"card\"><h2>Send Frame</h2><label>Data (ASCII)</label><textarea id=\"sdata\" rows=\"2\" placeholder=\"m5-A\" onkeydown=\"if(event.key===&#39;Enter&#39;&&!event.shiftKey){event.preventDefault();doSend();}\"></textarea><div id=\"sr\"></div><div class=\"sendrow\"><button onclick=\"doSend()\">Send</button><label class=\"raw-toggle\"><input type=\"checkbox\" id=\"sraw\"> Raw &mdash; send verbatim, skip sanitizing &amp; framing (debug)</label></div></div></div>");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("<div id=\"pane-settings\" class=\"pane\">");
   server.sendContent("<div class=\"card\"><h2>WiFi</h2>");
@@ -2371,6 +2775,7 @@ void handleRoot() {
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-rtc\">-</div><div class=\"k\">Gateway Time</div></div>");
   server.sendContent("<div class=\"stat\"><div class=\"v\" id=\"s-ntp\">-</div><div class=\"k\">NTP Sync</div></div>");
   server.sendContent("</div></div></div>");
+  server.sendContent("<div id=\"diagModal\" style=\"display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center\" onclick=\"if(event.target===this)closeDiag()\"><div style=\"background:var(--card);border:2px solid var(--acc);border-radius:10px;padding:18px;max-width:520px;width:92%;max-height:88vh;overflow:auto\"><div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:8px\"><h3 id=\"diagTitle\" style=\"margin:0;color:var(--hi)\">Diagnostics</h3><button class=\"sec\" style=\"margin:0;padding:4px 12px\" onclick=\"closeDiag()\">Close</button></div><div id=\"diagBody\" style=\"font-size:.85rem\">-</div></div></div>");
   server.sendContent("<script>");
   server.sendContent("function show(id,el){document.querySelectorAll(\".pane\").forEach(function(p){p.classList.remove(\"on\");});document.querySelectorAll(\"nav a\").forEach(function(a){a.classList.remove(\"on\");});document.getElementById(\"pane-\"+id).classList.add(\"on\");el.classList.add(\"on\");if(id===\"display\"){startWall();}else{stopWall();}if(id===\"calib\"){calLoadModules();}if(id===\"modules\"){loadModules();}}");
   server.sendContent("var _wallTimer=null;function buildWall(s){var w=document.getElementById(\"wall\");if(!w)return;var cells=s.cells||[];var html=\"\";var idx=0;for(var r=0;r<s.rows;r++){html+=\"<div class='wallrow'>\";for(var c=0;c<s.cols;c++){var v=(idx<cells.length)?cells[idx]:null;var cls=\"flap\",disp=\"\";if(v===null){cls+=\" empty\";disp=\"\";}else if(v===\"?\"){cls+=\" unknown\";disp=\"?\";}else{disp=v===\" \"?\"&nbsp;\":v;}html+=\"<div class='\"+cls+\"'>\"+disp+\"</div>\";idx++;}html+=\"</div>\";}w.innerHTML=html;var known=cells.filter(function(x){return x!==null;}).length;document.getElementById(\"wallMeta\").textContent=s.rows+\" x \"+s.cols+\" grid - \"+known+\" module(s) mapped\";}");
@@ -2379,23 +2784,23 @@ void handleRoot() {
   server.sendContent("function stopWall(){if(_wallTimer){clearInterval(_wallTimer);_wallTimer=null;}}");
   wdgWebMs = millis();  // touch WDG during long page send
   server.sendContent("var FC=\" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\";");
-  server.sendContent("function sfDecode(raw){var s=raw.replace(/[\\r\\n]+$/,\"\");if(s.length<2||s[0]!==\"m\")return \"\";if(s[1]===\"X\"){if(s.indexOf(\"mXadv:\")==0)return \"ADV  unprovisioned SN: \"+s.slice(6);if(s.indexOf(\"mXack:\")==0){var r=s.slice(6),ci=r.lastIndexOf(\":\");return ci>=0?\"ACK  SN \"+r.slice(0,ci)+\" -> ID \"+r.slice(ci+1):\"ACK \"+r;}if(s[2]===\"I\"){var ci2=s.indexOf(\":\",3);return ci2>=0?\"PROVISION  SN \"+s.slice(3,ci2)+\" -> ID \"+s.slice(ci2+1):\"PROVISION \"+s.slice(3);}if(s[2]===\"H\")return \"PROVISION  home SN \"+s.slice(3);if(s[2]===\"D\")return \"DUMP       SN \"+s.slice(3);if(s[2]===\"F\")return \"FACTORY RST SN \"+s.slice(3);if(s[2]===\"W\")return \"RESTORE    \"+s.slice(3);return \"PROVISIONING \"+s.slice(2);}var p=1,id=\"\",bc=false;while(p<s.length&&(s[p]===\"*\"||s[p]>=\"0\"&&s[p]<=\"9\")){if(s[p]===\"*\")bc=true;else id+=s[p];p++;}var who=bc?\"ALL\":\"#\"+id;if(p>=s.length)return who+\" (incomplete)\";var cmd=s[p],rest=s.slice(p+1);if(cmd===\"-\"){var fi=FC.indexOf(rest[0]||\"\");var sfx=fi>=0?\" (idx \"+fi+\")\":\"\";return \"SHOW CHAR    \"+who+\" -> [\"+(rest[0]||\"?\")+\"]\"+sfx;}if(cmd===\"+\"){var n=parseInt(rest);var ch=isNaN(n)?\"?\":(FC[n]||\"?\");return \"SHOW INDEX   \"+who+\" -> \"+n+\" [\"+ch+\"]\";}if(cmd===\"h\")return \"HOME         \"+who;if(cmd===\"c\")return rest?\"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\":\"CALIBRATE    \"+who;if(cmd===\"o\")return \"HOME OFFSET  \"+who+\" = \"+rest+\" steps\";if(cmd===\"t\")return \"TOTAL STEPS  \"+who+\" = \"+rest;if(cmd===\"s\")return \"NUDGE        \"+who+\" \"+rest+\" steps\";if(cmd===\"g\")return \"GOTO STEP    \"+who+\" -> step \"+rest;if(cmd===\"w\"){var wci=rest.indexOf(\":\");return wci>=0?\"WRITE POS    \"+who+\" idx \"+rest.slice(0,wci)+\" -> \"+rest.slice(wci+1)+\" steps\":\"WRITE POS    \"+who+\" \"+rest;}if(cmd===\"i\")return \"SET ID       \"+who+\" -> ID \"+rest;if(cmd===\"a\")return \"AUTO-HOME    \"+who+(rest===\"1\"?\" ON\":\" OFF\");if(cmd===\"d\")return rest&&rest[0]===\":\"?\"DUMP RESP    \"+who+\" \"+rest.slice(1):\"DUMP?        \"+who;if(cmd===\"e\")return \"ERASE MAP    \"+who;if(cmd===\":\")return \"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\";if(cmd===\"v\"){if(rest&&rest[0]===\":\"){var vp=rest.slice(1).split(\":\");var vs=\"VERSION RESP \"+who+\" fw:\"+vp[0];if(vp.length>1&&vp[1]!==\"\")vs+=\" id:\"+vp[1];if(vp.length>2&&vp[2]!==\"\")vs+=\" sn:\"+vp[2];return vs;}return \"VERSION?     \"+who;}if(cmd===\"R\")return \"RESET PROV   \"+who;if(cmd===\"F\")return \"FACTORY RST  \"+who;return \"CMD [\"+cmd+\"] \"+who+(rest?\" \"+rest:\"\");}");
+  server.sendContent("function sfDecode(raw){var s=raw.replace(/[\\r\\n]+$/,\"\");if(s.length<2||s[0]!==\"m\")return \"\";if(s[1]===\"X\"){if(s.indexOf(\"mXadv:\")==0)return \"ADV  unprovisioned SN: \"+s.slice(6);if(s.indexOf(\"mXack:\")==0){var r=s.slice(6),ci=r.lastIndexOf(\":\");return ci>=0?\"ACK  SN \"+r.slice(0,ci)+\" -> ID \"+r.slice(ci+1):\"ACK \"+r;}if(s[2]===\"I\"){var ci2=s.indexOf(\":\",3);return ci2>=0?\"PROVISION  SN \"+s.slice(3,ci2)+\" -> ID \"+s.slice(ci2+1):\"PROVISION \"+s.slice(3);}if(s[2]===\"H\")return \"PROVISION  home SN \"+s.slice(3);if(s[2]===\"D\")return \"DUMP       SN \"+s.slice(3);if(s[2]===\"A\")return \"ALL FIELDS SN \"+s.slice(3);if(s[2]===\"F\")return \"FACTORY RST SN \"+s.slice(3);if(s[2]===\"W\")return \"RESTORE    \"+s.slice(3);return \"PROVISIONING \"+s.slice(2);}var p=1,id=\"\",bc=false;while(p<s.length&&(s[p]===\"*\"||s[p]>=\"0\"&&s[p]<=\"9\")){if(s[p]===\"*\")bc=true;else id+=s[p];p++;}var who=bc?\"ALL\":\"#\"+id;if(p>=s.length)return who+\" (incomplete)\";var cmd=s[p],rest=s.slice(p+1);if(cmd===\"-\"){var fi=FC.indexOf(rest[0]||\"\");var sfx=fi>=0?\" (idx \"+fi+\")\":\"\";return \"SHOW CHAR    \"+who+\" -> [\"+(rest[0]||\"?\")+\"]\"+sfx;}if(cmd===\"+\"){var n=parseInt(rest);var ch=isNaN(n)?\"?\":(FC[n]||\"?\");return \"SHOW INDEX   \"+who+\" -> \"+n+\" [\"+ch+\"]\";}if(cmd===\"h\")return \"HOME         \"+who;if(cmd===\"c\")return rest?\"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\":\"CALIBRATE    \"+who;if(cmd===\"o\")return \"HOME OFFSET  \"+who+\" = \"+rest+\" steps\";if(cmd===\"t\")return \"TOTAL STEPS  \"+who+\" = \"+rest;if(cmd===\"s\")return \"NUDGE        \"+who+\" \"+rest+\" steps\";if(cmd===\"g\")return \"GOTO STEP    \"+who+\" -> step \"+rest;if(cmd===\"w\"){var wci=rest.indexOf(\":\");return wci>=0?\"WRITE POS    \"+who+\" idx \"+rest.slice(0,wci)+\" -> \"+rest.slice(wci+1)+\" steps\":\"WRITE POS    \"+who+\" \"+rest;}if(cmd===\"i\")return \"SET ID       \"+who+\" -> ID \"+rest;if(cmd===\"a\")return \"AUTO-HOME    \"+who+(rest===\"1\"?\" ON\":\" OFF\");if(cmd===\"d\")return rest&&rest[0]===\":\"?\"DUMP RESP    \"+who+\" \"+rest.slice(1):\"DUMP?        \"+who;if(cmd===\"e\")return \"ERASE MAP    \"+who;if(cmd===\":\")return \"CALIB RESP   \"+who+\" \"+rest+\" steps/rev\";if(cmd===\"v\"){if(rest&&rest[0]===\":\"){var vp=rest.slice(1).split(\":\");var vs=\"VERSION RESP \"+who+\" fw:\"+vp[0];if(vp.length>1&&vp[1]!==\"\")vs+=\" id:\"+vp[1];if(vp.length>2&&vp[2]!==\"\")vs+=\" sn:\"+vp[2];return vs;}return \"VERSION?     \"+who;}if(cmd===\"A\"){if(rest&&rest[0]===\":\"){var ap=rest.slice(1).split(\":\");var as=\"ALL RESP     \"+who+\" fw:\"+ap[0];if(ap[1])as+=\" id:\"+ap[1];if(ap[2])as+=\" sn:\"+ap[2];if(ap[3]!==undefined)as+=\" ho:\"+ap[3];if(ap[4]!==undefined)as+=\" ts:\"+ap[4];if(ap[5]!==undefined)as+=\" ah:\"+ap[5];if(ap[6]!==undefined)as+=\" ci:\"+ap[6];return as;}return \"ALL FIELDS   \"+who;}if(cmd===\"R\")return \"RESET PROV   \"+who;if(cmd===\"F\")return \"FACTORY RST  \"+who;return \"CMD [\"+cmd+\"] \"+who+(rest?\" \"+rest:\"\");}");
   server.sendContent("var _lfc=0;var _loglines=[];function loadMonPrefs(){try{var a=localStorage.getItem(\"sfgw_asc\");if(a!==null)document.getElementById(\"asc\").checked=(a===\"1\");var p=localStorage.getItem(\"sfgw_pause\");if(p!==null)document.getElementById(\"lpause\").checked=(p===\"1\");}catch(e){}}function saveMonPrefs(){try{localStorage.setItem(\"sfgw_asc\",document.getElementById(\"asc\").checked?\"1\":\"0\");localStorage.setItem(\"sfgw_pause\",document.getElementById(\"lpause\").checked?\"1\":\"0\");}catch(e){}}function downloadLog(){if(!_loglines.length){return;}var blob=new Blob([_loglines.join(\"\\n\")+\"\\n\"],{type:\"text/plain\"});var url=URL.createObjectURL(blob);var a=document.createElement(\"a\");var ts=new Date().toISOString().replace(/[:.]/g,\"-\").slice(0,19);a.href=url;a.download=\"splitflap-buslog-\"+ts+\".txt\";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);}loadMonPrefs();");
   server.sendContent("function clearLog(){document.getElementById(\"log\").innerHTML=\"\";_lfc=0;document.getElementById(\"logCount\").textContent=\"0 frames\";}");
-  server.sendContent("function appendLogRow(m){var log=document.getElementById(\"log\");var ascii=(m.command||\"\").replace(/[\\r\\n]/g,\"\");var desc=sfDecode(ascii);var safeR=ascii.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var safeD=desc.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var ts=m.ep?new Date(m.ep*1000).toLocaleTimeString([],{hour12:false}):(m.wt?m.wt:(m.ts<60000?m.ts+\"ms\":Math.floor(m.ts/1000)+\"s\"));var row=document.createElement(\"div\");row.className=\"logrow \"+(m.dir===\"R\"?\"rx\":\"tx\");row.innerHTML=\"<span class=\\\"lts\\\">\"+ts+\"</span>\"+\"<span class=\\\"ldir\\\">\"+(m.dir===\"R\"?\"RX\":\"TX\")+\"</span>\"+\"<span class=\\\"lraw\\\">\"+safeR+\"</span>\";if(desc)row.innerHTML+=\"<span class=\\\"ldesc\\\">\"+safeD+\"</span>\";log.appendChild(row);_loglines.push(ts+\" \"+(m.dir===\"R\"?\"RX\":\"TX\")+\" \"+ascii+(desc?\"  [\"+desc+\"]\":\"\"));if(_loglines.length>5000)_loglines.splice(0,_loglines.length-5000);_lfc++;document.getElementById(\"logCount\").textContent=_lfc+\" frame\"+(_lfc===1?\"\":\"s\");if(document.getElementById(\"asc\").checked)log.scrollTop=log.scrollHeight;}");
+  server.sendContent("function appendLogRow(m){var log=document.getElementById(\"log\");var ascii=(m.command||\"\").replace(/[\\r\\n]/g,\"\");var desc=sfDecode(ascii);var safeR=ascii.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var safeD=desc.replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");var ts=m.ep?new Date(m.ep*1000).toLocaleTimeString([],{hour12:false}):(m.wt?m.wt:(m.ts<60000?m.ts+\"ms\":Math.floor(m.ts/1000)+\"s\"));var row=document.createElement(\"div\");row.className=\"logrow \"+(m.dir===\"R\"?\"rx\":\"tx\");row.innerHTML=\"<span class=\\\"lts\\\">\"+ts+\"</span>\"+\"<span class=\\\"ldir\\\">\"+(m.dir===\"R\"?\"RX\":\"TX\")+\"</span>\"+\"<span class=\\\"lraw\\\">\"+safeR+\"</span>\";if(desc)row.innerHTML+=\"<span class=\\\"ldesc\\\">\"+safeD+\"</span>\";if(m.san)row.innerHTML+=\"<span class=\\\"lsan\\\">sanitized</span>\";log.appendChild(row);_loglines.push(ts+\" \"+(m.dir===\"R\"?\"RX\":\"TX\")+\" \"+ascii+(desc?\"  [\"+desc+\"]\":\"\")+(m.san?\"  (sanitized)\":\"\"));if(_loglines.length>5000)_loglines.splice(0,_loglines.length-5000);_lfc++;document.getElementById(\"logCount\").textContent=_lfc+\" frame\"+(_lfc===1?\"\":\"s\");if(document.getElementById(\"asc\").checked)log.scrollTop=log.scrollHeight;}");
   server.sendContent("setInterval(function(){if(document.getElementById(\"lpause\").checked)return;fetch(\"/api/rs485/messages\").then(function(r){return r.json();}).then(function(arr){arr.forEach(appendLogRow);}).catch(function(){});},600);");
-  server.sendContent("function doSend(){var data=document.getElementById(\"sdata\").value.trim();if(!data){document.getElementById(\"sr\").textContent=\"Nothing to send.\";return;}fetch(\"/api/rs485/send\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({data:data})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"sr\").textContent=j.ok?\"Sent \"+j.bytes+\" bytes\":\"Error: \"+j.error;}).catch(function(e){document.getElementById(\"sr\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function doSend(){var data=document.getElementById(\"sdata\").value.trim();if(!data){document.getElementById(\"sr\").textContent=\"Nothing to send.\";return;}var raw=document.getElementById(\"sraw\").checked;fetch(\"/api/rs485/send\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({data:data,raw:raw})}).then(function(r){return r.json();}).then(function(j){document.getElementById(\"sr\").textContent=j.ok?(\"Sent \"+j.bytes+\" bytes\"+(j.raw?\" (raw)\":\"\")):(\"Error: \"+j.error);}).catch(function(e){document.getElementById(\"sr\").textContent=\"Error: \"+e;});}");
   server.sendContent("function apiFlapCmd(path,body){return fetch(path,{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(body)}).then(function(r){return r.json();});}");
   server.sendContent("function parseDump(raw){if(!raw)return{error:\"No data\"};var parts=raw.split(\":\");if(parts.length<2)return{error:\"Invalid format\",raw:raw};var r={homeOffset:parseInt(parts[0]),totalSteps:parseInt(parts[1]),map:{}};if(parts[2])parts[2].split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\")r.map[parseInt(kv[0])]=parseInt(kv[1]);});return r;}");
   server.sendContent("function refreshModules(){var el=document.getElementById(\"refreshR\");el.textContent=\"Identifying...\";fetch(\"/api/flap/identify\",{method:\"POST\"}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"List cleared, identifying all modules -- refreshing in 2s\":\"Error: \"+j.error;if(j.ok)setTimeout(function(){loadModules();},2000);setTimeout(function(){loadModules();el.textContent=\"\";},7000);}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function doBackup(){var prog=document.getElementById(\"backupProg\");var res=document.getElementById(\"backupR\");res.textContent=\"\";prog.textContent=\"Loading module list...\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(mods){var targets=mods.filter(function(m){return m.sn&&m.sn.length>0;});if(!targets.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules with serial numbers found. Run Identify All first.</span>\";return;}var out={version:1,created:new Date().toISOString(),modules:[]};var i=0,okN=0,failN=0;function next(){if(i>=targets.length){prog.textContent=\"\";if(!out.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No calibration data could be read.</span>\";return;}var blob=new Blob([JSON.stringify(out,null,2)],{type:\"application/json\"});var url=URL.createObjectURL(blob);var a=document.createElement(\"a\");var ts=new Date().toISOString().replace(/[:.]/g,\"-\").slice(0,19);a.href=url;a.download=\"splitflap-backup-\"+ts+\".json\";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Backup created: \"+okN+\" module(s) saved\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\";return;}var m=targets[i];prog.textContent=\"Reading module \"+(i+1)+\" of \"+targets.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:m.id})}).then(function(r){return r.json();}).then(function(d){if(d.ok&&d.dump){out.modules.push({sn:m.sn,id:m.id,dump:d.dump});okN++;}else{failN++;}i++;next();}).catch(function(){failN++;i++;next();});}next();}).catch(function(e){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Error: \"+e+\"</span>\";});}function parseBackupDump(raw){var parts=raw.split(\":\");if(parts.length<2)return null;var ho=parseInt(parts[0]),ts=parseInt(parts[1]);if(isNaN(ho)||isNaN(ts))return null;var map=parts.length>2?parts.slice(2).join(\":\"):\"\";return {homeOffset:ho,totalSteps:ts,map:map};}function doRestore(){var prog=document.getElementById(\"restoreProg\");var res=document.getElementById(\"restoreR\");var fileInput=document.getElementById(\"restoreFile\");var preserve=document.getElementById(\"preserveId\").checked;res.textContent=\"\";if(!fileInput.files||!fileInput.files.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Choose a backup file first.</span>\";return;}var reader=new FileReader();reader.onload=function(){var data;try{data=JSON.parse(reader.result);}catch(e){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Invalid JSON file.</span>\";return;}if(!data||!Array.isArray(data.modules)||!data.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules found in backup file.</span>\";return;}var mods=data.modules,i=0,okN=0,failN=0;function next(){if(i>=mods.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Restore complete: \"+okN+\" module(s)\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\"+(preserve?\"\":\" IDs were reassigned from the backup.\");return;}var m=mods[i];if(!m.sn){failN++;i++;next();return;}var p=parseBackupDump(m.dump||\"\");if(!p){failN++;i++;next();return;}prog.textContent=\"Restoring module \"+(i+1)+\" of \"+mods.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/restorebysn\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,homeOffset:p.homeOffset,totalSteps:p.totalSteps,map:p.map})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){failN++;i++;next();return;}if(!preserve&&typeof m.id===\"number\"&&m.id>=0){fetch(\"/api/flap/provision\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,id:m.id})}).then(function(r){return r.json();}).then(function(){okN++;i++;next();}).catch(function(){okN++;i++;next();});}else{okN++;i++;next();}}).catch(function(){failN++;i++;next();});}next();};reader.onerror=function(){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Could not read file.</span>\";};reader.readAsText(fileInput.files[0]);}");
-  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?(\"ID: <span class='mid'>\"+m.id+\"</span>\"+(legacy?\"<span class='mlegacy' title='Firmware v7 or earlier: no serial number, no provisioning, no factory reset. Homing and calibration are fully supported.'>LEGACY</span>\":\"\")):\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var delBtn=legacy?(\"<button class='micon del dis' title='Not available on legacy (v7) modules' onclick=\\\"event.stopPropagation()\\\">&#x1f5d1;</button>\"):(\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\");var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+delBtn+\"</div>\"):\"\";var snStr=legacy?\"SN: <span style='color:var(--dim)'>n/a (legacy)</span>\":(\"SN: \"+m.sn);var fwStr=legacy?\"<br><span class='mc'>FW: v7 or earlier</span>\":(m.fwVersion?\"<br><span class='mc'>FW: \"+(m.fwVersion==\"<18\"?\"older (pre-v18)\":(\"v\"+m.fwVersion))+\"</span>\":\"\");h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>\"+snStr+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+fwStr+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
+  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?(\"ID: <span class='mid'>\"+m.id+\"</span>\"+(legacy?\"<span class='mlegacy' title='Firmware v7 or earlier: no serial number, no provisioning, no factory reset. Homing and calibration are fully supported.'>LEGACY</span>\":\"\")+(m.dupSuspect?\"<span style='display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;background:var(--hi);color:#fff;font-size:.66rem;font-weight:bold;vertical-align:middle' title='Repeated corrupt version replies for this ID -- two modules may share it. Deprovision and reassign unique IDs.'>DUP ID?</span>\":\"\")):\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var delBtn=legacy?(\"<button class='micon del dis' title='Not available on legacy (v7) modules' onclick=\\\"event.stopPropagation()\\\">&#x1f5d1;</button>\"):(\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\");var fwn=m.fwVersion?parseInt(m.fwVersion):0;var diagBtn=(m.provisioned&&fwn>=26)?(\"<button class='micon' title='Run self-diagnostics (mechanical + stats)' onclick=\\\"runDiag(\"+m.id+\")\\\">&#x1fa7a;</button>\"):\"\";var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+diagBtn+delBtn+\"</div>\"):\"\";var snStr=legacy?\"SN: <span style='color:var(--dim)'>n/a (legacy)</span>\":(\"SN: \"+m.sn);var fwStr=legacy?\"<br><span class='mc'>FW: v7 or earlier</span>\":(m.fwVersion?\"<br><span class='mc'>FW: \"+(m.fwVersion==\"<18\"?\"older (pre-v18)\":(\"v\"+m.fwVersion))+\"</span>\":\"\");h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>\"+snStr+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+fwStr+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
   server.sendContent("loadModules();setInterval(loadModules,5000);");
   server.sendContent("function loadUnprovisioned(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var el=document.getElementById(\"unprovList\");var up=arr.filter(function(m){return !m.provisioned;});if(!up.length){el.innerHTML=\"<p style=\\\"color:var(--dim)\\\">No unprovisioned modules seen yet.</p>\";return;}var h=\"\";up.forEach(function(m){h+=\"<div style=\\\"display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap\\\">\"+\"<code style=\\\"color:var(--ylw);flex:1;min-width:160px\\\">\"+m.sn+\"</code>\"+\"<button class=\\\"sec\\\" style=\\\"margin:0;padding:4px 10px;font-size:.78rem\\\" onclick=\\\"doHomeSN('\"+m.sn+\"')\\\" title=\\\"Home this module to identify it\\\">Home</button>\"+\"</div>\";});el.innerHTML=h;}).catch(function(){});}");
   server.sendContent("setInterval(loadUnprovisioned,10000);loadUnprovisioned();");
   server.sendContent("function modHome(id){apiFlapCmd(\"/api/flap/home\",{id:id}).then(function(j){loadModules();});}var _infoId=-1;var _delId=-1;function openInfo(id){_infoId=id;document.getElementById(\"modModalTitle\").textContent=\"Module #\"+id;document.getElementById(\"modModal\").style.display=\"flex\";fetchInfo(id);}function refreshDump(){if(_infoId>=0)fetchInfo(_infoId);}function closeModal(){document.getElementById(\"modModal\").style.display=\"none\";_infoId=-1;}");
-  server.sendContent("function fetchInfo(id){var b=document.getElementById(\"modModalBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading module #\"+id+\" ...</p>\";document.getElementById(\"modModalStatus\").textContent=\"\";fetch(\"/api/flap/version\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).catch(function(){}).then(function(){return fetch(\"/api/flap/modules\");}).then(function(r){return r.json();}).then(function(arr){var m=null;arr.forEach(function(x){if(x.id===id)m=x;});fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){b.innerHTML=renderInfo(m,d);document.getElementById(\"modModalStatus\").textContent=d.stale?\"EEPROM is cached -- click Refresh for a fresh read\":\"EEPROM read fresh from module\";}).catch(function(e){b.innerHTML=renderInfo(m,{ok:false,error:String(e)});});}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
-  server.sendContent("function mrow(k,v){return \"<div class='mfield'><span class='mk'>\"+k+\"</span><span class='mv'>\"+v+\"</span></div>\";}function renderInfo(m,d){var h=\"\";if(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;h+=mrow(\"Module ID\",m.id)+mrow(\"Serial Number\",legacy?\"n/a (legacy module)\":(m.sn||\"-\"))+mrow(\"Provisioned\",m.provisioned?(legacy?\"yes (hardcoded ID)\":\"yes\"):\"no\")+mrow(\"Firmware\",m.fwVersion?(\"v\"+m.fwVersion):(legacy?\"v7 or earlier\":\"unknown\"))+mrow(\"Last Char\",m.flapChar?m.flapChar:\"-\")+mrow(\"Last Seen\",m.lastSeenEpoch?new Date(m.lastSeenEpoch*1000).toLocaleString():(m.lastSeen?\"seen (clock not set)\":\"-\"));}else{h+=mrow(\"Module ID\",\"(not in registry)\");}h+=\"<div class='sgh' style='margin-top:12px'>EEPROM</div>\";if(!d||!d.ok){h+=\"<p style='color:var(--hi)'>\"+((d&&d.error)?d.error:\"No EEPROM data\")+\"</p>\";return h;}var p=parseDump(d.dump||\"\");if(p.error){h+=\"<p style='color:var(--hi)'>\"+p.error+\"</p>\";return h;}h+=mrow(\"Home Offset\",p.homeOffset+\" steps\")+mrow(\"Steps / Rev\",p.totalSteps);var keys=Object.keys(p.map);h+=mrow(\"Calibrated Flaps\",keys.length+\" / 64\");if(keys.length){h+=\"<div class='mmap'>\";keys.forEach(function(k){h+=\"[\"+k+\"]=\"+p.map[k]+\" \";});h+=\"</div>\";}h+=mrow(\"Raw\",\"<span style='word-break:break-all;color:var(--dim);font-size:.72rem'>\"+d.dump+\"</span>\");return h;}");
+  server.sendContent("function fetchInfo(id){var b=document.getElementById(\"modModalBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading module #\"+id+\" ...</p>\";var st=document.getElementById(\"modModalStatus\");st.textContent=\"\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var m=null;arr.forEach(function(x){if(x.id===id)m=x;});var fwn=(m&&m.fwVersion)?parseInt(m.fwVersion):0;function done(d,fresh){if(m&&d){if(d.ver)m.fwVersion=d.ver;if(d.sn)m.sn=d.sn;}b.innerHTML=renderInfo(m,d);st.textContent=(d&&d.stale)?\"EEPROM is cached -- click Refresh for a fresh read\":fresh;}if(fwn>=25){fetch(\"/api/flap/all\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(a){done(a,\"Version + EEPROM read in one request (A)\");}).catch(function(e){b.innerHTML=renderInfo(m,{ok:false,error:String(e)});});}else{var vr=null;fetch(\"/api/flap/version\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).catch(function(){return {};}).then(function(v){vr=v;return fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})});}).then(function(r){return r.json();}).then(function(d){if(m&&vr){if(vr.ver)m.fwVersion=vr.ver;if(vr.sn)m.sn=vr.sn;}done(d,\"EEPROM read fresh from module\");}).catch(function(e){b.innerHTML=renderInfo(m,{ok:false,error:String(e)});});}}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
+  server.sendContent("function mrow(k,v){return \"<div class='mfield'><span class='mk'>\"+k+\"</span><span class='mv'>\"+v+\"</span></div>\";}function renderInfo(m,d){var h=\"\";if(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;if(m.dupSuspect)h+=mrow(\"<span style='color:var(--hi)'>Possible Duplicate ID</span>\",\"<span style='color:var(--hi)'>Repeated corrupt version replies; two modules may share ID \"+m.id+\". Deprovision and reassign unique IDs.</span>\");h+=mrow(\"Module ID\",m.id)+mrow(\"Serial Number\",legacy?\"n/a (legacy module)\":(m.sn||\"-\"))+mrow(\"Provisioned\",m.provisioned?(legacy?\"yes (hardcoded ID)\":\"yes\"):\"no\")+mrow(\"Firmware\",m.fwVersion?(\"v\"+m.fwVersion):(legacy?\"v7 or earlier\":\"unknown\"))+mrow(\"Last Char\",m.flapChar?m.flapChar:\"-\")+mrow(\"Last Seen\",m.lastSeenEpoch?new Date(m.lastSeenEpoch*1000).toLocaleString():(m.lastSeen?\"seen (clock not set)\":\"-\"));if(d&&typeof d.reportedId===\"number\"&&d.reportedId>=0&&d.reportedId!==m.id)h+=mrow(\"Self-Reported ID\",\"<span style='color:var(--hi)'>\"+d.reportedId+\" (differs from address \"+m.id+\")</span>\");}else{h+=mrow(\"Module ID\",\"(not in registry)\");}h+=\"<div class='sgh' style='margin-top:12px'>EEPROM</div>\";if(!d||!d.ok){h+=\"<p style='color:var(--hi)'>\"+((d&&d.error)?d.error:\"No EEPROM data\")+\"</p>\";return h;}var p=parseDump(d.dump||\"\");if(p.error){h+=\"<p style='color:var(--hi)'>\"+p.error+\"</p>\";return h;}h+=mrow(\"Home Offset\",p.homeOffset+\" steps\")+mrow(\"Steps / Rev\",p.totalSteps);if(d.autoHome===0||d.autoHome===1)h+=mrow(\"Auto-Home\",d.autoHome?\"On (home on boot)\":\"Off (restore saved position)\");if(typeof d.curIndex===\"number\"&&d.curIndex!==-99)h+=mrow(\"Current Flap\",d.curIndex===-2?\"released\":(d.curIndex===-1?\"unknown\":d.curIndex));var keys=Object.keys(p.map);h+=mrow(\"Calibrated Flaps\",keys.length+\" / 64\");if(keys.length){h+=\"<div class='mmap'>\";keys.forEach(function(k){h+=\"[\"+k+\"]=\"+p.map[k]+\" \";});h+=\"</div>\";}return h;}");
   server.sendContent("function openDel(id){_delId=id;document.getElementById(\"delModalTitle\").textContent=\"Module #\"+id+\" -- Destructive Actions\";document.getElementById(\"delModalStatus\").textContent=\"\";document.getElementById(\"delModal\").style.display=\"flex\";}function closeDelModal(){document.getElementById(\"delModal\").style.display=\"none\";_delId=-1;}function delAction(kind){if(_delId<0)return;var names={erase:\"Erase EEPROM\",factoryreset:\"Factory Reset\",deprovision:\"De-provision\"};if(!confirm(names[kind]+\" on module #\"+_delId+\"? This cannot be undone.\"))return;var st=document.getElementById(\"delModalStatus\");st.textContent=names[kind]+\" in progress...\";apiFlapCmd(\"/api/flap/\"+kind,{id:_delId}).then(function(j){st.textContent=j.ok?(names[kind]+\" sent.\"):(\"Error: \"+(j.error||\"failed\"));if(j.ok){setTimeout(function(){closeDelModal();loadModules();},900);}}).catch(function(e){st.textContent=\"Error: \"+e;});}");
   server.sendContent("function sendChar(){var id=parseInt(document.getElementById(\"scId\").value);var ch=document.getElementById(\"scChar\").value.toUpperCase().slice(0,1);var r=document.getElementById(\"scr\");if(!ch){r.textContent=\"Enter a character\";return;}apiFlapCmd(\"/api/flap/char\",{id:id,\"char\":ch}).then(function(j){r.textContent=j.ok?(\"Sent '\"+ch+\"' to \"+(id<0?\"all modules\":\"module #\"+id)):(\"Error: \"+(j.error||\"failed\"));}).catch(function(e){r.textContent=\"Error: \"+e;});}");
   server.sendContent("function sendText(){var text=document.getElementById(\"dispText\").value.toUpperCase();var start=parseInt(document.getElementById(\"dispStart\").value);apiFlapCmd(\"/api/flap/text\",{text:text,start:start}).then(function(j){document.getElementById(\"dr\").textContent=j.ok?\"Sent \"+j.chars+\" chars\":\"Error: \"+j.error;});}");
@@ -2419,9 +2824,21 @@ void handleRoot() {
   server.sendContent("fetch(\"/api/config\").then(function(r){return r.json();}).then(function(c){document.getElementById(\"wSSID\").value=c.wSSID||\"\";document.getElementById(\"mqH\").value=c.mqHost||\"\";document.getElementById(\"mqP\").value=c.mqPort||1883;document.getElementById(\"mqU\").value=c.mqUser||\"\";document.getElementById(\"mqPfx\").value=c.mqPfx||\"splitflap\";if(c.posixTZ){var sel=document.getElementById(\"tzSel\");for(var j=0;j<sel.options.length;j++){if(sel.options[j].value===c.posixTZ){sel.selectedIndex=j;break;}}}if(c.ntpServer){document.getElementById(\"ntpSrv\").value=c.ntpServer;}if(c.gridRows){document.getElementById(\"gRows\").value=c.gridRows;}if(c.gridCols){document.getElementById(\"gCols\").value=c.gridCols;}var hc=document.getElementById(\"haChk\");if(hc)hc.checked=!!c.haEnabled;var dc=document.getElementById(\"dbgChk\");if(dc)dc.checked=!!c.serialDebug;});fetch(\"/api/quiet\").then(function(r){return r.json();}).then(function(q){var qc=document.getElementById(\"quietChk\");if(qc)qc.checked=!!q.on;}).catch(function(){});");
   server.sendContent("var CAL_CHARS=\" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\";var CAL_COLORS={r:\"#e23b3b\",o:\"#ff9f0a\",y:\"#ffd60a\",g:\"#2fb84a\",b:\"#3b82f6\",p:\"#a855f7\",w:\"#e8e8e8\"};");
   server.sendContent("var _calId=-1,_calTotal=4096,_calHo=0,_calMap={},_tuneIdx=-1;var CAL_UNSET=65535,CAL_DEF_HO=2832,CAL_DEF_TS=4096;var _wizIdx=-1,_wizTarget=0;");
+server.sendContent("var _bmFlap=-1,_bmSt=null,_bmArr=[],_bmCorrected={},_bmMaintWas=false;");
   server.sendContent("function calDefault(i){var ts=(_calTotal&&_calTotal>0)?_calTotal:CAL_DEF_TS;return Math.floor((i*ts)/64);}");
   server.sendContent("function calParseDump(raw){var r={homeOffset:0,totalSteps:4096,map:{}};if(!raw)return r;var parts=raw.split(\":\");r.homeOffset=parseInt(parts[0]);r.totalSteps=parseInt(parts[1]);if(isNaN(r.totalSteps))r.totalSteps=4096;if(parts.length>2){var rest=parts.slice(2).join(\":\");rest.split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\"){var k=parseInt(kv[0]),v=parseInt(kv[1]);if(!isNaN(k)&&!isNaN(v)&&v!==CAL_UNSET)r.map[k]=v;}});}return r;}");
-  server.sendContent("function calLoadModules(){var el=document.getElementById(\"calMods\");el.textContent=\"Loading layout...\";Promise.all([fetch(\"/api/display/state\").then(function(r){return r.json();}),fetch(\"/api/flap/modules\").then(function(r){return r.json();})]).then(function(res){var st=res[0]||{},arr=res[1]||[];var rows=st.rows||1,cols=st.cols||16;var count=rows*cols;el.classList.remove(\"single\");el.style.gridTemplateColumns=\"repeat(\"+cols+\",minmax(0,1fr))\";var byId={};arr.forEach(function(m){if(m.provisioned)byId[m.id]=m;});var h=\"\";for(var id=0;id<count;id++){var m=byId[id];var legacy=m&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var known=m&&m.fwVersion;var cls=\"cmod\";if(id===_calId)cls+=\" sel\";if(legacy)cls+=\" legacy\";else if(known)cls+=\" known\";else if(!m)cls+=\" unknown\";var sub=legacy?\"<span class='csn lg'>v7</span>\":(m&&m.sn?\"<span class='csn'>\"+m.sn.slice(-4)+\"</span>\":\"<span class='csn'>--</span>\");h+=\"<div class='\"+cls+\"' data-id='\"+id+\"' onclick='calSelect(\"+id+\")'>\"+id+sub+\"</div>\";}el.innerHTML=h;}).catch(function(){el.innerHTML=\"<span style='color:var(--hi)'>Error loading layout</span>\";});}");
+  server.sendContent("function calLayout(cb){Promise.all([fetch(\"/api/display/state\").then(function(r){return r.json();}),fetch(\"/api/flap/modules\").then(function(r){return r.json();})]).then(function(res){cb(res[0]||{},res[1]||[]);}).catch(function(){cb(null,null);});}");
+  server.sendContent("function calBuildGrid(el,st,arr,cellFn){var rows=st.rows||1,cols=st.cols||16,count=rows*cols;el.classList.remove(\"single\");el.style.gridTemplateColumns=\"repeat(\"+cols+\",minmax(0,1fr))\";var byId={};arr.forEach(function(m){if(m&&m.provisioned)byId[m.id]=m;});var h=\"\";for(var id=0;id<count;id++){h+=cellFn(id,byId[id]);}el.innerHTML=h;}");
+  server.sendContent("function calLoadModules(){var el=document.getElementById(\"calMods\");el.textContent=\"Loading layout...\";calLayout(function(st,arr){if(!st){el.innerHTML=\"<span style='color:var(--hi)'>Error loading layout</span>\";return;}calBuildGrid(el,st,arr,function(id,m){var legacy=m&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var known=m&&m.fwVersion;var cls=\"cmod\";if(id===_calId)cls+=\" sel\";if(legacy)cls+=\" legacy\";else if(known)cls+=\" known\";else if(!m)cls+=\" unknown\";var sub=legacy?\"<span class='csn lg'>v7</span>\":(m&&m.sn?\"<span class='csn'>\"+m.sn.slice(-4)+\"</span>\":\"<span class='csn'>--</span>\");return \"<div class='\"+cls+\"' data-id='\"+id+\"' onclick='calSelect(\"+id+\")'>\"+id+sub+\"</div>\";});});}");
+  server.sendContent("function bmStart(){var chk=document.getElementById(\"maintChk\");_bmMaintWas=chk?chk.checked:false;calEnableMaint();_bmCorrected={};document.getElementById(\"bmModal\").style.display=\"flex\";document.getElementById(\"bmStat\").textContent=\"Loading board layout...\";calLayout(function(st,arr){if(!st){document.getElementById(\"bmStat\").textContent=\"Error loading layout.\";return;}_bmSt=st;_bmArr=arr;_bmFlap=0;bmShow();});}");
+  server.sendContent("function bmShow(){if(_bmFlap<0)return;var i=_bmFlap,n=CAL_CHARS.length;document.getElementById(\"bmProg\").textContent=\"Flap \"+(i+1)+\" of \"+n+\" -- \"+calCharName(i);document.getElementById(\"bmBar\").style.width=Math.round(i/n*100)+\"%\";document.getElementById(\"bmChar\").innerHTML=calCharDisp(i);document.getElementById(\"bmStat\").textContent=\"\";calApi(\"/api/flap/index\",{id:-1,index:i},function(j){if(!j.ok)document.getElementById(\"bmStat\").textContent=\"Move error: \"+j.error;});bmRenderGrid();}");
+  server.sendContent("function bmRenderGrid(){var el=document.getElementById(\"bmGrid\");if(!_bmSt){el.textContent=\"No layout.\";return;}var done=_bmCorrected[_bmFlap]||{};calBuildGrid(el,_bmSt,_bmArr,function(id,m){if(!m)return \"<div class='cmod unknown' style='opacity:.3;cursor:default'>\"+id+\"</div>\";var legacy=m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var cls=\"cmod\"+(done[id]?\" known\":\"\")+(legacy?\" legacy\":\"\");var sub=m.dupSuspect?\"<span class='csn' style='color:var(--hi)'>DUP?</span>\":(done[id]?\"<span class='csn' style='color:var(--grn)'>fixed</span>\":\"<span class='csn'>\"+(m.sn?m.sn.slice(-4):\"--\")+\"</span>\");return \"<div class='\"+cls+\"' onclick='bmCell(\"+id+\")'>\"+id+sub+\"</div>\";});}");
+  server.sendContent("function bmCell(id){if(_bmFlap<0)return;var m=null;_bmArr.forEach(function(x){if(x.id===id)m=x;});if(!m)return;if(m.dupSuspect&&!confirm(\"Module \"+id+\" looks like a DUPLICATE ID -- nudging may move or save the wrong module. Continue?\"))return;document.getElementById(\"bmStat\").textContent=\"Reading module \"+id+\"...\";_calId=id;fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){document.getElementById(\"bmStat\").textContent=\"Error reading module \"+id+\": \"+(d.error||\"no response\");return;}var pp=calParseDump(d.dump||\"\");_calHo=pp.homeOffset;_calTotal=pp.totalSteps;_calMap=pp.map;document.getElementById(\"bmStat\").textContent=\"\";calOpenTune(_bmFlap);}).catch(function(e){document.getElementById(\"bmStat\").textContent=\"Error: \"+e;});}");
+  server.sendContent("function bmNext(){if(_bmFlap<CAL_CHARS.length-1){_bmFlap++;bmShow();}else{document.getElementById(\"bmStat\").textContent=\"Last flap reached -- click Finish.\";}}");
+  server.sendContent("function bmPrev(){if(_bmFlap>0){_bmFlap--;bmShow();}}");
+  server.sendContent("function bmSkip(){bmNext();}");
+  server.sendContent("function bmJump(){var v=parseInt(document.getElementById(\"bmJumpIn\").value);if(isNaN(v)||v<1||v>CAL_CHARS.length){document.getElementById(\"bmStat\").textContent=\"Enter a flap number 1-\"+CAL_CHARS.length+\".\";return;}_bmFlap=v-1;bmShow();}");
+  server.sendContent("function bmFinish(){var chk=document.getElementById(\"maintChk\");if(chk&&chk.checked!==_bmMaintWas){chk.checked=_bmMaintWas;toggleMaint();}document.getElementById(\"bmModal\").style.display=\"none\";_bmFlap=-1;}");
   server.sendContent("function calSelectAny(){var v=parseInt(document.getElementById(\"calAnyId\").value);if(isNaN(v)||v<0||v>254){alert(\"Enter an ID from 0 to 254.\");return;}calSelect(v);}");
   server.sendContent("function calSelect(id){_calId=id;document.querySelectorAll(\"#calMods .cmod\").forEach(function(el){el.classList.toggle(\"sel\",parseInt(el.dataset.id)===id);});var cell=document.querySelector(\"#calMods .cmod[data-id='\"+id+\"']\");var tag=\"\";if(cell){if(cell.classList.contains(\"legacy\"))tag=\" (legacy v7)\";else if(cell.classList.contains(\"unknown\"))tag=\" (not yet seen)\";}document.getElementById(\"calDetail\").style.display=\"block\";document.getElementById(\"calTitle\").textContent=\"Module \"+id+tag;calRefresh();}");
   server.sendContent("function calRefresh(){if(_calId<0)return;var st=document.getElementById(\"calStatus\");st.textContent=\"Reading EEPROM from module \"+_calId+\"...\";document.getElementById(\"calHoIn\").value=\"\";document.getElementById(\"calTsIn\").value=\"\";document.getElementById(\"calMap\").innerHTML=\"\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:_calId})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){st.textContent=\"Error: \"+(d.error||\"no response from module\");return;}var p=calParseDump(d.dump||\"\");_calHo=p.homeOffset;_calTotal=p.totalSteps;_calMap=p.map;document.getElementById(\"calHoIn\").value=isNaN(p.homeOffset)?\"\":p.homeOffset;document.getElementById(\"calTsIn\").value=p.totalSteps;st.textContent=d.stale?\"Cached EEPROM -- click Re-read for a fresh value\":\"EEPROM read fresh from module\";calRenderMap();}).catch(function(e){st.textContent=\"Error: \"+e;});}");
@@ -2439,7 +2856,7 @@ void handleRoot() {
   server.sendContent("function calCloseTune(){document.getElementById(\"tuneModal\").style.display=\"none\";_tuneIdx=-1;}");
   server.sendContent("function calTuneNudge(d){var el=document.getElementById(\"tuneVal\");var v=(parseInt(el.value)||0)+d;if(v<0)v=0;el.value=v;}");
   server.sendContent("function calTuneGoto(){if(_tuneIdx<0)return;var v=parseInt(document.getElementById(\"tuneVal\").value);if(isNaN(v)||v<0){document.getElementById(\"tuneStatus\").textContent=\"Enter a valid step.\";return;}calApi(\"/api/flap/goto\",{id:_calId,step:v},function(j){document.getElementById(\"tuneStatus\").textContent=j.ok?\"Moving to step \"+v+\"... watch the reel.\":\"Error: \"+j.error;});}");
-  server.sendContent("function calTuneLock(){if(_tuneIdx<0)return;var v=parseInt(document.getElementById(\"tuneVal\").value);if(isNaN(v)||v<0){document.getElementById(\"tuneStatus\").textContent=\"Enter a valid step.\";return;}calApi(\"/api/flap/writepos\",{id:_calId,idx:_tuneIdx,pos:v},function(j){if(j.ok){_calMap[_tuneIdx]=v;document.getElementById(\"tuneStatus\").textContent=\"Locked to EEPROM at step \"+v+\".\";calRenderMap();setTimeout(calCloseTune,700);}else{document.getElementById(\"tuneStatus\").textContent=\"Error: \"+j.error;}});}");
+  server.sendContent("function calTuneLock(){if(_tuneIdx<0)return;var v=parseInt(document.getElementById(\"tuneVal\").value);if(isNaN(v)||v<0){document.getElementById(\"tuneStatus\").textContent=\"Enter a valid step.\";return;}calApi(\"/api/flap/writepos\",{id:_calId,idx:_tuneIdx,pos:v},function(j){if(j.ok){_calMap[_tuneIdx]=v;if(_bmFlap>=0){if(!_bmCorrected[_bmFlap])_bmCorrected[_bmFlap]={};_bmCorrected[_bmFlap][_calId]=true;bmRenderGrid();}document.getElementById(\"tuneStatus\").textContent=\"Locked to EEPROM at step \"+v+\".\";calRenderMap();setTimeout(calCloseTune,700);}else{document.getElementById(\"tuneStatus\").textContent=\"Error: \"+j.error;}});}");
   server.sendContent("function calTuneRevert(){if(_tuneIdx<0)return;var def=calDefault(_tuneIdx);calApi(\"/api/flap/writepos\",{id:_calId,idx:_tuneIdx,pos:CAL_UNSET},function(j){if(j.ok){delete _calMap[_tuneIdx];document.getElementById(\"tuneVal\").value=def;document.getElementById(\"tuneStatus\").textContent=\"Unset in EEPROM -- now uses default (\"+def+\").\";calRenderMap();setTimeout(calCloseTune,800);}else{document.getElementById(\"tuneStatus\").textContent=\"Error: \"+j.error;}});}");
   server.sendContent("function calCharDisp(i){var ch=CAL_CHARS[i];if(ch===\" \")return \"<span class='wsw' style='background:#000'></span>\";if(CAL_COLORS[ch])return \"<span class='wsw' style='background:\"+CAL_COLORS[ch]+\"'></span>\";return ch;}");
   server.sendContent("function calCharName(i){var ch=CAL_CHARS[i];if(ch===\" \")return \"BLANK (home)\";if(CAL_COLORS[ch])return ch.toUpperCase()+\" color flap\";return \"'\"+ch+\"'\";}");
@@ -2461,6 +2878,13 @@ void handleRoot() {
   server.sendContent("function calWizBack(){if(_wizIdx>0)_wizIdx--;calWizShow();}");
   server.sendContent("function calWizFinish(){document.getElementById(\"wizModal\").style.display=\"none\";_wizIdx=-1;calRenderMap();document.getElementById(\"calStatus\").textContent=\"Calibration wizard complete -- all flaps reviewed.\";}");
   server.sendContent("function calWizExit(){if(!confirm(\"Exit the wizard? Flaps you already confirmed are saved; the rest are unchanged.\"))return;document.getElementById(\"wizModal\").style.display=\"none\";_wizIdx=-1;calRenderMap();}");
+  server.sendContent("var _diagId=-1;");
+  server.sendContent("function closeDiag(){document.getElementById(\"diagModal\").style.display=\"none\";}");
+  server.sendContent("function diagRow(k,v,warn){return \"<tr><td style='color:var(--dim);padding:3px 12px 3px 0;vertical-align:top;white-space:nowrap'>\"+k+\"</td><td style='\"+(warn?\"color:var(--hi);font-weight:bold\":\"\")+\"'>\"+v+\"</td></tr>\";}");
+  server.sendContent("function diagResetText(rc){if(rc===0)return \"none recorded (0)\";var b=[];if(rc&1)b.push(\"power-on\");if(rc&2)b.push(\"brown-out (supply dipped)\");if(rc&4)b.push(\"external/reset pin\");if(rc&8)b.push(\"watchdog (recovered from a hang)\");if(rc&16)b.push(\"software\");if(!b.length)b.push(\"unknown\");return b.join(\", \")+\" (0x\"+rc.toString(16)+\")\";}");
+  server.sendContent("function diagQSection(q){if(!q)return \"<h4 style='margin:0 0 6px'>Stats snapshot (Q)</h4><p style='color:var(--hi)'>No response to the stats query -- the module did not answer (check it is powered and on the bus).</p>\";var rows=\"\";var rc=q.resetCause;var rcWarn=((rc&2)||(rc&8))?true:false;rows+=diagRow(\"Last reset cause\",diagResetText(rc),rcWarn);rows+=diagRow(\"Boot count\",q.bootCount+\" (since counter reset; wraps at 255)\",false);var vWarn=(q.vcc>0)&&((q.vcc>=4000)?(q.vcc<4500):(q.vcc<3000));var vtxt=(q.vcc>0?(q.vcc/1000).toFixed(2)+\" V\":\"n/a\")+(vWarn?\" -- LOW (risks brown-outs under load)\":\"\");rows+=diagRow(\"Supply voltage\",vtxt,vWarn);rows+=diagRow(\"EEPROM verify\",q.eepromOk?\"passed\":\"FAILED -- calibration storage may be unreliable\",!q.eepromOk);var ci=(q.curIndex===-1)?\"unknown (needs homing)\":((q.curIndex===-2)?\"released\":q.curIndex);rows+=diagRow(\"Current flap index\",ci,false);return \"<h4 style='margin:0 0 6px'>Stats snapshot (Q)</h4><table style='border-collapse:collapse;width:100%'>\"+rows+\"</table>\";}");
+  server.sendContent("function diagMSection(s){var code=s.code;var spread=(s.spreadTenths/10).toFixed(1);var verdict,vcol,detail;if(code===0){verdict=\"OK -- motor, driver and supply are healthy.\";vcol=\"var(--grn)\";detail=\"All revolutions were consistent (spread \"+spread+\"%, within the 5% tolerance).\";}else if(code===1){verdict=\"INCONSISTENT -- intermittent missed steps.\";vcol=\"var(--ylw)\";detail=\"Revolutions varied by \"+spread+\"% (over the 5% limit). Likely mechanical drag or binding, a weak/sagging supply, or a failing motor driver.\";}else if(code===2){verdict=\"NO MOTION -- the reel did not turn.\";vcol=\"var(--hi)\";detail=\"Over a full revolution the home sensor never saw the magnet enter and leave. Likely an open motor coil, a dead driver, or a jam. A dead Hall sensor gives the same result -- if the motor is clearly turning, suspect the sensor.\";}else{verdict=\"Unknown result (code \"+code+\").\";vcol=\"var(--hi)\";detail=\"\";}var rows=diagRow(\"Result\",\"<span style='color:\"+vcol+\";font-weight:bold'>\"+verdict+\"</span>\",false);if(s.min||s.max)rows+=diagRow(\"Steps/rev (min..max)\",s.min+\" .. \"+s.max,false);rows+=diagRow(\"Spread\",spread+\"%\",code===1);return \"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><table style='border-collapse:collapse;width:100%'>\"+rows+\"</table>\"+(detail?\"<p style='font-size:.8rem;color:var(--dim);margin-top:6px'>\"+detail+\"</p>\":\"\");}");
+  server.sendContent("function runDiag(id){_diagId=id;document.getElementById(\"diagTitle\").textContent=\"Diagnostics -- Module \"+id;var b=document.getElementById(\"diagBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading stats snapshot...</p>\";document.getElementById(\"diagModal\").style.display=\"flex\";fetch(\"/api/flap/diag\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(j){if(!j.ok){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+(j.error||\"could not start diagnostics\")+\"</p>\";return;}var html=diagQSection(j.q);html+=\"<div id='diagMsec' style='margin-top:14px'><h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--ylw)'>Motor is spinning through several revolutions -- this can take 20-60s. Please wait...</p></div>\";b.innerHTML=html;var tries=0;var poll=setInterval(function(){tries++;if(tries>115){clearInterval(poll);var e=document.getElementById(\"diagMsec\");if(e)e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>Timed out waiting for the result.</p>\";return;}fetch(\"/api/flap/diag/status\").then(function(r){return r.json();}).then(function(st){if(st.state===\"pending\")return;clearInterval(poll);var e=document.getElementById(\"diagMsec\");if(!e)return;if(st.state===\"done\"){e.innerHTML=diagMSection(st);}else if(st.state===\"timeout\"){e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>No response from the module (timed out). The motor may be jammed, or the module reset during the test.</p>\";}else{e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>The test did not run.</p>\";}}).catch(function(){});},1000);}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
   server.sendContent("</script></body></html>");
   server.sendContent("");
   server.sendContent("");
@@ -2480,13 +2904,14 @@ void handleApiSend() {
     sendJsonError(400, "Bad JSON"); return;
   }
   const char* d = doc["data"] | "";
+  bool raw = doc["raw"] | false;   // optional: send verbatim, bypassing sanitization
   uint8_t outBuf[TX_MAX_BYTES];
   size_t  outLen = min(strlen(d), (size_t)TX_MAX_BYTES);
   memcpy(outBuf, d, outLen);
   if (!outLen) { sendJsonError(400, "Empty data"); return; }
-  rs485Send(outBuf, outLen);
-  char resp[48];
-  snprintf(resp, sizeof(resp), "{\"ok\":true,\"bytes\":%zu}", outLen);
+  rs485Send(outBuf, outLen, raw);
+  char resp[64];
+  snprintf(resp, sizeof(resp), "{\"ok\":true,\"bytes\":%zu,\"raw\":%s}", outLen, raw ? "true" : "false");
   server.send(200, "application/json", resp);
 }
 
@@ -2535,13 +2960,15 @@ void handleApiModules() {
 
     char flapBuf[2] = {0, 0};
     if (m.flapChar >= 32 && m.flapChar <= 126 && m.flapChar != '"') flapBuf[0] = m.flapChar;
-    char obj[256];
+    char obj[288];
     snprintf(obj, sizeof(obj),
       "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"acked\":%s,\"flapIndex\":%d,"
-      "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"lastSeen\":%lu,\"lastSeenEpoch\":%lu}",
+      "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"lastSeen\":%lu,\"lastSeenEpoch\":%lu,"
+      "\"dupSuspect\":%s}",
       emitted ? "," : "", (int)m.id, m.serialNum, m.provisioned ? "true" : "false",
       m.acked ? "true" : "false",
-      m.flapIndex, flapBuf, m.fwVersion, m.lastSeen, m.lastSeenEpoch);
+      m.flapIndex, flapBuf, m.fwVersion, m.lastSeen, m.lastSeenEpoch,
+      m.dupSuspect ? "true" : "false");
     server.sendContent(obj);
     emitted++;
   }
@@ -2715,6 +3142,92 @@ void handleApiCalibrate() {
   server.send(200, "application/json", out);
 }
 
+// POST /api/flap/diag {id}
+// Runs both module self-diagnostics (firmware v26+). The 'Q' snapshot is instant
+// and returned in THIS response; the 'M' mechanical self-test spins the motor
+// for several revolutions, so it runs as an async job -- the UI polls
+// /api/flap/diag/status for the M result (mirrors the calibrate job pattern).
+void handleApiDiag() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendJsonError(400, "Bad JSON"); return;
+  }
+  int id = doc["id"] | -1;
+  if (id < 0 || id > 254) { sendJsonError(400, "valid id required"); return; }
+  DBG("[API] diagnostics module %d\n", id);
+
+  // Reject if a mechanical test is already running for a different module.
+  if (sfDiagMJobActive && sfDiagMJobId != id) {
+    char busy[96];
+    snprintf(busy, sizeof(busy),
+      "{\"ok\":false,\"error\":\"diagnostics already running for module %d\"}",
+      sfDiagMJobId);
+    server.send(409, "application/json", busy);
+    return;
+  }
+
+  // 1) Instant stats snapshot ('Q') -- captured synchronously (no motor).
+  bool qok = sfSendAndCaptureQ(id, 1500);
+
+  // 2) Mechanical self-test ('M') -- long (motor spins ~6 revolutions). Arm the
+  //    capture + job, fire the command, and return immediately.
+  sfDiagMTs        = 0;
+  sfDiagMCode      = -1;
+  sfDiagMWaitId    = id;
+  sfDiagMJobActive = true;
+  sfDiagMJobId     = id;
+  sfDiagMDeadline  = millis() + 100000UL;
+  char mframe[16];
+  snprintf(mframe, sizeof(mframe), "m%dM\n", id);
+  rs485SendStr(mframe);
+
+  char out[200];
+  if (qok) {
+    snprintf(out, sizeof(out),
+      "{\"ok\":true,\"started\":true,\"id\":%d,"
+      "\"q\":{\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d}}",
+      id, sfDiagQReset, sfDiagQBoot, sfDiagQVcc, sfDiagQEe, sfDiagQCur);
+  } else {
+    snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d,\"q\":null}", id);
+  }
+  server.send(200, "application/json", out);
+}
+
+// GET /api/flap/diag/status
+// Poll target for the async mechanical self-test:
+//   {"ok":true,"state":"pending","id":N}
+//   {"ok":true,"state":"done","id":N,"code":C,"min":..,"max":..,"spreadTenths":..}
+//   {"ok":true,"state":"timeout","id":N}
+//   {"ok":true,"state":"idle"}
+void handleApiDiagStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  char out[160];
+  if (sfDiagMJobActive) {
+    if (sfDiagMTs != 0) {
+      sfDiagMJobActive = false;
+      sfDiagMWaitId    = -1;
+      snprintf(out, sizeof(out),
+        "{\"ok\":true,\"state\":\"done\",\"id\":%d,\"code\":%d,\"min\":%d,\"max\":%d,\"spreadTenths\":%d}",
+        sfDiagMJobId, sfDiagMCode, sfDiagMMin, sfDiagMMax, sfDiagMSpread);
+      server.send(200, "application/json", out);
+      return;
+    }
+    if ((long)(millis() - sfDiagMDeadline) >= 0) {
+      sfDiagMJobActive = false;
+      sfDiagMWaitId    = -1;
+      snprintf(out, sizeof(out), "{\"ok\":true,\"state\":\"timeout\",\"id\":%d}", sfDiagMJobId);
+      server.send(200, "application/json", out);
+      return;
+    }
+    snprintf(out, sizeof(out), "{\"ok\":true,\"state\":\"pending\",\"id\":%d}", sfDiagMJobId);
+    server.send(200, "application/json", out);
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"state\":\"idle\"}");
+}
+
 // GET /api/flap/calibrate/status
 // Poll target for the async calibration job. Reports one of:
 //   {"ok":true,"state":"idle"}                          no job has run
@@ -2777,50 +3290,22 @@ void handleApiVersion() {
   DBG("[API] version query module %d\n", id);
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
 
-  // Record the lastSeen timestamp before sending so we can detect a fresh reply
-  unsigned long seenBefore = 0;
-  xSemaphoreTake(sfMutex, portMAX_DELAY);
-  SFModule* m = sfFindById((uint8_t)id);
-  if (m) seenBefore = m->lastSeen;
-  xSemaphoreGive(sfMutex);
-
-  // Send the version query onto the bus
-  sfQueryVersion(id);
-
-  // Wait for a fresh version response. A DIRECT version query is answered
-  // synchronously by the module (typically within ~35-70ms once the trailing
-  // newline no longer collides with the reply -- see sfQueryVersion), so a
-  // modest window is plenty. lastSeen advances when sfParseResponse processes
-  // the reply and writes fwVersion.
+  // Send a direct version query and wait for a fresh reply. The window scales
+  // mildly with id (broadcast-stagger headroom); a direct query usually answers
+  // in ~35-70ms now that the newline collision is fixed (see sfQueryVersion).
   char          fwVer[8]     = "";
   char          sn[21]       = "";
-  int           repId        = -1;
-  bool          gotReply     = false;
   unsigned long repLastSeen  = 0;
   unsigned long waitMs   = 500UL + (unsigned long)(id > 25 ? 25 : id) * 100UL;
-  unsigned long deadline = millis() + waitMs;
-  while (millis() < deadline) {
-    wdgWebMs = millis();  // keep watchdog alive during version wait
-    vTaskDelay(pdMS_TO_TICKS(10));
-    xSemaphoreTake(sfMutex, portMAX_DELAY);
-    SFModule* mx = sfFindById((uint8_t)id);
-    if (mx && mx->lastSeen != seenBefore && mx->fwVersion[0]) {
-      strlcpy(fwVer, mx->fwVersion,  sizeof(fwVer));
-      strlcpy(sn,    mx->serialNum,  sizeof(sn));
-      repId        = mx->id;
-      repLastSeen  = mx->lastSeen;
-      gotReply     = true;
-    }
-    xSemaphoreGive(sfMutex);
-    if (gotReply) break;
-  }
+  bool gotReply = sfSendVersionAndWait(id, waitMs, fwVer, sizeof(fwVer),
+                                       sn, sizeof(sn), &repLastSeen);
 
   if (gotReply) {
     char out[128];
     snprintf(out, sizeof(out),
              "{\"ok\":true,\"id\":%d,\"ver\":\"%s\",\"sn\":\"%s\",\"stale\":false,\"lastSeen\":%lu}",
-             repId, fwVer, sn, repLastSeen);
-    DBG("[API] version response: id=%d ver=%s sn=%s\n", repId, fwVer, sn);
+             id, fwVer, sn, repLastSeen);
+    DBG("[API] version response: id=%d ver=%s sn=%s\n", id, fwVer, sn);
     server.send(200, "application/json", out);
   } else {
     // Timed out -- check if we already have a cached version from before
@@ -3522,11 +4007,17 @@ void handleApiRestoreBySN() {
   if (!sn[0] || homeOffset == -9999 || totalSteps < 0) {
     sendJsonError(400, "sn, homeOffset, totalSteps required"); return;
   }
-  // Build mXW command -- map can be large; use String to avoid buffer overflow
-  String cmd = String("mXW") + sn + ":" + homeOffset + ":" + totalSteps
-               + ":" + map + "\n";
+  // Build mXW<sn>:<ho>:<ts>:<map>\n. The map can be large; snprintf into a
+  // bounded static buffer (off taskWeb's stack) and reject anything that would
+  // overflow a single frame -- a truncated restore command would corrupt the
+  // module's EEPROM, so it's safer to refuse than to send a partial map.
+  static char cmd[TX_MAX_BYTES + 1];
+  int n = snprintf(cmd, sizeof(cmd), "mXW%s:%d:%d:%s\n", sn, homeOffset, totalSteps, map);
+  if (n < 0 || (size_t)n >= sizeof(cmd)) {
+    sendJsonError(400, "restore payload too large for one frame"); return;
+  }
   DBG("[API] restore by SN %s\n", sn);
-  rs485SendStr(cmd.c_str());
+  rs485SendStr(cmd);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -3556,81 +4047,131 @@ void handleApiDump() {
   const char* verStr = (fwVer[0] == 'v' || fwVer[0] == 'V') ? fwVer + 1 : fwVer;
   int fwVerNum = atoi(verStr);
 
-  // Arm the shared dump capture slot for this id, then send the request.
-  sfDumpCapture[0] = 0;
-  sfDumpCaptureTs  = 0;
-  sfDumpWaitId     = id;
-
-  // Prefer the serial-number dump command mXD<sn> for fw >= 15 with a known SN.
-  // A full 64-flap dump is ~565 bytes -- ~590ms just to transmit at 9600 baud,
-  // plus the module's EEPROM-read time -- so the wait MUST be well over 500ms.
-  // The previous 500ms window expired mid-response and triggered the m<id>d
-  // fallback, whose request collided on the half-duplex bus with the late mXD
-  // response (the cause of the dropped bytes / no-response). A 1200ms window
-  // lets mXD fully respond, so no premature fallback and no collision.
-  // The wait loop touches wdgWebMs each iteration, so a longer wait is
-  // watchdog-safe.
-  bool triedSN = false;
-  if (fwVerNum >= 15 && sn[0]) {
-    DBG("[API] dump module %d via SN %s (fw=%d)\n", id, sn, fwVerNum);
-    sfDumpBySN(sn);
-    triedSN = true;
-  } else {
-    DBG("[API] dump module %d via ID (fw=%d)\n", id, fwVerNum);
-    char buf[16]; snprintf(buf, sizeof(buf), "m%dd\n", id); rs485SendStr(buf);
-  }
-
+  // Read fresh: prefer the serial-number dump mXD<sn> for fw>=15 with a known
+  // SN; fall back to m<id>d if that gets no reply. A full 64-flap dump is ~565
+  // bytes (~590ms to transmit at 9600 baud) plus the module's EEPROM-read time,
+  // so the wait must be well over 500ms; 1200ms lets mXD fully respond before any
+  // fallback, avoiding a half-duplex collision with a late reply.
   char rawDump[TX_MAX_BYTES] = "";
   bool gotReply = false;
-  unsigned long deadline = millis() + 1200;
-  while (millis() < deadline) {
-    wdgWebMs = millis();
-    vTaskDelay(pdMS_TO_TICKS(10));
-    if (sfDumpCaptureTs != 0) {
-      strlcpy(rawDump, sfDumpCapture, sizeof(rawDump));
-      gotReply = true;
-      break;
-    }
+  if (fwVerNum >= 15 && sn[0]) {
+    DBG("[API] dump module %d via SN %s (fw=%d)\n", id, sn, fwVerNum);
+    char f[40]; snprintf(f, sizeof(f), "mXD%s\n", sn);
+    gotReply = sfSendAndCaptureDump(id, f, 1200, rawDump, sizeof(rawDump));
   }
-
-  // Only if the SN command got NO response within the full window do we fall
-  // back to m<id>d. After a complete 1200ms with silence, the module clearly
-  // isn't answering mXD, so there is no late response left to collide with.
-  if (!gotReply && triedSN) {
-    DBG("[API] SN dump timed out, retrying module %d via ID\n", id);
-    char buf[16]; snprintf(buf, sizeof(buf), "m%dd\n", id); rs485SendStr(buf);
-    deadline = millis() + 1200;
-    while (millis() < deadline) {
-      wdgWebMs = millis();
-      vTaskDelay(pdMS_TO_TICKS(10));
-      if (sfDumpCaptureTs != 0) {
-        strlcpy(rawDump, sfDumpCapture, sizeof(rawDump));
-        gotReply = true;
-        break;
-      }
-    }
+  if (!gotReply) {
+    DBG("[API] dump module %d via ID (fw=%d)\n", id, fwVerNum);
+    char f[16]; snprintf(f, sizeof(f), "m%dd\n", id);
+    gotReply = sfSendAndCaptureDump(id, f, 1200, rawDump, sizeof(rawDump));
   }
-
   sfDumpWaitId = -1;  // disarm capture
 
   if (gotReply) {
-    // Build JSON reply (escape the dump string for JSON safety)
-    String reply = "{\"ok\":true,\"id\":";
-    reply += id;
-    reply += ",\"sn\":\""; reply += sn; reply += "\",";
-    reply += "\"dump\":";
-    reply += '"';
-    for (const char* p2 = rawDump; *p2; p2++) {
-      if (*p2 == '"' || *p2 == '\\') reply += '\\';
-      reply += *p2;
+    // JSON-escape the dump, then format the reply (static buffers: off taskWeb's
+    // stack, and the synchronous server serves one request at a time). sn is
+    // validated alphanumeric, so it needs no escaping.
+    static char escDump[TX_MAX_BYTES * 2];
+    size_t ei = 0;
+    for (const char* p2 = rawDump; *p2 && ei < sizeof(escDump) - 2; p2++) {
+      if (*p2 == '"' || *p2 == '\\') escDump[ei++] = '\\';
+      escDump[ei++] = *p2;
     }
-    reply += "\",\"stale\":false}";
-    server.send(200, "application/json", reply);
-    reply = "";
+    escDump[ei] = 0;
+    static char out[TX_MAX_BYTES * 2 + 96];
+    snprintf(out, sizeof(out),
+             "{\"ok\":true,\"id\":%d,\"sn\":\"%s\",\"dump\":\"%s\",\"stale\":false}",
+             id, sn, escDump);
+    server.send(200, "application/json", out);
   } else {
     server.send(200, "application/json",
       "{\"ok\":false,\"error\":\"no response from module\"}");
   }
+}
+
+// POST /api/flap/all  {"id":N}
+// Refresh a module's COMPLETE state -- firmware version, serial, and EEPROM dump.
+// For a module known to be v25+ this is a SINGLE bus transaction using the
+// combined 'A' command, instead of a version query followed by a dump. For older
+// firmware (or if 'A' times out) it falls back to the classic version-then-dump
+// sequence. Returns the same dump string the /api/flap/dump endpoint does, plus
+// the refreshed ver/sn, so the Info dialog can render from one response.
+void handleApiAll() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendJsonError(400, "Bad JSON"); return;
+  }
+  int id = doc["id"] | -99;
+  if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
+  DBG("[API] all (version+EEPROM) module %d\n", id);
+
+  char sn[21] = "", fwVer[8] = "";
+  xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* m = sfFindById((uint8_t)id);
+  if (m) { strlcpy(sn, m->serialNum, sizeof(sn)); strlcpy(fwVer, m->fwVersion, sizeof(fwVer)); }
+  xSemaphoreGive(sfMutex);
+  const char* verStr = (fwVer[0] == 'v' || fwVer[0] == 'V') ? fwVer + 1 : fwVer;
+  int fwVerNum = atoi(verStr);
+
+  static char rawDump[TX_MAX_BYTES];   // static: keeps taskWeb's stack clear of a 768B frame
+  rawDump[0] = 0;
+  bool gotReply = false;
+  const char* mode = "A";
+
+  if (fwVerNum >= 25) {
+    // Known v25+: one combined 'A' transaction. If it times out the module is
+    // offline -- a v+d fallback would almost certainly also time out, just ~2s
+    // slower -- so we return stale rather than fall back. The next version read
+    // (Identify, stale-probe, explicit query) self-corrects the cache if the
+    // module was in fact downgraded or swapped for an older one.
+    char f[64];
+    if (sn[0]) { DBG("[API] all via mXA %s\n", sn); snprintf(f, sizeof(f), "mXA%s\n", sn); }
+    else       { DBG("[API] all via m%dA\n", id);   snprintf(f, sizeof(f), "m%dA\n", id); }
+    gotReply = sfSendAndCaptureDump(id, f, 1300, rawDump, sizeof(rawDump));  // 'A' ~570ms + assembly
+  } else {
+    // Unknown or older firmware: version query, then dump (two transactions).
+    // Wait for the version reply to clear the bus before the dump goes out.
+    mode = "vd";
+    sfSendVersionAndWait(id, 700, fwVer, sizeof(fwVer), sn, sizeof(sn), NULL);
+    verStr   = (fwVer[0] == 'v' || fwVer[0] == 'V') ? fwVer + 1 : fwVer;
+    fwVerNum = atoi(verStr);
+    char f[40];
+    if (fwVerNum >= 15 && sn[0]) snprintf(f, sizeof(f), "mXD%s\n", sn);
+    else                         snprintf(f, sizeof(f), "m%dd\n", id);
+    gotReply = sfSendAndCaptureDump(id, f, 1300, rawDump, sizeof(rawDump));
+  }
+  sfDumpWaitId = -1;  // disarm capture
+  // Snapshot the 'A'-only extras the parse left behind (n/a == -99 for the v+d
+  // path or a stale read). Safe to read now: the slot is disarmed, so no later
+  // reply can overwrite them before we format.
+  int aAutoHome   = sfCaptureAutoHome;
+  int aCurIndex   = sfCaptureCurIndex;
+  int aReportedId = sfCaptureReportedId;
+
+  // Read the freshest version/serial the reply left in the registry.
+  xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* mf = sfFindById((uint8_t)id);
+  if (mf) { strlcpy(sn, mf->serialNum, sizeof(sn)); strlcpy(fwVer, mf->fwVersion, sizeof(fwVer)); }
+  xSemaphoreGive(sfMutex);
+
+  // JSON-escape the dump, then format the reply (static buffers: off taskWeb's
+  // stack; the synchronous server serves one request at a time). sn is validated
+  // alphanumeric and fwVer is a version token, so neither needs escaping.
+  static char escDump[TX_MAX_BYTES * 2];
+  size_t ei = 0;
+  for (const char* p2 = rawDump; *p2 && ei < sizeof(escDump) - 2; p2++) {
+    if (*p2 == '"' || *p2 == '\\') escDump[ei++] = '\\';
+    escDump[ei++] = *p2;
+  }
+  escDump[ei] = 0;
+  static char out[TX_MAX_BYTES * 2 + 128];
+  snprintf(out, sizeof(out),
+           "{\"ok\":true,\"id\":%d,\"ver\":\"%s\",\"sn\":\"%s\",\"dump\":\"%s\","
+           "\"autoHome\":%d,\"curIndex\":%d,\"reportedId\":%d,\"stale\":%s,\"mode\":\"%s\"}",
+           id, fwVer, sn, escDump, aAutoHome, aCurIndex, aReportedId,
+           gotReply ? "false" : "true", mode);
+  server.send(200, "application/json", out);
 }
 
 void handleApiIdentify() {
@@ -3768,6 +4309,9 @@ void webInit() {
   server.on("/api/flap/calibrate",   HTTP_POST,    handleApiCalibrate);
   server.on("/api/flap/calibrate",   HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/calibrate/status", HTTP_GET, handleApiCalibrateStatus);
+  server.on("/api/flap/diag",        HTTP_POST,    handleApiDiag);
+  server.on("/api/flap/diag",        HTTP_OPTIONS, handleOptions);
+  server.on("/api/flap/diag/status", HTTP_GET,     handleApiDiagStatus);
   server.on("/api/flap/version",     HTTP_POST,    handleApiVersion);
   server.on("/api/flap/version",     HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/provision",   HTTP_POST,    handleApiProvision);
@@ -3794,6 +4338,8 @@ void webInit() {
   server.on("/api/flap/factoryreset",    HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/dump",              HTTP_POST,    handleApiDump);
   server.on("/api/flap/dump",              HTTP_OPTIONS, handleOptions);
+  server.on("/api/flap/all",               HTTP_POST,    handleApiAll);
+  server.on("/api/flap/all",               HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/dumpbysn",          HTTP_POST,    handleApiDumpBySN);
   server.on("/api/flap/dumpbysn",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/factoryresetbysn",HTTP_POST,    handleApiFactoryResetBySN);
@@ -3897,6 +4443,7 @@ void taskRS485(void* pv) {
         RS485Msg m;
         m.timestamp = millis();
         m.dir       = 'R';
+        m.sanitized = false;   // RX frames are never sanitized
         // The monitor ring entry is fixed-size; store at most MSG_MAX_BYTES.
         // The full frame is still parsed below -- this copy is display-only.
         size_t ringLen = (lineLen > MSG_MAX_BYTES) ? MSG_MAX_BYTES : lineLen;
@@ -4104,6 +4651,7 @@ void setup() {
   sfMutex    = xSemaphoreCreateMutexStatic(&sfMutexBuf);
   timeMutex  = xSemaphoreCreateMutexStatic(&timeMutexBuf);
   mqttQMutex = xSemaphoreCreateMutexStatic(&mqttQMutexBuf);
+  txMutex    = xSemaphoreCreateMutexStatic(&txMutexBuf);
   psramAllocInit();   // allocate large buffers (ring + MQTT queue + registry) in PSRAM
 
   // Debug output via native USB CDC (USB CDC On Boot: Enabled).
