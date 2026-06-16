@@ -71,6 +71,7 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 - **Sticky module list** — the known-module registry persists across reboots in flash; a stale module is version-probed before being dropped (so a merely-quiet module isn't lost), and a gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
 - **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
 - **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs
+- **Module self-diagnostics** — modules on firmware v26+ gain a 🩺 icon that runs two built-in tests and interprets the results: an instant **stats snapshot** (reset cause, boot count, supply voltage, EEPROM verify, current flap index) and a motor-driven **mechanical self-test** that detects intermittent missed steps (drag / weak supply / failing driver) or a stalled reel
 - **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
 - **Health metrics** — the Status tab shows minimum-ever free heap and per-task stack high-water marks, surfacing memory pressure before it causes a crash
 - **Diagnostic boot/telemetry log** — on boot the gateway prints its reset reason (POWERON / PANIC / TASK_WDT / BROWNOUT, etc.), a chip/heap snapshot, and where its large buffers were allocated (`[MEM] … in PSRAM`); the periodic `[WDG]` line reports heap, min-ever heap, largest free block, heap-fragmentation %, per-task stack watermarks, RX/TX/parse-reject counters, WiFi station and fallback-AP state, WiFi RSSI, and MQTT state
@@ -247,7 +248,7 @@ Navigate to the gateway's IP address in any browser.
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap's current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through all 64 flaps one at a time. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
 | **Backup** | Download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
-| **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. |
+| **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
 | **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update |
 | **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
 
@@ -290,7 +291,7 @@ dashboard isn't empty after a restart.
 
 ## Split-Flap Protocol
 
-All bus frames are newline-terminated ASCII starting with `m`.
+All bus frames are ASCII starting with `m`. On the wire, frames are newline-terminated — but you don't have to manage that yourself: the gateway normalizes framing for every send path (bus monitor, REST, MQTT), adding or stripping the trailing newline as needed and trimming any junk past a complete command. The one frame it intentionally sends *without* a terminator is the direct version query `m<id>v` (a gateway turnaround workaround — the module accepts either form). A **Raw** option bypasses all of this for debugging. See the note under the command table for details.
 
 ### Commands (gateway → modules)
 
@@ -300,8 +301,9 @@ All bus frames are newline-terminated ASCII starting with `m`.
 | `m<id>+<index>\n` | Show flap by index 0–63 (firmware v7+) |
 | `m<id>h\n` | Home the module |
 | `m<id>c\n` | Calibrate (measure steps/rev) |
-| `m<id>v\n` | Query firmware version |
+| `m<id>v` | Query firmware version — **sent without a trailing newline** (see note below) |
 | `m<id>d\n` | Dump EEPROM configuration |
+| `m<id>A\n` | Combined all-fields dump — version + EEPROM in one reply (firmware v25+) |
 | `m<id>o<n>\n` | Set home offset (steps past Hall trigger to flap 0) |
 | `m<id>t<n>\n` | Set total steps per revolution |
 | `m<id>s<n>\n` | Nudge forward n steps and add to home offset |
@@ -313,12 +315,18 @@ All bus frames are newline-terminated ASCII starting with `m`.
 | `m<id>R\n` | Reset — erase stored ID, return to unprovisioned (firmware v9+) |
 | `m<id>F\n` | Factory reset EEPROM defaults (preserves module ID) |
 | `m*h\n` | Broadcast home (all modules) |
-| `m*v\n` | Broadcast version query (all modules) |
+| `m*v\n` / `m*v<lo>-<hi>\n` | Broadcast version query (all modules, or an ID range; firmware v25+ for the range) |
+| `m*A\n` / `m*A<lo>-<hi>\n` | Broadcast combined all-fields dump (staggered; prefer ranged batches — each reply is long; firmware v25+) |
 | `mXI<sn>:<id>\n` | Assign ID to module by serial number |
 | `mXH<sn>\n` | Home module by serial number |
 | `mXD<sn>\n` | Dump EEPROM by serial number (firmware v15+) |
+| `mXA<sn>\n` | Combined all-fields dump by serial number (firmware v25+) |
 | `mXF<sn>\n` | Factory reset by serial number |
 | `mXW<sn>:<offset>:<steps>:<map>\n` | Restore EEPROM to module by serial number |
+
+> **Framing and sanitization are handled for you.** Whether a frame comes from the bus monitor, `POST /api/rs485/send`, or the MQTT `splitflap/send` topic, the gateway normalizes it at a single transmit choke point. It (1) strips any trailing CR/LF you supplied, (2) **trims anything past a complete, well-formed known command** — so `m4vDSassa` is sent as `m4v` rather than relying on the module to ignore the junk — and (3) re-adds exactly one `\n` terminator, so `m5-A` and `m5-A\n` behave identically and a payload command like `m9o2832` is terminated for you (which also spares it the module's 50 ms idle-timeout wait). By-serial `mX…` frames (e.g. a long restore map) and any command the gateway doesn't model are passed through unchanged, so a legitimate frame is never truncated. The **one exception** to terminating is a direct numeric-id version query `m<id>v`, which the gateway always ships **without** a terminator. This is **not** a module requirement — the module accepts both `m<id>v` and `m<id>v\n` and answers either; it acts on the `v` byte itself. The bare form works around a **gateway-side** limitation in its half-duplex bus turnaround: a module answers a direct version query synchronously, the instant it parses `v` (a dump, by contrast, assembles its EEPROM string first, so its reply is naturally late enough to be safe), but the gateway's hardware driver-enable keeps it driving the line until the whole frame has clocked out, and its receiver is off while it transmits — so a trailing `\n` would keep the gateway transmitting for one extra byte-time (~1 ms at 9600 baud) *after* the module has already started replying, and the reply's leading bytes would be lost. Shipping `m<id>v` bare lets the gateway release the bus and start listening before the module answers. The **broadcast** `m*v` keeps a newline (the gateway adds it): a wildcard query collects an optional `<lo>-<hi>` ID range and the module fires a *staggered, deferred* reply on the newline (or a 50 ms idle timeout), so there's no turnaround race there.
+>
+> **Raw bypass (debugging).** To send bytes exactly as typed — no trimming, no terminator changes — enable **Raw** in the bus monitor's Send box, or pass `"raw":true` in the `/api/rs485/send` or `splitflap/send` JSON body. This is the escape hatch for deliberately exercising malformed or experimental frames.
 
 ### Responses (modules → gateway)
 
@@ -327,8 +335,11 @@ All bus frames are newline-terminated ASCII starting with `m`.
 | `m<id>v:<version>:<moduleId>:<serialNumber>\n` | Firmware version |
 | `m<id>:<steps>\n` | Calibration result |
 | `m<id>d:<homeOffset>:<stepsPerRev>:<map>\n` | EEPROM dump |
+| `m<id>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<map>\n` | Combined all-fields dump (v25+): everything from `v` and `d`, plus the auto-home flag and the live current flap index |
 | `mXadv:<serialNumber>\n` | Unprovisioned module advertisement |
 | `mXack:<serialNumber>:<assignedId>\n` | Provisioning acknowledgement |
+
+> **The gateway uses the combined `A` command automatically when it's more efficient.** When the Info dialog refreshes a module's full state it normally needs both a version query and a dump (two bus transactions). For a module known to be **firmware v25+**, the gateway issues a single `A` instead — one transaction that returns version, serial, and the full EEPROM dump together. Older modules (or a module whose version isn't known yet) fall back to the classic version-then-dump sequence. This is handled internally via the `/api/flap/all` endpoint; no client change is required.
 
 ### Character set (64 flaps, index 0–63)
 
@@ -357,7 +368,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
 | `GET` | `/api/rs485/messages` | — | Drain buffered frames (up to 64) |
-| `POST` | `/api/rs485/send` | `{"data":"m5-A\n"}` | Send raw ASCII frame |
+| `POST` | `/api/rs485/send` | `{"data":"m5-A\n"}` (optional `"raw":true`) | Send raw ASCII frame. Framing/junk is normalized by default; `"raw":true` sends bytes verbatim |
 
 ### Module Control
 
@@ -370,6 +381,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `POST` | `/api/flap/home` | `{"id":5}` | Home module (`id:-1` = all) |
 | `POST` | `/api/flap/version` | `{"id":5}` | Query version — waits up to 500ms, returns `{ok,id,ver,sn,stale,lastSeen}` |
 | `POST` | `/api/flap/dump` | `{"id":5}` | Fetch EEPROM fresh — waits up to 500ms (1s if SN fallback needed), returns `{ok,id,sn,dump}` |
+| `POST` | `/api/flap/all` | `{"id":5}` | Refresh version **and** EEPROM together, returns `{ok,id,ver,sn,dump,stale,mode}`. Uses one `A` transaction for v25+ modules (`mode:"A"`), else falls back to version+dump (`mode:"vd"`) |
 | `POST` | `/api/flap/identify` | — | Clear the list (memory + saved) and broadcast `m*v` to re-discover all modules |
 
 ### Advanced Module Commands
@@ -385,6 +397,10 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `POST` | `/api/flap/autohome` | `{"id":5,"enable":1}` | Set auto-home on boot |
 | `POST` | `/api/flap/erase` | `{"id":5}` | Erase calibration map |
 | `POST` | `/api/flap/factoryreset` | `{"id":5}` | Factory reset EEPROM |
+| `POST` | `/api/flap/diag` | `{"id":5}` | Run module self-diagnostics (fw v26+): returns the stats snapshot `q` inline and starts the async mechanical test — poll `/api/flap/diag/status` |
+| `GET` | `/api/flap/diag/status` | — | Poll the mechanical self-test: `{ok,state,id,code,min,max,spreadTenths}` (`state` = idle/pending/done/timeout; `code` 0 OK, 1 inconsistent, 2 no motion) |
+
+A module running **firmware v26 or newer** shows a 🩺 diagnostics icon in the Modules grid. Clicking it runs both self-tests and opens a results modal with plain-language interpretation. The **stats snapshot** (`Q`, instant, no motor) decodes the last reset cause from the RSTFR bits (power-on / brown-out / external / watchdog / software) and reports the boot counter, supply voltage, an EEPROM write-verify result, and the current flap index — flagging a sagging supply, a failed EEPROM verify, or a brown-out/watchdog reset. The supply-voltage check is rail-aware (a healthy 3.3 V reading is not mistaken for a low 5 V rail). The **mechanical self-test** (`M`) then spins the motor through several revolutions (20–60 s) and reports OK, *inconsistent* (revolutions varied by more than 5 %, pointing to drag, a weak supply, or a failing driver), or *no motion* (an open coil, dead driver, jam, or a dead Hall sensor). Because `M` is motor-driven and slow it runs as an asynchronous job; the snapshot is returned immediately and the mechanical result is polled.
 
 ### Provisioning
 
@@ -494,7 +510,7 @@ Default topic prefix: **`splitflap`** (configurable in Settings → MQTT).
 
 | Topic | Payload | Description |
 |---|---|---|
-| `splitflap/send` | `m9h\n` or `{"data":"m9h\n"}` | Send raw ASCII frame to bus |
+| `splitflap/send` | `m9h\n` or `{"data":"m9h\n"}` (optional `"raw":true`) | Send raw ASCII frame to bus. Normalized by default; `"raw":true` sends verbatim |
 | `splitflap/flap/set` | `{"id":5,"char":"A"}` | Show character |
 | `splitflap/flap/home` | `{"id":5}` | Home module |
 | `splitflap/flap/provision` | `{"sn":"AABBCC...","id":5}` | Provision module |
@@ -535,7 +551,7 @@ The **NTP server** defaults to `pool.ntp.org`. You can point it at a LAN time se
 
 After the initial USB flash, all subsequent updates can be done over WiFi.
 
-> **Upgrading from a pre-1.6 version?** The firmware *currently running* is what receives and writes the new image, so the OTA-reliability improvements in 1.6 (PSRAM-backed buffers, AP-drop and MQTT-pause during upload) can't help the upload that installs 1.6 — they only take effect once 1.6 is running. On a memory-constrained older build the browser upload of 1.6 may drop near the end (heap exhaustion); this is harmless (the image is written to the inactive partition, so a failed upload leaves your old firmware running and fully functional), but for that first jump it's more reliable to use **espota** or a one-time **USB flash**. After 1.6 is installed, the web updater is reliable. No migration is needed: PSRAM is set up at boot, and your saved settings and module registry carry over (the new Home Assistant option simply defaults to off).
+> **Upgrading from a pre-1.6 version?** The firmware *currently running* is what receives and writes the new image, so the OTA-reliability improvements introduced in 1.6 (PSRAM-backed buffers, AP-drop and MQTT-pause during upload) can't help the upload that *first* installs a 1.6-or-later build — they only take effect once that build is running. On a memory-constrained pre-1.6 build the browser upload may drop near the end (heap exhaustion); this is harmless (the image is written to the inactive partition, so a failed upload leaves your old firmware running and fully functional), but for that first jump it's more reliable to use **espota** or a one-time **USB flash**. Once you're on 1.6 or later, the web updater is reliable. No migration is needed: PSRAM is set up at boot, and your saved settings and module registry carry over (the Home Assistant option simply defaults to off).
 
 ### Browser upload (recommended)
 

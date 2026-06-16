@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "2.0"
+  version: "2.3"
   description: |
-    REST API for the ESP32-S3 Split-Flap Gateway firmware.
+    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v1.3).
 
     **Base URL:** `http://<gateway-ip>` — replace with the IP shown in the
     gateway status badge, or use `http://192.168.4.1` when connected to the
@@ -71,14 +71,25 @@ paths:
               properties:
                 data:
                   type: string
-                  description: ASCII frame to transmit, must end with `\n`
+                  description: >
+                    ASCII frame to transmit. A trailing newline is optional — the
+                    gateway normalizes framing (adds/strips the terminator and trims
+                    any bytes past a complete known command) unless `raw` is true.
+                raw:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, the bytes in `data` are sent verbatim with no
+                    sanitization or terminator changes (debugging escape hatch).
             examples:
               home_all:
-                value: { data: "m*h\n" }
+                value: { data: "m*h" }
               version_all:
-                value: { data: "m*v\n" }
+                value: { data: "m*v" }
               show_char:
-                value: { data: "m5-A\n" }
+                value: { data: "m5-A" }
+              raw_verbatim:
+                value: { data: "m4vDSassa", raw: true }
       responses:
         "200":
           $ref: "#/components/responses/Ok"
@@ -86,6 +97,31 @@ paths:
           $ref: "#/components/responses/BadRequest"
 
   # ── Module display control ──────────────────────────────────────
+
+  /api/display/state:
+    get:
+      tags: [Display]
+      summary: Current visual state of the split-flap wall
+      description: |
+        Returns the configured grid dimensions and the character shown in each
+        cell. Cells map to module IDs left-to-right, top-to-bottom (cell index =
+        row*cols + col == module id). Each cell is the tracked character, "?" if
+        a module is present but its character is unknown (e.g. after a home or an
+        index set), or null if no module has that id. Drives the Live Display.
+      responses:
+        "200":
+          description: Display state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows:  { type: integer, example: 1 }
+                  cols:  { type: integer, example: 16 }
+                  cells:
+                    type: array
+                    items: { type: [string, "null"] }
+                    example: [" ","1","2",":","0","4","A","M",null,null]
 
   /api/flap/modules:
     get:
@@ -132,6 +168,10 @@ paths:
                 char:
                   type: string
                   maxLength: 1
+                  description: >
+                    A single character. The gateway uppercases it and rejects
+                    non-printable / non-ASCII bytes, then sends it verbatim as
+                    m<id>-<char>; the module firmware maps it to a flap index.
             example: { id: 5, char: "A" }
       responses:
         "200":
@@ -287,12 +327,18 @@ paths:
                 timeout:
                   value: { ok: false, error: "no response from module" }
 
-  # ── Advanced module commands ─────────────────────────────────────
-
-  /api/flap/calibrate:
+  /api/flap/all:
     post:
-      tags: [Advanced]
-      summary: Calibrate steps per revolution
+      tags: [Modules]
+      summary: Refresh version and EEPROM together (uses the v25+ combined 'A' command when possible)
+      description: |
+        Returns a module's firmware version, serial number, and full EEPROM dump
+        in one response. For a module known to be firmware v25+, the gateway issues
+        a single combined `A` command (one bus transaction) instead of a version
+        query followed by a dump. Older firmware (or a module whose version isn't
+        known yet) falls back to the classic version-then-dump sequence. The `mode`
+        field reports which path ran (`"A"` or `"vd"`). Data is fetched fresh each
+        call; `stale:true` (with cached/empty fields) indicates no reply arrived.
       requestBody:
         required: true
         content:
@@ -301,11 +347,236 @@ paths:
               type: object
               required: [id]
               properties:
-                id: { type: integer }
+                id: { type: integer, minimum: 0, maximum: 254 }
             example: { id: 5 }
       responses:
         "200":
-          $ref: "#/components/responses/Ok"
+          description: Combined version + EEPROM state, or stale on timeout
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SyncReply"
+                  - type: object
+                    properties:
+                      ver:  { type: string, description: Firmware version, example: "25" }
+                      dump:
+                        type: string
+                        description: Raw EEPROM string — `homeOffset:totalSteps:0=pos,1=pos,...`
+                        example: "42:4096:0=210,1=320"
+                      mode:
+                        type: string
+                        enum: ["A", "vd"]
+                        description: Which path ran — single `A` transaction, or version+dump fallback
+                      autoHome:
+                        type: integer
+                        description: >-
+                          Auto-home setting — `1` = home on boot, `0` = restore saved position.
+                          Only the `A` path carries this; `-99` when not provided (the `vd`
+                          fallback or a stale read).
+                        example: 1
+                      curIndex:
+                        type: integer
+                        description: >-
+                          Module's current flap index (live state) — `0..63`, `-1` unknown,
+                          `-2` motor released. `A` path only; `-99` when not provided.
+                        example: 5
+                      reportedId:
+                        type: integer
+                        description: >-
+                          Module's self-reported ID from the `A` reply, for diagnosing an
+                          address/identity mismatch against `id`. `-99` when not provided.
+                        example: 5
+              examples:
+                combined_A:
+                  value: { ok: true, id: 5, ver: "25", sn: "AABBCCDD", dump: "42:4096:0=210,1=320", autoHome: 1, curIndex: 5, reportedId: 5, stale: false, mode: "A" }
+                fallback_vd:
+                  value: { ok: true, id: 5, ver: "23", sn: "AABBCCDD", dump: "42:4096:0=210,1=320", autoHome: -99, curIndex: -99, reportedId: -99, stale: false, mode: "vd" }
+                stale:
+                  value: { ok: true, id: 5, ver: "25", sn: "AABBCCDD", dump: "", autoHome: -99, curIndex: -99, reportedId: -99, stale: true, mode: "A" }
+
+  /api/flap/calibrate:
+    post:
+      tags: [Advanced]
+      summary: Start calibration of steps per revolution (asynchronous)
+      description: |
+        Sends `m<id>c` and returns immediately so the web server stays
+        responsive while the reel physically measures a revolution (several
+        seconds). The module spins the reel a full revolution, replies
+        `m<id>:<steps>\n`, and saves the measured value to its own EEPROM.
+
+        For a single module (`id >= 0`) this **starts an asynchronous job** and
+        returns `{ok, started, id}`. Poll `GET /api/flap/calibrate/status` for
+        the result, then typically write the measured value back with
+        `/api/flap/totalsteps` to confirm it. A broadcast (`id < 0`) is
+        fire-and-forget and returns `{ok, broadcast: true}`. Starting a job for a
+        different module while one is already running returns `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, description: "Module ID, or a negative value to broadcast to all modules" }
+            example: { id: 11 }
+      responses:
+        "200":
+          description: |
+            Job started (single module) or broadcast sent.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:        { type: boolean, example: true }
+                  started:   { type: boolean, description: "true once the job is running (single-module calls)", example: true }
+                  id:        { type: integer, description: "Module ID (single-module calls only)", example: 11 }
+                  broadcast: { type: boolean, description: "Present and true for broadcast (id < 0) calls" }
+              examples:
+                started:   { value: { ok: true, started: true, id: 11 } }
+                broadcast: { value: { ok: true, broadcast: true } }
+        "409":
+          description: A calibration job is already running for a different module.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: false }
+                  error: { type: string,  example: "calibration already running for module 5" }
+
+  /api/flap/calibrate/status:
+    get:
+      tags: [Advanced]
+      summary: Poll the asynchronous calibration job
+      description: |
+        Returns the current state of the calibration job started by
+        `POST /api/flap/calibrate`. `pending` while the reel is still measuring;
+        `done` with the measured `stepsPerRev` once the module replies; `timeout`
+        if no reply arrived within the window (~15 s); `idle` if no job has run.
+      responses:
+        "200":
+          description: Current job state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:          { type: boolean, example: true }
+                  state:       { type: string, enum: [idle, pending, done, timeout], example: "done" }
+                  id:          { type: integer, description: "Module ID (pending/done/timeout)", example: 11 }
+                  stepsPerRev: { type: integer, description: "Measured steps per revolution (state=done only)", example: 4097 }
+              examples:
+                pending: { value: { ok: true, state: "pending", id: 11 } }
+                done:    { value: { ok: true, state: "done", id: 11, stepsPerRev: 4097 } }
+                timeout: { value: { ok: true, state: "timeout", id: 11 } }
+                idle:    { value: { ok: true, state: "idle" } }
+
+  /api/flap/diag:
+    post:
+      tags: [Advanced]
+      summary: Run module self-diagnostics (firmware v26+)
+      description: |
+        Runs both built-in self-tests on a module whose firmware is **v26 or
+        newer**:
+
+        - **Stats snapshot (`Q`)** — instant, no motor movement. Captured
+          synchronously and returned inline in this response as `q`. Reports the
+          last reset cause (raw RSTFR bits), boot counter, supply voltage (mV),
+          an EEPROM write-verify flag, and the current flap index. If the module
+          does not answer, `q` is `null` (the mechanical job is still started).
+        - **Mechanical self-test (`M`)** — drives the motor through several
+          revolutions (typically 20–60 s, bounded ~100 s), so it runs as an
+          **asynchronous job**. Poll `GET /api/flap/diag/status` for the result.
+
+        Starting a diagnostics run for a different module while a mechanical test
+        is already in flight returns `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, description: "Module ID (0–254)" }
+            example: { id: 11 }
+      responses:
+        "200":
+          description: |
+            Stats snapshot captured (or `q: null` if unanswered) and the
+            mechanical self-test started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  started: { type: boolean, description: "true once the mechanical job is running", example: true }
+                  id:      { type: integer, example: 11 }
+                  q:
+                    type: object
+                    nullable: true
+                    description: "Stats snapshot, or null if the module did not answer the Q query"
+                    properties:
+                      resetCause: { type: integer, description: "Raw RSTFR bits: 1 power-on, 2 brown-out, 4 external, 8 watchdog, 16 software (combinable)", example: 1 }
+                      bootCount:  { type: integer, description: "Boots since the counter was reset (wraps at 255)", example: 3 }
+                      vcc:        { type: integer, description: "Supply voltage in millivolts (0 if unavailable)", example: 3320 }
+                      eepromOk:   { type: integer, description: "1 if the EEPROM write-verify passed, else 0", example: 1 }
+                      curIndex:   { type: integer, description: "Current flap index (-1 unknown / needs homing, -2 released)", example: 5 }
+              examples:
+                captured: { value: { ok: true, started: true, id: 11, q: { resetCause: 1, bootCount: 3, vcc: 3320, eepromOk: 1, curIndex: 5 } } }
+                noQ:      { value: { ok: true, started: true, id: 11, q: null } }
+        "400":
+          description: Missing or invalid `id`.
+        "409":
+          description: A mechanical self-test is already running for a different module.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: false }
+                  error: { type: string,  example: "diagnostics already running for module 5" }
+
+  /api/flap/diag/status:
+    get:
+      tags: [Advanced]
+      summary: Poll the asynchronous mechanical self-test
+      description: |
+        Returns the current state of the mechanical self-test started by
+        `POST /api/flap/diag`. `pending` while the motor is still spinning;
+        `done` with the result once the module replies; `timeout` if no reply
+        arrived within the window (~100 s); `idle` if no job has run.
+
+        `code` interprets the result: `0` OK (all revolutions consistent),
+        `1` inconsistent (spread > 5 % — intermittent missed steps from drag, a
+        weak supply, or a failing driver), `2` no motion (open coil / dead
+        driver / jam, or a dead Hall sensor). `min`/`max` are the smallest and
+        largest steps-per-revolution measured, and `spreadTenths` is
+        `(max-min)/avg` in tenths of a percent (e.g. `23` = 2.3 %).
+      responses:
+        "200":
+          description: Current job state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:           { type: boolean, example: true }
+                  state:        { type: string, enum: [idle, pending, done, timeout], example: "done" }
+                  id:           { type: integer, description: "Module ID (pending/done/timeout)", example: 11 }
+                  code:         { type: integer, enum: [0, 1, 2], description: "Mechanical result (state=done only): 0 OK, 1 inconsistent, 2 no motion", example: 0 }
+                  min:          { type: integer, description: "Smallest steps-per-rev measured (state=done only)", example: 4090 }
+                  max:          { type: integer, description: "Largest steps-per-rev measured (state=done only)", example: 4099 }
+                  spreadTenths: { type: integer, description: "(max-min)/avg in tenths of a percent (state=done only)", example: 3 }
+              examples:
+                pending: { value: { ok: true, state: "pending", id: 11 } }
+                done:    { value: { ok: true, state: "done", id: 11, code: 0, min: 4090, max: 4099, spreadTenths: 3 } }
+                timeout: { value: { ok: true, state: "timeout", id: 11 } }
+                idle:    { value: { ok: true, state: "idle" } }
 
   /api/flap/homeoffset:
     post:
@@ -591,6 +862,130 @@ paths:
               schema:
                 $ref: "#/components/schemas/Status"
 
+  /api/mqtt/test:
+    post:
+      tags: [Status]
+      summary: Test MQTT broker connectivity and credentials
+      description: |
+        Performs a TCP reachability check (3s cap) followed by a real MQTT
+        CONNECT/CONNACK exchange using a throwaway client, without touching the
+        gateway's live MQTT connection. Body fields are optional; omitted fields
+        default to the saved configuration, so settings can be verified before
+        saving.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                host: { type: string, example: "192.168.1.65" }
+                port: { type: integer, example: 1883 }
+                user: { type: string }
+                pass: { type: string }
+      responses:
+        "200":
+          description: Test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean, description: "true if MQTT CONNECT succeeded" }
+                  tcp:    { type: boolean, description: "TCP connection succeeded" }
+                  mqtt:   { type: boolean, description: "MQTT CONNECT/CONNACK succeeded" }
+                  state:  { type: integer, description: "PubSubClient state code" }
+                  detail: { type: string,  example: "bad username or password" }
+
+  /api/maintenance:
+    get:
+      tags: [Status]
+      summary: Get maintenance-mode state
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  on: { type: boolean, example: false }
+    post:
+      tags: [Status]
+      summary: Enable or disable maintenance mode
+      description: |
+        When enabled, the gateway ignores all commands arriving via MQTT and
+        does not relay them to the RS-485 bus. The web UI / REST API continue to
+        work normally. Always resets to off on reboot (not persisted).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [on]
+              properties:
+                on: { type: boolean }
+            example: { on: true }
+      responses:
+        "200":
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  on: { type: boolean, example: true }
+
+  /api/quiet:
+    get:
+      tags: [Status]
+      summary: Get quiet-time state
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  on: { type: boolean, example: false }
+    post:
+      tags: [Status]
+      summary: Enable or disable quiet time
+      description: |
+        When enabled, the gateway still accepts and acknowledges every command,
+        but does not transmit normal display-motion frames (show character, show
+        index, home), so the flaps stay still. Deliberate calibration moves
+        (calibrate, goto, nudge) are still allowed. Display tracking is left
+        unchanged. When disabled, the reels resync to the display each module was
+        last asked to show while quiet. Always resets to off on reboot (not
+        persisted). Also settable over MQTT (`<prefix>/quiet/set`) and from Home
+        Assistant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [on]
+              properties:
+                on: { type: boolean }
+            example: { on: true }
+      responses:
+        "200":
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  on: { type: boolean, example: true }
+
   /api/config:
     get:
       tags: [Config]
@@ -677,15 +1072,25 @@ paths:
               type: object
               properties:
                 posixTZ:     { type: string, example: "EST5EDT,M3.2.0,M11.1.0" }
+                ntpServer:   { type: string, example: "pool.ntp.org", description: "NTP server hostname; blank resets to pool.ntp.org" }
+                gridRows:    { type: integer, minimum: 1, maximum: 64, example: 1,  description: "Display wall rows" }
+                gridCols:    { type: integer, minimum: 1, maximum: 64, example: 16, description: "Display wall columns" }
                 serialDebug: { type: boolean, example: true }
+                haEnabled:   { type: boolean, example: true, description: "Enable Home Assistant MQTT auto-discovery and entity state topics" }
                 otaPassword: { type: string, example: "mysecret" }
             examples:
               timezone:
                 value:
                   posixTZ: "EST5EDT,M3.2.0,M11.1.0"
+              ntp_server:
+                value:
+                  ntpServer: "time.google.com"
               debug_on:
                 value:
                   serialDebug: true
+              home_assistant:
+                value:
+                  haEnabled: true
               ota_password:
                 value:
                   otaPassword: "mysecret"
@@ -768,6 +1173,7 @@ components:
       properties:
         ts:      { type: integer, description: "Milliseconds since boot", example: 12345 }
         wt:      { type: string,  description: "Local wall-clock timestamp", example: "2026-06-10 14:32:01" }
+        ep:          { type: integer, description: "UTC epoch at capture (0 if RTC not set); UI renders in browser-local time", example: 1781210380 }
         dir:     { type: string,  enum: [R, T], description: "R=received, T=transmitted" }
         command: { type: string,  description: "Frame content (trailing newline stripped)", example: "m5-A" }
         len:     { type: integer, description: "Original byte length including newline", example: 5 }
@@ -780,8 +1186,11 @@ components:
         provisioned: { type: boolean, example: true }
         flapIndex:   { type: integer, description: "Last known flap index (-1 = unknown)", example: 1 }
         flapChar:    { type: string,  description: "Last known displayed character", example: "A" }
-        fwVersion:   { type: string,  description: "Firmware version string", example: "12" }
+        fwVersion:   { type: string,  description: "Firmware version string (empty for legacy v7-or-earlier modules, which do not answer the version command)", example: "12" }
         lastSeen:    { type: integer, description: "millis() of last activity (0 if not seen since boot; restored entries start at 0)", example: 45000 }
+        lastSeenEpoch: { type: integer, description: "RTC wall-clock epoch (seconds) of last activity; survives reboot. 0 if the RTC clock has never been set.", example: 1781210380 }
+        acked:       { type: boolean, description: "true once the module acknowledged provisioning (an acked module is, by definition, not legacy)", example: true }
+        dupSuspect:  { type: boolean, description: "true if a possible DUPLICATE ID was detected on the bus for this module -- repeated corrupt version/all replies (intact framing, garbled serial), the signature of two modules sharing one ID. Clears on the next clean version read.", example: false }
 
     SyncReply:
       type: object
@@ -809,6 +1218,18 @@ components:
         modules:   { type: integer, example: 6 }
         time:      { type: string,  description: "Local RTC time", example: "2026-06-10 14:32:01" }
         ntpSynced: { type: boolean, example: true }
+        maint:     { type: boolean, description: "true if maintenance mode is on (external MQTT commands ignored)", example: false }
+        quiet:     { type: boolean, description: "true if quiet time is on (flaps do not move for display updates)", example: false }
+        minheap:   { type: integer, description: "Minimum free heap ever observed (bytes)", example: 98000 }
+        stk:
+          type: object
+          description: "Per-task minimum-ever free stack in bytes (stack high-water marks)"
+          properties:
+            rs485: { type: integer, example: 3100 }
+            web:   { type: integer, example: 5200 }
+            net:   { type: integer, example: 2900 }
+            ota:   { type: integer, example: 2400 }
+            rtc:   { type: integer, example: 900 }
 
     Config:
       type: object
@@ -823,5 +1244,9 @@ components:
         parity:       { type: integer, description: "0=None 1=Even 2=Odd", example: 0 }
         stopBits:     { type: integer, example: 1 }
         posixTZ:      { type: string,  example: "EST5EDT,M3.2.0,M11.1.0" }
+        ntpServer:    { type: string,  example: "pool.ntp.org" }
+        gridRows:     { type: integer, example: 1,  description: "Display wall rows" }
+        gridCols:     { type: integer, example: 16, description: "Display wall columns" }
         serialDebug:  { type: boolean, example: false }
+        haEnabled:    { type: boolean, description: "true if Home Assistant MQTT discovery is enabled", example: false }
         otaPasswordSet: { type: boolean, description: "true if an OTA password is configured", example: false }
