@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "2.4"
+  version: "2.5"
   description: |
     REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v1.3).
 
@@ -477,22 +477,24 @@ paths:
   /api/flap/diag:
     post:
       tags: [Advanced]
-      summary: Run module self-diagnostics (firmware v26+)
+      summary: Self-diagnostics — stats snapshot + start the Hall test (firmware v26+)
       description: |
-        Runs both built-in self-tests on a module whose firmware is **v26 or
-        newer**:
+        First step of a three-test self-diagnostics run on a module whose
+        firmware is **v26 or newer**. Tests run in order **Q → T → M**:
 
-        - **Stats snapshot (`Q`)** — instant, no motor movement. Captured
-          synchronously and returned inline in this response as `q`. Reports the
-          last reset cause (raw RSTFR bits), boot counter, supply voltage (mV),
-          an EEPROM write-verify flag, and the current flap index. If the module
-          does not answer, `q` is `null` (the mechanical job is still started).
-        - **Mechanical self-test (`M`)** — drives the motor through several
-          revolutions (typically 20–60 s, bounded ~100 s), so it runs as an
-          **asynchronous job**. Poll `GET /api/flap/diag/status` for the result.
+        - **Stats snapshot (`Q`)** — instant, no motor. Captured synchronously and
+          returned inline here as `q`: last reset cause (raw RSTFR bits), boot
+          counter, supply voltage (mV), an EEPROM write-verify flag, and the
+          current flap index. If the module does not answer, `q` is `null` (the
+          Hall test is still started).
+        - **Hall sensor self-test (`T`)** — started by this call; drives the motor
+          ~2 revolutions to check the home sensor. Poll
+          `GET /api/flap/diag/status` for the result (`kind: hall`).
+        - **Mechanical self-test (`M`)** — started afterwards via
+          `POST /api/flap/diag/mech` once the Hall test completes.
 
-        Starting a diagnostics run for a different module while a mechanical test
-        is already in flight returns `409`.
+        Starting a run for a different module while a motor test is in flight
+        returns `409`.
       requestBody:
         required: true
         content:
@@ -505,16 +507,14 @@ paths:
             example: { id: 11 }
       responses:
         "200":
-          description: |
-            Stats snapshot captured (or `q: null` if unanswered) and the
-            mechanical self-test started.
+          description: Snapshot captured (q present, or null if unanswered) and the Hall test started.
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   ok:      { type: boolean, example: true }
-                  started: { type: boolean, description: "true once the mechanical job is running", example: true }
+                  started: { type: boolean, description: "true once the Hall test is running", example: true }
                   id:      { type: integer, example: 11 }
                   q:
                     type: object
@@ -532,7 +532,7 @@ paths:
         "400":
           description: Missing or invalid `id`.
         "409":
-          description: A mechanical self-test is already running for a different module.
+          description: A motor self-test is already running for a different module.
           content:
             application/json:
               schema:
@@ -541,22 +541,69 @@ paths:
                   ok:    { type: boolean, example: false }
                   error: { type: string,  example: "diagnostics already running for module 5" }
 
+  /api/flap/diag/mech:
+    post:
+      tags: [Advanced]
+      summary: Run the mechanical self-test (firmware v26+; rotation count v29+)
+      description: |
+        Second motor test of the run — started by the UI after the Hall test
+        completes. Spins the motor and measures steps-per-revolution
+        consistency. Poll `GET /api/flap/diag/status` for the result
+        (`kind: mech`).
+
+        The optional `revs` field requests a rotation count (**firmware v29+**),
+        clamped to **5–20** (default 5). More rotations catch intermittent faults
+        but take longer (~6 s per rotation). Omit `revs` to send the bare command
+        (default 5) — required for firmware v26–v28, which do not parse a count.
+        The poll window scales with the count.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:   { type: integer, description: "Module ID (0–254)" }
+                revs: { type: integer, minimum: 5, maximum: 20, description: "Optional rotation count, firmware v29+ (default 5)" }
+            example: { id: 11, revs: 10 }
+      responses:
+        "200":
+          description: Mechanical self-test started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  started: { type: boolean, example: true }
+                  id:      { type: integer, example: 11 }
+                  revs:    { type: integer, description: "Rotation count actually used (clamped 5–20)", example: 10 }
+              example: { ok: true, started: true, id: 11, revs: 10 }
+        "400":
+          description: Missing or invalid `id`.
+        "409":
+          description: A motor self-test is already running for a different module.
+
   /api/flap/diag/status:
     get:
       tags: [Advanced]
-      summary: Poll the asynchronous mechanical self-test
+      summary: Poll the active motor self-test (Hall or mechanical)
       description: |
-        Returns the current state of the mechanical self-test started by
-        `POST /api/flap/diag`. `pending` while the motor is still spinning;
-        `done` with the result once the module replies; `timeout` if no reply
-        arrived within the window (~100 s); `idle` if no job has run.
+        Returns the state of the motor test started by `POST /api/flap/diag`
+        (Hall) or `POST /api/flap/diag/mech` (mechanical). `kind` says which —
+        `hall` or `mech`. `pending` while spinning; `done` with the result;
+        `timeout` if no reply arrived in the window; `idle` if no job has run.
 
-        `code` interprets the result: `0` OK (all revolutions consistent),
-        `1` inconsistent (spread > 5 % — intermittent missed steps from drag, a
-        weak supply, or a failing driver), `2` no motion (open coil / dead
-        driver / jam, or a dead Hall sensor). `min`/`max` are the smallest and
-        largest steps-per-revolution measured, and `spreadTenths` is
-        `(max-min)/avg` in tenths of a percent (e.g. `23` = 2.3 %).
+        **Hall (`kind: hall`)** — `code`: 0 OK, 1 stuck-active, 2 stuck-inactive,
+        3 multiple active regions, 4 inverted polarity. `rising`/`falling` are the
+        home-edge counts (healthy 1/1); `active` is the active-sample width.
+
+        **Mechanical (`kind: mech`)** — `code`: 0 OK, 1 inconsistent (>5 % spread),
+        2 no motion. `min`/`max` are steps-per-rev; `spreadTenths` is (max-min)/avg
+        in tenths of a percent. `gateActive`/`gateSpan` describe the one-rev motion
+        gate (used to interpret a no-motion result); `magWidth` is the average
+        magnet width; `revs` is the comma-separated per-rotation step counts.
       responses:
         "200":
           description: Current job state.
@@ -567,16 +614,25 @@ paths:
                 properties:
                   ok:           { type: boolean, example: true }
                   state:        { type: string, enum: [idle, pending, done, timeout], example: "done" }
-                  id:           { type: integer, description: "Module ID (pending/done/timeout)", example: 11 }
-                  code:         { type: integer, enum: [0, 1, 2], description: "Mechanical result (state=done only): 0 OK, 1 inconsistent, 2 no motion", example: 0 }
-                  min:          { type: integer, description: "Smallest steps-per-rev measured (state=done only)", example: 4090 }
-                  max:          { type: integer, description: "Largest steps-per-rev measured (state=done only)", example: 4099 }
-                  spreadTenths: { type: integer, description: "(max-min)/avg in tenths of a percent (state=done only)", example: 3 }
+                  kind:         { type: string, enum: [hall, mech], description: "Which motor test (omitted when idle)", example: "mech" }
+                  id:           { type: integer, example: 11 }
+                  code:         { type: integer, description: "Result code (state=done). Hall: 0-4. Mech: 0 OK, 1 inconsistent, 2 no motion", example: 0 }
+                  rising:       { type: integer, description: "Hall only: rising home edges (healthy 1)", example: 1 }
+                  active:       { type: integer, description: "Hall only: active-sample width", example: 162 }
+                  falling:      { type: integer, description: "Hall only: falling home edges (healthy 1)", example: 1 }
+                  min:          { type: integer, description: "Mech only: smallest steps-per-rev", example: 4090 }
+                  max:          { type: integer, description: "Mech only: largest steps-per-rev", example: 4099 }
+                  spreadTenths: { type: integer, description: "Mech only: (max-min)/avg in tenths of a percent", example: 3 }
+                  gateActive:   { type: integer, description: "Mech only: Hall active-sample count over the motion gate", example: 162 }
+                  gateSpan:     { type: integer, description: "Mech only: steps driven during the motion gate (~1.1 rev)", example: 4505 }
+                  magWidth:     { type: integer, description: "Mech only: average magnet active-region width", example: 163 }
+                  revs:         { type: string,  description: "Mech only: comma-separated per-rotation step counts", example: "4096,4097,4096,4094,4096" }
               examples:
-                pending: { value: { ok: true, state: "pending", id: 11 } }
-                done:    { value: { ok: true, state: "done", id: 11, code: 0, min: 4090, max: 4099, spreadTenths: 3 } }
-                timeout: { value: { ok: true, state: "timeout", id: 11 } }
-                idle:    { value: { ok: true, state: "idle" } }
+                hallPending: { value: { ok: true, state: "pending", kind: "hall", id: 11 } }
+                hallDone:    { value: { ok: true, state: "done", kind: "hall", id: 11, code: 0, rising: 1, active: 162, falling: 1 } }
+                mechDone:    { value: { ok: true, state: "done", kind: "mech", id: 11, code: 0, min: 4094, max: 4097, spreadTenths: 0, gateActive: 162, gateSpan: 4505, magWidth: 163, revs: "4096,4097,4096,4094,4096" } }
+                timeout:     { value: { ok: true, state: "timeout", kind: "mech", id: 11 } }
+                idle:        { value: { ok: true, state: "idle" } }
 
   /api/flap/homeoffset:
     post:

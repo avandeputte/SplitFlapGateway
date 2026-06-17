@@ -142,18 +142,46 @@ to keep flashing simple and avoid erasing config on partition changes.
 - "Identify All" (`POST /api/flap/identify`) wipes both the in-memory list and
   the file, then broadcasts `m*v` to rebuild from scratch.
 
-`MAX_MODULES` is 200. With the EEPROM dump cache removed from the in-RAM struct
-(dumps are now fetched on demand), each `SFModule` is ~48 bytes, so the full
-registry is ~9.4 KB of RAM and the persisted file is ~7 KB -- both comfortable.
-The largest transient cost is the `handleApiModules` JSON response (~27 KB heap
-String at 200 modules), which is freed immediately after each send.
+`MAX_MODULES` is 255, covering module IDs 0-254 (ID 255 is reserved as the
+empty-slot / unprovisioned sentinel). With the EEPROM dump cache removed from
+the in-RAM struct (dumps are now fetched on demand), each `SFModule` is ~48
+bytes, so the full registry is ~12 KB of RAM and the persisted file is ~9 KB --
+both comfortable on the 8 MB-PSRAM / 512 KB-SRAM ESP32-S3. The largest transient
+cost is the `handleApiModules` JSON response (~33 KB heap String at 255
+modules), which is `reserve()`d up front and freed immediately after each send.
+
+A deliberate design point: the RS-485 **frame buffers** (`MSG_MAX_BYTES` = 256
+for the monitor ring, `TX_MAX_BYTES` = 768 for outbound frames, `MQTT_BUF_SIZE`
+= 768) are sized by the **largest single frame**, not by module count. The
+worst-case frame is a full 64-flap EEPROM restore (`mXW<sn>:<offset>:<steps>:<map>`,
+~620 bytes) -- a frame always targets one module, so raising the module ceiling
+from 200 to 255 does not change them. Three-digit IDs (vs two) add at most ~1
+byte to a handful of commands, still far inside `TX_MAX_BYTES`. These buffers
+were sized for the frame, and the frame is what bounds them.
 
 ## Time handling
 
 The RTC stores UTC. Local time is derived at format time using the configured
 POSIX TZ string (DST-aware). The `timeMutex` serialises all time-formatting
 calls because newlib's time functions and the `TZ` environment are process-wide
-and not thread-safe.
+and not thread-safe. The NTP server is configurable (default `pool.ntp.org`);
+`configTime` is always called with a zero offset so the system clock is UTC and
+`mktime` acts as `timegm`, avoiding double-offset bugs.
+
+## Diagnostics
+
+The periodic `[WDG]` line and the boot banner are the primary field-debugging
+surface. Boot prints `esp_reset_reason()` (distinguishing a firmware `PANIC`
+from a `BROWNOUT` power fault from a clean `POWERON`) plus a heap/PSRAM/flash
+snapshot. The `[WDG]` line, emitted every 30 s, carries free heap, minimum-ever
+heap, largest allocatable block and a derived fragmentation %, per-task stack
+high-water marks (the early-warning signal for the stack-canary crash class),
+bus RX/TX counters, a parse-reject counter (rising = bus collisions or noise),
+WiFi RSSI, and MQTT state. Stall reboots name the offending task and its age;
+low-heap reboots log the heap value. None of this requires the serial-debug
+toggle -- it is always on, because the situations it diagnoses (unexpected
+reboots, slow memory leaks, bus corruption) are exactly the ones where you
+cannot reproduce on demand.
 
 ## Protocol note: dump-by-serial vs dump-by-id
 
@@ -162,3 +190,27 @@ module reports firmware **v15 or newer**, because `mXD` does not exist in older
 firmware. For older modules (or if the SN-based request times out) it falls back
 to the ID-based `m<id>d`. This keeps the EEPROM inspector working across all
 firmware versions.
+
+## Module self-diagnostics
+
+The 🩺 diagnostics action (module firmware v26+) runs three tests in the fixed
+order **Q → T → M**, reusing the existing reply-capture machinery rather than
+adding a parallel path. The **`Q` stats snapshot** is instant and captured
+synchronously in the request handler, exactly like an EEPROM dump: arm a wait
+slot, send the frame, spin on a ready flag with the web-task watchdog touched.
+The **`T` Hall self-test** and **`M` mechanical test** are motor-driven (~2 and
+~6+ revolutions), so they share a single async job — only one motor test is ever
+in flight. The browser sequences them: `POST /api/flap/diag` returns the
+snapshot and starts `T`; once the poll reports `T` done it calls
+`POST /api/flap/diag/mech` to start `M`. The `M` job deadline scales with the
+requested rotation count (5–20 on firmware v29+), because the motor time does.
+
+The reply frames (`m<id>Q:…`, `m<id>T:…`, `m<id>M:…`) are parsed in
+`sfParseResponse` alongside `v`/`d`/`A`, into per-test capture globals; the `M`
+parser keeps the trailing comma-separated per-rotation list as its greedy last
+field. `GET /api/flap/diag/status` is consume-on-read (it reports `done` once,
+then `idle`), so the UI poller is built to match: one request in flight at a
+time (self-scheduling, not a fixed interval), firing its terminal callback
+exactly once, with a generation counter that cancels any stale poller left by a
+new run or a closed modal. That combination is what stops a late `idle` read
+from clobbering a result the module actually returned.

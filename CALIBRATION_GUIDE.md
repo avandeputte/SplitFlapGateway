@@ -241,6 +241,35 @@ The status line under each flap tells you exactly what happened ("Saved custom
 position 333", "Already at default — no change needed", and so on). When you reach
 the last flap, the wizard closes and refreshes the Character Map.
 
+### Calibrating the whole board at once
+
+The per-module wizard above is the way to dial in one module. When you're
+checking or correcting an **entire wall**, the **Calibrate Whole Board** button
+(in the same **Calibration** section) is faster: it steps *every* module to the
+same flap at once, so you walk the wall one character at a time instead of one
+module at a time.
+
+For each flap, every module is told to show that character (a single broadcast,
+so each module uses its own saved map). Look across the wall:
+
+- Modules that are correct need nothing — move on with **Next**.
+- For any module that's **off**, click its cell in the grid. That loads the
+  module and opens the same per-character nudge dialog used everywhere else;
+  adjust until centered and the fix is saved to that module. The cell turns green
+  to mark it fixed.
+- **Prev / Next** move between flaps, and you can jump straight to a specific
+  flap. **Finish** ends the pass.
+
+Because it reuses the single-module tuning dialog, corrections behave identically
+(same nudge steps, same custom-vs-default save rules as above). The whole-board
+wizard also leaves **Maintenance mode exactly as it found it** — if maintenance
+was off when you started, it's turned back off when you finish.
+
+A cell flagged **DUP?** means two modules may share that ID; nudging it could move
+or save the wrong module, so the wizard asks you to confirm before correcting it.
+Resolve duplicate IDs (deprovision and reassign) before relying on a whole-board
+pass.
+
 ---
 
 ## Typical workflows

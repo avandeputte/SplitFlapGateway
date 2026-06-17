@@ -464,12 +464,17 @@ static volatile bool          sfCalibJobActive   = false;  // a job is in flight
 static volatile int           sfCalibJobId       = -1;     // module being calibrated
 static volatile int           sfCalibJobSteps    = -1;     // measured result (-1 until done)
 static volatile unsigned long sfCalibJobDeadline = 0;      // millis() timeout
-// Self-diagnostics (module firmware v26+). Two tests run per request:
-//   'Q' snapshot  m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>
-//                 -- instant (no motor), captured synchronously like a dump.
-//   'M' mechanical m<id>M:<code>:<min>:<max>:<spreadTenthsPct>
-//                 -- drives the motor ~6 revolutions (can take 20-100s on a
-//                    large reel), so it uses an async job like calibrate.
+// Self-diagnostics (module firmware v26+; extended in v28). Three tests run per
+// request, in order Q -> T -> M (browser-sequenced):
+//   'Q' snapshot   m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>
+//                  -- instant (no motor), captured synchronously like a dump.
+//   'T' Hall test  m<id>T:<code>:<risingEdges>:<activeSamples>:<fallingEdges>
+//                  -- drives the motor ~2 revolutions.
+//   'M' mechanical m<id>M:<code>:<min>:<max>:<spread>:<gateActive>:<gateSpan>:
+//                          <avgMagnetWidth>:<r1>,<r2>,...,<rN>
+//                  -- drives the motor ~6 revolutions (can take 20-100s).
+// T and M are motor-driven, so they share one async job (only one runs at a
+// time); the browser starts T, polls, then starts M and polls again.
 static volatile int           sfDiagQWaitId = -1;  // id the Q capture is waiting on
 static volatile unsigned long sfDiagQTs     = 0;   // ready flag (0=none)
 static volatile int           sfDiagQReset  = 0;
@@ -477,15 +482,27 @@ static volatile int           sfDiagQBoot   = 0;
 static volatile int           sfDiagQVcc    = 0;
 static volatile int           sfDiagQEe     = 0;
 static volatile int           sfDiagQCur    = -1;
+static volatile int           sfDiagTWaitId = -1;  // id the parser captures T for
+static volatile unsigned long sfDiagTTs     = 0;   // T ready flag (0=none)
+static volatile int           sfDiagTCode    = -1;
+static volatile int           sfDiagTRising  = 0;
+static volatile int           sfDiagTActive  = 0;
+static volatile int           sfDiagTFalling = 0;
 static volatile int           sfDiagMWaitId = -1;  // id the parser captures M for
 static volatile unsigned long sfDiagMTs     = 0;   // M ready flag (0=none)
-static volatile int           sfDiagMCode   = -1;
-static volatile int           sfDiagMMin    = 0;
-static volatile int           sfDiagMMax    = 0;
-static volatile int           sfDiagMSpread = 0;
-static volatile bool          sfDiagMJobActive = false;  // an M test is in flight
-static volatile int           sfDiagMJobId     = -1;
-static volatile unsigned long sfDiagMDeadline  = 0;      // millis() timeout
+static volatile int           sfDiagMCode      = -1;
+static volatile int           sfDiagMMin       = 0;
+static volatile int           sfDiagMMax       = 0;
+static volatile int           sfDiagMSpread    = 0;
+static volatile int           sfDiagMGateActive= 0;   // Hall active-sample count over the motion gate
+static volatile int           sfDiagMGateSpan  = 0;   // steps driven during the gate (~1.1 rev)
+static volatile int           sfDiagMMagWidth  = 0;   // avg magnet active-region width across revs
+static char                   sfDiagMRevs[256] = {0}; // raw "r1,r2,..." per-rev list (parser writes, web reads)
+// Shared async motor-test job ('T' then 'M'); Q is captured synchronously.
+static volatile bool          sfDiagJobActive   = false;
+static volatile int           sfDiagJobId       = -1;
+static volatile char          sfDiagJobKind     = 0;   // 'T' or 'M'
+static volatile unsigned long sfDiagJobDeadline = 0;   // millis() timeout
 static volatile bool          sfModulesDirty   = false;  // pending NVS save
 static volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
 static bool          ntpSynced   = false; // declared early; also set in taskNetwork
@@ -2017,8 +2034,12 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     for (int k = (int)strlen(aBuf)-1; k >= 0 && (aBuf[k]=='\n'||aBuf[k]=='\r'||aBuf[k]==' '); k--) aBuf[k] = 0;
     // Split into the 7 scalar fields plus the trailing map (which has no ':').
     // f: 0 ver, 1 modId, 2 sn, 3 homeOffset, 4 totalSteps, 5 autoHome, 6 curIndex, 7 map
-    char* f[8] = {0}; f[0] = aBuf; int fi = 1;
-    for (char* cp = aBuf; *cp && fi < 8; cp++) { if (*cp == ':') { *cp = 0; f[fi++] = cp + 1; } }
+    // The cap is well above the 8 fields we use: because the map is colon-free it
+    // still lands cleanly in f[7], and any field a future firmware appends after
+    // it falls into f[8+] and is harmlessly ignored -- rather than being glued
+    // onto the map (which would corrupt the dump/backup string).
+    char* f[16] = {0}; f[0] = aBuf; int fi = 1;
+    for (char* cp = aBuf; *cp && fi < 16; cp++) { if (*cp == ':') { *cp = 0; f[fi++] = cp + 1; } }
     char fwCopy[8] = "?";
     if (f[0] && f[0][0]) strlcpy(fwCopy, f[0], sizeof(fwCopy));
     int reportedId = (f[1] && f[1][0]) ? atoi(f[1]) : -1;
@@ -2084,26 +2105,57 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       id, rc, boot, vcc, ee, cur);
     mqttPublishSFEvent("diag", payload);
   }
-  // Mechanical self-test (firmware v26+): m<id>M:<code>:<min>:<max>:<spreadTenthsPct>
+  // Mechanical self-test (v26+; v28 appends gate/magnet/per-rev fields):
+  // m<id>M:<code>:<min>:<max>:<spread>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,...,<rN>
   else if (cmd == 'M' && *p == ':') {
-    char mb[48];
+    char mb[256];
     strlcpy(mb, p + 1, sizeof(mb));
     for (int k = (int)strlen(mb)-1; k >= 0 && (mb[k]=='\n'||mb[k]=='\r'||mb[k]==' '); k--) mb[k] = 0;
-    char* mf[4] = {0}; mf[0] = mb; int mi = 1;
-    for (char* cp = mb; *cp && mi < 4; cp++) { if (*cp == ':') { *cp = 0; mf[mi++] = cp + 1; } }
+    char* mf[8] = {0}; mf[0] = mb; int mi = 1;
+    for (char* cp = mb; *cp && mi < 8; cp++) { if (*cp == ':') { *cp = 0; mf[mi++] = cp + 1; } }
     int code = (mf[0] && mf[0][0]) ? atoi(mf[0]) : -1;
     int mn   = (mf[1] && mf[1][0]) ? atoi(mf[1]) : 0;
     int mx   = (mf[2] && mf[2][0]) ? atoi(mf[2]) : 0;
     int spr  = (mf[3] && mf[3][0]) ? atoi(mf[3]) : 0;
-    DBG("[SF] Module %d diag M: code=%d min=%d max=%d spread=%d\n", id, code, mn, mx, spr);
+    int ga   = (mf[4] && mf[4][0]) ? atoi(mf[4]) : 0;
+    int gs   = (mf[5] && mf[5][0]) ? atoi(mf[5]) : 0;
+    int mw   = (mf[6] && mf[6][0]) ? atoi(mf[6]) : 0;
+    const char* revs = (mf[7] && mf[7][0]) ? mf[7] : "";
+    DBG("[SF] Module %d diag M: code=%d min=%d max=%d spread=%d gateA=%d gateS=%d magW=%d revs=%s\n",
+        id, code, mn, mx, spr, ga, gs, mw, revs);
     if (sfDiagMWaitId == (int)id) {
       sfDiagMCode = code; sfDiagMMin = mn; sfDiagMMax = mx; sfDiagMSpread = spr;
+      sfDiagMGateActive = ga; sfDiagMGateSpan = gs; sfDiagMMagWidth = mw;
+      strlcpy(sfDiagMRevs, revs, sizeof(sfDiagMRevs));
       sfDiagMTs = millis();
     }
-    char payload[80];
+    char payload[96];
     snprintf(payload, sizeof(payload),
       "{\"id\":%d,\"code\":%d,\"min\":%d,\"max\":%d,\"spreadTenths\":%d}",
       id, code, mn, mx, spr);
+    mqttPublishSFEvent("diag", payload);
+  }
+  // Hall sensor self-test (v26+; v28 appends fallingEdges):
+  // m<id>T:<code>:<risingEdges>:<activeSamples>:<fallingEdges>
+  else if (cmd == 'T' && *p == ':') {
+    char tb[48];
+    strlcpy(tb, p + 1, sizeof(tb));
+    for (int k = (int)strlen(tb)-1; k >= 0 && (tb[k]=='\n'||tb[k]=='\r'||tb[k]==' '); k--) tb[k] = 0;
+    char* tf[4] = {0}; tf[0] = tb; int ti = 1;
+    for (char* cp = tb; *cp && ti < 4; cp++) { if (*cp == ':') { *cp = 0; tf[ti++] = cp + 1; } }
+    int code = (tf[0] && tf[0][0]) ? atoi(tf[0]) : -1;
+    int rise = (tf[1] && tf[1][0]) ? atoi(tf[1]) : 0;
+    int act  = (tf[2] && tf[2][0]) ? atoi(tf[2]) : 0;
+    int fall = (tf[3] && tf[3][0]) ? atoi(tf[3]) : 0;
+    DBG("[SF] Module %d diag T: code=%d rising=%d active=%d falling=%d\n", id, code, rise, act, fall);
+    if (sfDiagTWaitId == (int)id) {
+      sfDiagTCode = code; sfDiagTRising = rise; sfDiagTActive = act; sfDiagTFalling = fall;
+      sfDiagTTs = millis();
+    }
+    char payload[96];
+    snprintf(payload, sizeof(payload),
+      "{\"id\":%d,\"hallCode\":%d,\"rising\":%d,\"active\":%d,\"falling\":%d}",
+      id, code, rise, act, fall);
     mqttPublishSFEvent("diag", payload);
   }
 }
@@ -2794,7 +2846,7 @@ void handleRoot() {
   server.sendContent("function parseDump(raw){if(!raw)return{error:\"No data\"};var parts=raw.split(\":\");if(parts.length<2)return{error:\"Invalid format\",raw:raw};var r={homeOffset:parseInt(parts[0]),totalSteps:parseInt(parts[1]),map:{}};if(parts[2])parts[2].split(\",\").forEach(function(e){var kv=e.split(\"=\");if(kv.length===2&&kv[0]!==\"\")r.map[parseInt(kv[0])]=parseInt(kv[1]);});return r;}");
   server.sendContent("function refreshModules(){var el=document.getElementById(\"refreshR\");el.textContent=\"Identifying...\";fetch(\"/api/flap/identify\",{method:\"POST\"}).then(function(r){return r.json();}).then(function(j){el.textContent=j.ok?\"List cleared, identifying all modules -- refreshing in 2s\":\"Error: \"+j.error;if(j.ok)setTimeout(function(){loadModules();},2000);setTimeout(function(){loadModules();el.textContent=\"\";},7000);}).catch(function(e){el.textContent=\"Error: \"+e;});}");
   server.sendContent("function doBackup(){var prog=document.getElementById(\"backupProg\");var res=document.getElementById(\"backupR\");res.textContent=\"\";prog.textContent=\"Loading module list...\";fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(mods){var targets=mods.filter(function(m){return m.sn&&m.sn.length>0;});if(!targets.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules with serial numbers found. Run Identify All first.</span>\";return;}var out={version:1,created:new Date().toISOString(),modules:[]};var i=0,okN=0,failN=0;function next(){if(i>=targets.length){prog.textContent=\"\";if(!out.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No calibration data could be read.</span>\";return;}var blob=new Blob([JSON.stringify(out,null,2)],{type:\"application/json\"});var url=URL.createObjectURL(blob);var a=document.createElement(\"a\");var ts=new Date().toISOString().replace(/[:.]/g,\"-\").slice(0,19);a.href=url;a.download=\"splitflap-backup-\"+ts+\".json\";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Backup created: \"+okN+\" module(s) saved\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\";return;}var m=targets[i];prog.textContent=\"Reading module \"+(i+1)+\" of \"+targets.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/dump\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:m.id})}).then(function(r){return r.json();}).then(function(d){if(d.ok&&d.dump){out.modules.push({sn:m.sn,id:m.id,dump:d.dump});okN++;}else{failN++;}i++;next();}).catch(function(){failN++;i++;next();});}next();}).catch(function(e){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Error: \"+e+\"</span>\";});}function parseBackupDump(raw){var parts=raw.split(\":\");if(parts.length<2)return null;var ho=parseInt(parts[0]),ts=parseInt(parts[1]);if(isNaN(ho)||isNaN(ts))return null;var map=parts.length>2?parts.slice(2).join(\":\"):\"\";return {homeOffset:ho,totalSteps:ts,map:map};}function doRestore(){var prog=document.getElementById(\"restoreProg\");var res=document.getElementById(\"restoreR\");var fileInput=document.getElementById(\"restoreFile\");var preserve=document.getElementById(\"preserveId\").checked;res.textContent=\"\";if(!fileInput.files||!fileInput.files.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Choose a backup file first.</span>\";return;}var reader=new FileReader();reader.onload=function(){var data;try{data=JSON.parse(reader.result);}catch(e){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Invalid JSON file.</span>\";return;}if(!data||!Array.isArray(data.modules)||!data.modules.length){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">No modules found in backup file.</span>\";return;}var mods=data.modules,i=0,okN=0,failN=0;function next(){if(i>=mods.length){prog.textContent=\"\";res.innerHTML=\"<span style=\\\"color:var(--grn)\\\">Restore complete: \"+okN+\" module(s)\"+(failN?\", \"+failN+\" failed\":\"\")+\".</span>\"+(preserve?\"\":\" IDs were reassigned from the backup.\");return;}var m=mods[i];if(!m.sn){failN++;i++;next();return;}var p=parseBackupDump(m.dump||\"\");if(!p){failN++;i++;next();return;}prog.textContent=\"Restoring module \"+(i+1)+\" of \"+mods.length+\" (SN \"+m.sn+\")...\";fetch(\"/api/flap/restorebysn\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,homeOffset:p.homeOffset,totalSteps:p.totalSteps,map:p.map})}).then(function(r){return r.json();}).then(function(d){if(!d.ok){failN++;i++;next();return;}if(!preserve&&typeof m.id===\"number\"&&m.id>=0){fetch(\"/api/flap/provision\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({sn:m.sn,id:m.id})}).then(function(r){return r.json();}).then(function(){okN++;i++;next();}).catch(function(){okN++;i++;next();});}else{okN++;i++;next();}}).catch(function(){failN++;i++;next();});}next();};reader.onerror=function(){res.innerHTML=\"<span style=\\\"color:var(--hi)\\\">Could not read file.</span>\";};reader.readAsText(fileInput.files[0]);}");
-  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?(\"ID: <span class='mid'>\"+m.id+\"</span>\"+(legacy?\"<span class='mlegacy' title='Firmware v7 or earlier: no serial number, no provisioning, no factory reset. Homing and calibration are fully supported.'>LEGACY</span>\":\"\")+(m.dupSuspect?\"<span style='display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;background:var(--hi);color:#fff;font-size:.66rem;font-weight:bold;vertical-align:middle' title='Repeated corrupt version replies for this ID -- two modules may share it. Deprovision and reassign unique IDs.'>DUP ID?</span>\":\"\")):\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var delBtn=legacy?(\"<button class='micon del dis' title='Not available on legacy (v7) modules' onclick=\\\"event.stopPropagation()\\\">&#x1f5d1;</button>\"):(\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\");var fwn=m.fwVersion?parseInt(m.fwVersion):0;var diagBtn=(m.provisioned&&fwn>=26)?(\"<button class='micon' title='Run self-diagnostics (mechanical + stats)' onclick=\\\"runDiag(\"+m.id+\")\\\">&#x1fa7a;</button>\"):\"\";var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+diagBtn+delBtn+\"</div>\"):\"\";var snStr=legacy?\"SN: <span style='color:var(--dim)'>n/a (legacy)</span>\":(\"SN: \"+m.sn);var fwStr=legacy?\"<br><span class='mc'>FW: v7 or earlier</span>\":(m.fwVersion?\"<br><span class='mc'>FW: \"+(m.fwVersion==\"<18\"?\"older (pre-v18)\":(\"v\"+m.fwVersion))+\"</span>\":\"\");h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>\"+snStr+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+fwStr+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
+  server.sendContent("function loadModules(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var g=document.getElementById(\"modGrid\");if(!arr.length){g.innerHTML=\"<p style='color:var(--dim)'>No modules detected yet.</p>\";return;}var h=\"\";arr.forEach(function(m){var legacy=m.provisioned&&m.lastSeen>0&&!m.fwVersion&&!m.sn&&!m.acked;var cls=m.provisioned?\"mod\":\"mod unprovisioned\";var idStr=m.provisioned?(\"ID: <span class='mid'>\"+m.id+\"</span>\"+(legacy?\"<span class='mlegacy' title='Firmware v7 or earlier: no serial number, no provisioning, no factory reset. Homing and calibration are fully supported.'>LEGACY</span>\":\"\")+(m.dupSuspect?\"<span style='display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;background:var(--hi);color:#fff;font-size:.66rem;font-weight:bold;vertical-align:middle' title='Repeated corrupt version replies for this ID -- two modules may share it. Deprovision and reassign unique IDs.'>DUP ID?</span>\":\"\")):\"<span style='color:var(--hi)'>Unprovisioned</span>\";var charStr=m.flapChar?\"Showing: <b>\"+m.flapChar+\"</b>\":\"\";var delBtn=legacy?(\"<button class='micon del dis' title='Not available on legacy (v7) modules' onclick=\\\"event.stopPropagation()\\\">&#x1f5d1;</button>\"):(\"<button class='micon del' title='Destructive actions' onclick=\\\"openDel(\"+m.id+\")\\\">&#x1f5d1;</button>\");var fwn=m.fwVersion?parseInt(m.fwVersion):0;var diagBtn=(m.provisioned&&fwn>=26)?(\"<button class='micon' title='Run self-diagnostics (mechanical + stats)' onclick=\\\"runDiag(\"+m.id+\",\"+fwn+\")\\\">&#x1fa7a;</button>\"):\"\";var icons=m.provisioned?(\"<div class='micons'>\"+\"<button class='micon' title='Home' onclick=\\\"modHome(\"+m.id+\")\\\">&#x2302;</button>\"+\"<button class='micon' title='Info / EEPROM' onclick=\\\"openInfo(\"+m.id+\")\\\">&#x2139;</button>\"+diagBtn+delBtn+\"</div>\"):\"\";var snStr=legacy?\"SN: <span style='color:var(--dim)'>n/a (legacy)</span>\":(\"SN: \"+m.sn);var fwStr=legacy?\"<br><span class='mc'>FW: v7 or earlier</span>\":(m.fwVersion?\"<br><span class='mc'>FW: \"+(m.fwVersion==\"<18\"?\"older (pre-v18)\":(\"v\"+m.fwVersion))+\"</span>\":\"\");h+=\"<div class='\"+cls+\"' data-mid='\"+m.id+\"'>\"+icons+idStr+\"<br><span class='mc'>\"+snStr+\"</span>\"+(charStr?\"<br><span class='mc'>\"+charStr+\"</span>\":\"\")+fwStr+\"</div>\";});g.innerHTML=h;}).catch(function(){document.getElementById(\"modGrid\").innerHTML=\"Error loading modules\";});}");
   server.sendContent("loadModules();setInterval(loadModules,5000);");
   server.sendContent("function loadUnprovisioned(){fetch(\"/api/flap/modules\").then(function(r){return r.json();}).then(function(arr){var el=document.getElementById(\"unprovList\");var up=arr.filter(function(m){return !m.provisioned;});if(!up.length){el.innerHTML=\"<p style=\\\"color:var(--dim)\\\">No unprovisioned modules seen yet.</p>\";return;}var h=\"\";up.forEach(function(m){h+=\"<div style=\\\"display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap\\\">\"+\"<code style=\\\"color:var(--ylw);flex:1;min-width:160px\\\">\"+m.sn+\"</code>\"+\"<button class=\\\"sec\\\" style=\\\"margin:0;padding:4px 10px;font-size:.78rem\\\" onclick=\\\"doHomeSN('\"+m.sn+\"')\\\" title=\\\"Home this module to identify it\\\">Home</button>\"+\"</div>\";});el.innerHTML=h;}).catch(function(){});}");
   server.sendContent("setInterval(loadUnprovisioned,10000);loadUnprovisioned();");
@@ -2878,13 +2930,18 @@ server.sendContent("var _bmFlap=-1,_bmSt=null,_bmArr=[],_bmCorrected={},_bmMaint
   server.sendContent("function calWizBack(){if(_wizIdx>0)_wizIdx--;calWizShow();}");
   server.sendContent("function calWizFinish(){document.getElementById(\"wizModal\").style.display=\"none\";_wizIdx=-1;calRenderMap();document.getElementById(\"calStatus\").textContent=\"Calibration wizard complete -- all flaps reviewed.\";}");
   server.sendContent("function calWizExit(){if(!confirm(\"Exit the wizard? Flaps you already confirmed are saved; the rest are unchanged.\"))return;document.getElementById(\"wizModal\").style.display=\"none\";_wizIdx=-1;calRenderMap();}");
-  server.sendContent("var _diagId=-1;");
-  server.sendContent("function closeDiag(){document.getElementById(\"diagModal\").style.display=\"none\";}");
+  server.sendContent("var _diagId=-1;var _diagFw=0;var _diagGen=0;");
+  server.sendContent("function closeDiag(){_diagGen++;document.getElementById(\"diagModal\").style.display=\"none\";}");
   server.sendContent("function diagRow(k,v,warn){return \"<tr><td style='color:var(--dim);padding:3px 12px 3px 0;vertical-align:top;white-space:nowrap'>\"+k+\"</td><td style='\"+(warn?\"color:var(--hi);font-weight:bold\":\"\")+\"'>\"+v+\"</td></tr>\";}");
   server.sendContent("function diagResetText(rc){if(rc===0)return \"none recorded (0)\";var b=[];if(rc&1)b.push(\"power-on\");if(rc&2)b.push(\"brown-out (supply dipped)\");if(rc&4)b.push(\"external/reset pin\");if(rc&8)b.push(\"watchdog (recovered from a hang)\");if(rc&16)b.push(\"software\");if(!b.length)b.push(\"unknown\");return b.join(\", \")+\" (0x\"+rc.toString(16)+\")\";}");
   server.sendContent("function diagQSection(q){if(!q)return \"<h4 style='margin:0 0 6px'>Stats snapshot (Q)</h4><p style='color:var(--hi)'>No response to the stats query -- the module did not answer (check it is powered and on the bus).</p>\";var rows=\"\";var rc=q.resetCause;var rcWarn=((rc&2)||(rc&8))?true:false;rows+=diagRow(\"Last reset cause\",diagResetText(rc),rcWarn);rows+=diagRow(\"Boot count\",q.bootCount+\" (since counter reset; wraps at 255)\",false);var vWarn=(q.vcc>0)&&((q.vcc>=4000)?(q.vcc<4500):(q.vcc<3000));var vtxt=(q.vcc>0?(q.vcc/1000).toFixed(2)+\" V\":\"n/a\")+(vWarn?\" -- LOW (risks brown-outs under load)\":\"\");rows+=diagRow(\"Supply voltage\",vtxt,vWarn);rows+=diagRow(\"EEPROM verify\",q.eepromOk?\"passed\":\"FAILED -- calibration storage may be unreliable\",!q.eepromOk);var ci=(q.curIndex===-1)?\"unknown (needs homing)\":((q.curIndex===-2)?\"released\":q.curIndex);rows+=diagRow(\"Current flap index\",ci,false);return \"<h4 style='margin:0 0 6px'>Stats snapshot (Q)</h4><table style='border-collapse:collapse;width:100%'>\"+rows+\"</table>\";}");
-  server.sendContent("function diagMSection(s){var code=s.code;var spread=(s.spreadTenths/10).toFixed(1);var verdict,vcol,detail;if(code===0){verdict=\"OK -- motor, driver and supply are healthy.\";vcol=\"var(--grn)\";detail=\"All revolutions were consistent (spread \"+spread+\"%, within the 5% tolerance).\";}else if(code===1){verdict=\"INCONSISTENT -- intermittent missed steps.\";vcol=\"var(--ylw)\";detail=\"Revolutions varied by \"+spread+\"% (over the 5% limit). Likely mechanical drag or binding, a weak/sagging supply, or a failing motor driver.\";}else if(code===2){verdict=\"NO MOTION -- the reel did not turn.\";vcol=\"var(--hi)\";detail=\"Over a full revolution the home sensor never saw the magnet enter and leave. Likely an open motor coil, a dead driver, or a jam. A dead Hall sensor gives the same result -- if the motor is clearly turning, suspect the sensor.\";}else{verdict=\"Unknown result (code \"+code+\").\";vcol=\"var(--hi)\";detail=\"\";}var rows=diagRow(\"Result\",\"<span style='color:\"+vcol+\";font-weight:bold'>\"+verdict+\"</span>\",false);if(s.min||s.max)rows+=diagRow(\"Steps/rev (min..max)\",s.min+\" .. \"+s.max,false);rows+=diagRow(\"Spread\",spread+\"%\",code===1);return \"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><table style='border-collapse:collapse;width:100%'>\"+rows+\"</table>\"+(detail?\"<p style='font-size:.8rem;color:var(--dim);margin-top:6px'>\"+detail+\"</p>\":\"\");}");
-  server.sendContent("function runDiag(id){_diagId=id;document.getElementById(\"diagTitle\").textContent=\"Diagnostics -- Module \"+id;var b=document.getElementById(\"diagBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading stats snapshot...</p>\";document.getElementById(\"diagModal\").style.display=\"flex\";fetch(\"/api/flap/diag\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(j){if(!j.ok){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+(j.error||\"could not start diagnostics\")+\"</p>\";return;}var html=diagQSection(j.q);html+=\"<div id='diagMsec' style='margin-top:14px'><h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--ylw)'>Motor is spinning through several revolutions -- this can take 20-60s. Please wait...</p></div>\";b.innerHTML=html;var tries=0;var poll=setInterval(function(){tries++;if(tries>115){clearInterval(poll);var e=document.getElementById(\"diagMsec\");if(e)e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>Timed out waiting for the result.</p>\";return;}fetch(\"/api/flap/diag/status\").then(function(r){return r.json();}).then(function(st){if(st.state===\"pending\")return;clearInterval(poll);var e=document.getElementById(\"diagMsec\");if(!e)return;if(st.state===\"done\"){e.innerHTML=diagMSection(st);}else if(st.state===\"timeout\"){e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>No response from the module (timed out). The motor may be jammed, or the module reset during the test.</p>\";}else{e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>The test did not run.</p>\";}}).catch(function(){});},1000);}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
+  server.sendContent("function diagMSection(s){var code=s.code;var spread=(s.spreadTenths/10).toFixed(1);var verdict,vcol,detail;if(code===0){verdict=\"OK -- motor, driver and supply are healthy.\";vcol=\"var(--grn)\";detail=\"All revolutions were consistent (spread \"+spread+\"%, within the 5% tolerance).\";}else if(code===1){verdict=\"INCONSISTENT -- intermittent missed steps.\";vcol=\"var(--ylw)\";detail=\"Revolutions varied by \"+spread+\"% (over the 5% limit). Likely mechanical drag or binding, a weak/sagging supply, or a failing motor driver.\";}else if(code===2){verdict=\"NO MOTION -- the reel did not turn.\";vcol=\"var(--hi)\";var gs=s.gateSpan||0,ga=s.gateActive||0;if(ga===0){detail=\"Over a full revolution the home sensor never went active. The reel under-rotated or slipped, or the magnet is missing/wrong. If the Hall test above passed, suspect the motor (open coil, dead driver, jam).\";}else if(gs>0&&ga>=gs*0.9){detail=\"The sensor stayed active the whole sweep -- the reel is likely parked on the magnet, or the sensor is stuck active (see the Hall test above).\";}else{detail=\"The sensor never saw the magnet both enter and leave. Likely an open motor coil, a dead driver, or a jam; a dead Hall sensor gives the same result (check the Hall test above).\";}}else{verdict=\"Unknown result (code \"+code+\").\";vcol=\"var(--hi)\";detail=\"\";}var rows=diagRow(\"Result\",\"<span style='color:\"+vcol+\";font-weight:bold'>\"+verdict+\"</span>\",false);if(s.min||s.max)rows+=diagRow(\"Steps/rev (min..max)\",s.min+\" .. \"+s.max,false);rows+=diagRow(\"Spread\",spread+\"%\",code===1);if(s.revs)rows+=diagRow(\"Per-rev counts\",s.revs.split(\",\").join(\", \"),false);if(s.magWidth)rows+=diagRow(\"Magnet width (avg)\",s.magWidth+\" steps\",false);if(code===2)rows+=diagRow(\"Motion gate\",(s.gateActive||0)+\" active / \"+(s.gateSpan||0)+\" steps\",false);return \"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><table style='border-collapse:collapse;width:100%'>\"+rows+\"</table>\"+(detail?\"<p style='font-size:.8rem;color:var(--dim);margin-top:6px'>\"+detail+\"</p>\":\"\");}");
+  server.sendContent("function diagTSection(t){var code=t.code;var verdict,vcol,detail;if(code===0){verdict=\"OK -- one clean home region per revolution.\";vcol=\"var(--grn)\";detail=\"The sensor went active exactly once as the magnet passed.\";}else if(code===1){verdict=\"STUCK ACTIVE -- reads active all the way round.\";vcol=\"var(--hi)\";detail=\"The sensor never released. Likely shorted, jammed on the magnet, or a wiring fault. Homing cannot work until this is fixed.\";}else if(code===2){verdict=\"STUCK INACTIVE -- never reads active.\";vcol=\"var(--hi)\";detail=\"The sensor never asserted over a full revolution. Likely dead, disconnected, or the home magnet is missing.\";}else if(code===3){verdict=\"MULTIPLE regions -- more than one active zone.\";vcol=\"var(--ylw)\";detail=\"The sensor went active more than once per revolution. Likely electrical noise or a stray magnet; homing may land on the wrong position.\";}else if(code===4){verdict=\"INVERTED polarity -- active background with a brief dip.\";vcol=\"var(--ylw)\";detail=\"Active most of the revolution with one brief inactive dip -- the mirror image of healthy, i.e. the sensor is wired with reversed polarity.\";}else{verdict=\"Unknown result (code \"+code+\").\";vcol=\"var(--hi)\";detail=\"\";}var rows=diagRow(\"Result\",\"<span style='color:\"+vcol+\";font-weight:bold'>\"+verdict+\"</span>\",false);var edgeWarn=(code===0)&&(t.rising!==1||t.falling!==1);rows+=diagRow(\"Edges (rising / falling)\",t.rising+\" / \"+t.falling+(edgeWarn?\" -- expected 1 / 1\":\"\"),edgeWarn);rows+=diagRow(\"Active samples\",t.active+\" steps in the home region\",false);return \"<h4 style='margin:0 0 6px'>Hall sensor self-test (T)</h4><table style='border-collapse:collapse;width:100%'>\"+rows+\"</table>\"+(detail?\"<p style='font-size:.8rem;color:var(--dim);margin-top:6px'>\"+detail+\"</p>\":\"\");}");
+  server.sendContent("function diagPoll(onDone,onErr,maxTries){var cap=maxTries||130;var tries=0;var gen=_diagGen;function step(){if(gen!==_diagGen)return;tries++;if(tries>cap){onErr(\"timeout\");return;}fetch(\"/api/flap/diag/status\").then(function(r){return r.json();}).then(function(s){if(gen!==_diagGen)return;if(s.state===\"pending\"){setTimeout(step,1000);return;}if(s.state===\"done\")onDone(s);else onErr(s.state);}).catch(function(){if(gen===_diagGen)setTimeout(step,1000);});}setTimeout(step,1000);}");
+  server.sendContent("function diagRunMech(id,revs){var e=document.getElementById(\"diagMsec\");var n=(typeof revs===\"number\")?revs:5;var est=Math.round(n*6);if(e)e.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--ylw)'>Motor spinning \"+n+\" rotation\"+(n===1?\"\":\"s\")+\" -- this can take ~\"+est+\"s...</p>\";var body={id:id};if(typeof revs===\"number\")body.revs=revs;fetch(\"/api/flap/diag/mech\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(j){if(!j.ok){var e2=document.getElementById(\"diagMsec\");if(e2)e2.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>Error: \"+(j.error||\"could not start\")+\"</p>\"+diagRevsControl(n);return;}diagPoll(function(st){var e2=document.getElementById(\"diagMsec\");if(e2)e2.innerHTML=diagMSection(st)+diagRevsControl(n);},function(why){var e2=document.getElementById(\"diagMsec\");if(e2)e2.innerHTML=\"<h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--hi)'>\"+(why===\"timeout\"?\"No response (timed out). The motor may be jammed, or the module reset during the test.\":\"The test did not run.\")+\"</p>\"+diagRevsControl(n);},40+n*24);}).catch(function(){});}");
+  server.sendContent("function diagRevsControl(lastN){if(_diagFw<29)return \"\";return \"<div style='margin-top:10px;font-size:.8rem;color:var(--dim)'>Rotations <input id='diagRevs' type='number' min='5' max='20' value='\"+lastN+\"' style='width:3.6em'> <button class='sec' style='padding:2px 10px' onclick='diagRerun()'>Run again</button> -- more rotations catch intermittent faults but take longer (5-20)</div>\";}");
+  server.sendContent("function diagRerun(){var el=document.getElementById(\"diagRevs\");var v=el?parseInt(el.value):5;if(isNaN(v)||v<5)v=5;if(v>20)v=20;diagRunMech(_diagId,v);}");
+  server.sendContent("function runDiag(id,fw){_diagId=id;_diagFw=fw||0;_diagGen++;document.getElementById(\"diagTitle\").textContent=\"Diagnostics -- Module \"+id;var b=document.getElementById(\"diagBody\");b.innerHTML=\"<p style='color:var(--dim)'>Reading stats snapshot...</p>\";document.getElementById(\"diagModal\").style.display=\"flex\";fetch(\"/api/flap/diag\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({id:id})}).then(function(r){return r.json();}).then(function(j){if(!j.ok){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+(j.error||\"could not start diagnostics\")+\"</p>\";return;}var html=diagQSection(j.q);html+=\"<div id='diagTsec' style='margin-top:14px'><h4 style='margin:0 0 6px'>Hall sensor self-test (T)</h4><p style='color:var(--ylw)'>Spinning the reel to check the home sensor (~10-20s)...</p></div>\";html+=\"<div id='diagMsec' style='margin-top:14px'><h4 style='margin:0 0 6px'>Mechanical self-test (M)</h4><p style='color:var(--dim)'>Queued -- runs after the Hall test.</p></div>\";b.innerHTML=html;diagPoll(function(st){document.getElementById(\"diagTsec\").innerHTML=diagTSection(st);diagRunMech(id,(_diagFw>=29)?5:null);},function(why){document.getElementById(\"diagTsec\").innerHTML=\"<h4 style='margin:0 0 6px'>Hall sensor self-test (T)</h4><p style='color:var(--hi)'>\"+(why===\"timeout\"?\"No response (timed out) -- the motor may be jammed or the module reset.\":\"The test did not run.\")+\"</p>\";diagRunMech(id,(_diagFw>=29)?5:null);},45);}).catch(function(e){b.innerHTML=\"<p style='color:var(--hi)'>Error: \"+e+\"</p>\";});}");
   server.sendContent("</script></body></html>");
   server.sendContent("");
   server.sendContent("");
@@ -3143,10 +3200,11 @@ void handleApiCalibrate() {
 }
 
 // POST /api/flap/diag {id}
-// Runs both module self-diagnostics (firmware v26+). The 'Q' snapshot is instant
-// and returned in THIS response; the 'M' mechanical self-test spins the motor
-// for several revolutions, so it runs as an async job -- the UI polls
-// /api/flap/diag/status for the M result (mirrors the calibrate job pattern).
+// First step of the self-diagnostics run (firmware v26+). Captures the instant
+// 'Q' stats snapshot synchronously (returned inline as `q`) and starts the 'T'
+// Hall self-test, which drives the motor ~2 revolutions. The UI polls
+// /api/flap/diag/status for the Hall result, then calls /api/flap/diag/mech to
+// run the mechanical test. T and M share one async job (one motor test at a time).
 void handleApiDiag() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
@@ -3156,14 +3214,14 @@ void handleApiDiag() {
   }
   int id = doc["id"] | -1;
   if (id < 0 || id > 254) { sendJsonError(400, "valid id required"); return; }
-  DBG("[API] diagnostics module %d\n", id);
+  DBG("[API] diagnostics module %d (Q + Hall)\n", id);
 
-  // Reject if a mechanical test is already running for a different module.
-  if (sfDiagMJobActive && sfDiagMJobId != id) {
+  // Reject if a motor test is already running for a different module.
+  if (sfDiagJobActive && sfDiagJobId != id) {
     char busy[96];
     snprintf(busy, sizeof(busy),
       "{\"ok\":false,\"error\":\"diagnostics already running for module %d\"}",
-      sfDiagMJobId);
+      sfDiagJobId);
     server.send(409, "application/json", busy);
     return;
   }
@@ -3171,17 +3229,18 @@ void handleApiDiag() {
   // 1) Instant stats snapshot ('Q') -- captured synchronously (no motor).
   bool qok = sfSendAndCaptureQ(id, 1500);
 
-  // 2) Mechanical self-test ('M') -- long (motor spins ~6 revolutions). Arm the
-  //    capture + job, fire the command, and return immediately.
-  sfDiagMTs        = 0;
-  sfDiagMCode      = -1;
-  sfDiagMWaitId    = id;
-  sfDiagMJobActive = true;
-  sfDiagMJobId     = id;
-  sfDiagMDeadline  = millis() + 100000UL;
-  char mframe[16];
-  snprintf(mframe, sizeof(mframe), "m%dM\n", id);
-  rs485SendStr(mframe);
+  // 2) Hall self-test ('T') -- motor-driven (~2 revolutions). Arm the capture +
+  //    shared job, fire the command, and return immediately.
+  sfDiagTTs         = 0;
+  sfDiagTCode       = -1;
+  sfDiagTWaitId     = id;
+  sfDiagJobActive   = true;
+  sfDiagJobId       = id;
+  sfDiagJobKind     = 'T';
+  sfDiagJobDeadline = millis() + 35000UL;
+  char tframe[16];
+  snprintf(tframe, sizeof(tframe), "m%dT\n", id);
+  rs485SendStr(tframe);
 
   char out[200];
   if (qok) {
@@ -3195,33 +3254,103 @@ void handleApiDiag() {
   server.send(200, "application/json", out);
 }
 
+// POST /api/flap/diag/mech {id}
+// Second motor test of the run: the mechanical self-test ('M'), which spins the
+// motor ~6 revolutions. Called by the UI after the Hall test completes. Result
+// is polled from /api/flap/diag/status.
+void handleApiDiagMech() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendJsonError(400, "Bad JSON"); return;
+  }
+  int id = doc["id"] | -1;
+  if (id < 0 || id > 254) { sendJsonError(400, "valid id required"); return; }
+
+  // Optional rotation count (firmware v29+). Absent -> bare 'm<id>M' (module
+  // default of 5). Present -> 'm<id>M<n>' with n clamped to [5,20]; the module
+  // re-clamps too. The motor time scales with n, so the job deadline does too.
+  bool haveRevs = doc["revs"].is<int>();
+  int  revs     = haveRevs ? (int)doc["revs"] : 5;
+  if (revs < 5)  revs = 5;
+  if (revs > 20) revs = 20;
+  DBG("[API] diagnostics module %d (mechanical, %s%d revs)\n",
+      id, haveRevs ? "" : "default ", revs);
+
+  if (sfDiagJobActive && sfDiagJobId != id) {
+    char busy[96];
+    snprintf(busy, sizeof(busy),
+      "{\"ok\":false,\"error\":\"diagnostics already running for module %d\"}",
+      sfDiagJobId);
+    server.send(409, "application/json", busy);
+    return;
+  }
+
+  sfDiagMTs         = 0;
+  sfDiagMCode       = -1;
+  sfDiagMRevs[0]    = 0;
+  sfDiagMWaitId     = id;
+  sfDiagJobActive   = true;
+  sfDiagJobId       = id;
+  sfDiagJobKind     = 'M';
+  // ~20s/rev worst-case bound plus headroom (5 revs -> 130s, 20 revs -> 430s).
+  sfDiagJobDeadline = millis() + 30000UL + (unsigned long)revs * 20000UL;
+  char mframe[20];
+  if (haveRevs) snprintf(mframe, sizeof(mframe), "m%dM%d\n", id, revs);
+  else          snprintf(mframe, sizeof(mframe), "m%dM\n", id);
+  rs485SendStr(mframe);
+
+  char out[64];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d,\"revs\":%d}", id, revs);
+  server.send(200, "application/json", out);
+}
+
 // GET /api/flap/diag/status
-// Poll target for the async mechanical self-test:
-//   {"ok":true,"state":"pending","id":N}
-//   {"ok":true,"state":"done","id":N,"code":C,"min":..,"max":..,"spreadTenths":..}
-//   {"ok":true,"state":"timeout","id":N}
+// Poll target for the active async motor test (Hall 'T' or mechanical 'M').
 //   {"ok":true,"state":"idle"}
+//   {"ok":true,"state":"pending","kind":"hall"|"mech","id":N}
+//   {"ok":true,"state":"done","kind":"hall","id":N,"code":C,"rising":..,"active":..,"falling":..}
+//   {"ok":true,"state":"done","kind":"mech","id":N,"code":C,"min":..,"max":..,
+//        "spreadTenths":..,"gateActive":..,"gateSpan":..,"magWidth":..,"revs":"r1,r2,..."}
+//   {"ok":true,"state":"timeout","kind":...,"id":N}
 void handleApiDiagStatus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  char out[160];
-  if (sfDiagMJobActive) {
-    if (sfDiagMTs != 0) {
-      sfDiagMJobActive = false;
-      sfDiagMWaitId    = -1;
-      snprintf(out, sizeof(out),
-        "{\"ok\":true,\"state\":\"done\",\"id\":%d,\"code\":%d,\"min\":%d,\"max\":%d,\"spreadTenths\":%d}",
-        sfDiagMJobId, sfDiagMCode, sfDiagMMin, sfDiagMMax, sfDiagMSpread);
+  char out[460];
+  if (sfDiagJobActive) {
+    char kind = sfDiagJobKind;
+    bool ready = (kind == 'T') ? (sfDiagTTs != 0) : (sfDiagMTs != 0);
+    if (ready) {
+      sfDiagJobActive = false;
+      if (kind == 'T') {
+        sfDiagTWaitId = -1;
+        snprintf(out, sizeof(out),
+          "{\"ok\":true,\"state\":\"done\",\"kind\":\"hall\",\"id\":%d,"
+          "\"code\":%d,\"rising\":%d,\"active\":%d,\"falling\":%d}",
+          sfDiagJobId, sfDiagTCode, sfDiagTRising, sfDiagTActive, sfDiagTFalling);
+      } else {
+        sfDiagMWaitId = -1;
+        snprintf(out, sizeof(out),
+          "{\"ok\":true,\"state\":\"done\",\"kind\":\"mech\",\"id\":%d,"
+          "\"code\":%d,\"min\":%d,\"max\":%d,\"spreadTenths\":%d,"
+          "\"gateActive\":%d,\"gateSpan\":%d,\"magWidth\":%d,\"revs\":\"%s\"}",
+          sfDiagJobId, sfDiagMCode, sfDiagMMin, sfDiagMMax, sfDiagMSpread,
+          sfDiagMGateActive, sfDiagMGateSpan, sfDiagMMagWidth, sfDiagMRevs);
+      }
       server.send(200, "application/json", out);
       return;
     }
-    if ((long)(millis() - sfDiagMDeadline) >= 0) {
-      sfDiagMJobActive = false;
-      sfDiagMWaitId    = -1;
-      snprintf(out, sizeof(out), "{\"ok\":true,\"state\":\"timeout\",\"id\":%d}", sfDiagMJobId);
+    if ((long)(millis() - sfDiagJobDeadline) >= 0) {
+      sfDiagJobActive = false;
+      sfDiagTWaitId = -1;
+      sfDiagMWaitId = -1;
+      snprintf(out, sizeof(out), "{\"ok\":true,\"state\":\"timeout\",\"kind\":\"%s\",\"id\":%d}",
+               (kind == 'T') ? "hall" : "mech", sfDiagJobId);
       server.send(200, "application/json", out);
       return;
     }
-    snprintf(out, sizeof(out), "{\"ok\":true,\"state\":\"pending\",\"id\":%d}", sfDiagMJobId);
+    snprintf(out, sizeof(out), "{\"ok\":true,\"state\":\"pending\",\"kind\":\"%s\",\"id\":%d}",
+             (kind == 'T') ? "hall" : "mech", sfDiagJobId);
     server.send(200, "application/json", out);
     return;
   }
@@ -4311,6 +4440,8 @@ void webInit() {
   server.on("/api/flap/calibrate/status", HTTP_GET, handleApiCalibrateStatus);
   server.on("/api/flap/diag",        HTTP_POST,    handleApiDiag);
   server.on("/api/flap/diag",        HTTP_OPTIONS, handleOptions);
+  server.on("/api/flap/diag/mech",   HTTP_POST,    handleApiDiagMech);
+  server.on("/api/flap/diag/mech",   HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/diag/status", HTTP_GET,     handleApiDiagStatus);
   server.on("/api/flap/version",     HTTP_POST,    handleApiVersion);
   server.on("/api/flap/version",     HTTP_OPTIONS, handleOptions);

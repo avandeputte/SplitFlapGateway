@@ -85,7 +85,7 @@ The gateway exposes the bus through three interfaces simultaneously:
 
 **A web UI** served directly from the ESP32. Open a browser, navigate to the gateway's IP address, and you have a full dashboard: a live bus monitor showing every RS-485 frame with decoded descriptions and local timestamps, a module grid showing all known modules with their current character and firmware version, provisioning tools, and configuration settings. No app to install, no account to create.
 
-**A REST API** with 17 endpoints covering every operation — sending characters, homing modules, calibrating, provisioning by serial number, querying firmware versions, and reading or updating configuration. An [OpenAPI specification](https://github.com/avandeputte/SplitFlapGateway) is included so you can import the entire API into Postman or Swagger UI with a single file.
+**A REST API** with more than 40 endpoints covering every operation — sending characters, homing modules, calibrating, running module self-diagnostics, provisioning by serial number, querying firmware versions, and reading or updating configuration. An [OpenAPI specification](https://github.com/avandeputte/SplitFlapGateway) is included so you can import the entire API into Postman or Swagger UI with a single file.
 
 **MQTT integration** using the `splitflap/` topic prefix. Every frame that travels in either direction on the RS-485 bus is published. Module events each get their own topic. Any system that can publish an MQTT message can drive the display — Node-RED, Home Assistant, a Python script, or a shell command.
 
