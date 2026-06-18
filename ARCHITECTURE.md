@@ -134,7 +134,12 @@ to keep flashing simple and avoid erasing config on partition changes.
   persisted.
 - `lastSeenEpoch` is an RTC wall-clock timestamp (not `millis()`, which resets),
   so "last seen N hours ago" is meaningful across reboots. Entries older than
-  `MODULE_STALE_SECS` (6h) are pruned on load and once a minute at runtime.
+  `MODULE_STALE_SECS` (6h) are pruned on load; at runtime (once a minute) a stale
+  entry is first **probed** with a version query and dropped only if it stays
+  silent past a grace window, so a quiet-but-present module is never purged. The
+  runtime probes are spaced out and sent in bounded batches -- a module answers a
+  bare version query synchronously, so firing them back-to-back would make each
+  reply collide with the next probe on the half-duplex bus.
 - Writes are atomic: the file is written to `/modules.dat.tmp` then renamed over
   the live file, so a crash mid-write can't corrupt the existing good copy.
 - Saves are debounced (5s) and only triggered when the registry actually changes

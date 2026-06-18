@@ -1,0 +1,38 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' role='img' aria-label='Split-Flap Gateway'>
+  <defs>
+    <linearGradient id='sfTop' x1='0' y1='0' x2='0' y2='1'>
+      <stop offset='0' stop-color='#3c424c'/>
+      <stop offset='1' stop-color='#2d323b'/>
+    </linearGradient>
+    <linearGradient id='sfBot' x1='0' y1='0' x2='0' y2='1'>
+      <stop offset='0' stop-color='#272b32'/>
+      <stop offset='1' stop-color='#181b20'/>
+    </linearGradient>
+    <clipPath id='sfTile'><rect x='7' y='7' width='50' height='50' rx='10'/></clipPath>
+  </defs>
+
+  <!-- drop shadow -->
+  <rect x='7' y='8.5' width='50' height='50' rx='10' fill='#000' opacity='0.35'/>
+
+  <g clip-path='url(#sfTile)'>
+    <!-- the two flaps -->
+    <rect x='7' y='7'  width='50' height='25' fill='url(#sfTop)'/>
+    <rect x='7' y='32' width='50' height='25' fill='url(#sfBot)'/>
+
+    <!-- character, bisected by the seam -->
+    <text x='32' y='46' text-anchor='middle'
+          font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='40'
+          fill='#f3eee3'>S</text>
+
+    <!-- the split seam: dark gap + a thin highlight on the lower flap edge -->
+    <rect x='7' y='30.9' width='50' height='2.2' fill='#0c0d10'/>
+    <rect x='7' y='33.1' width='50' height='0.8' fill='#565c68' opacity='0.7'/>
+  </g>
+
+  <!-- axle pivots at the seam -->
+  <rect x='4.5'  y='29.5' width='4' height='5' rx='1.6' fill='#0c0d10'/>
+  <rect x='55.5' y='29.5' width='4' height='5' rx='1.6' fill='#0c0d10'/>
+
+  <!-- crisp edge -->
+  <rect x='7' y='7' width='50' height='50' rx='10' fill='none' stroke='#0a0b0d' stroke-width='1'/>
+</svg>
