@@ -22,6 +22,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "charset.h"
 #include "rtc.h"
 #include "rs485.h"
 #include "modules.h"

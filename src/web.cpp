@@ -190,8 +190,9 @@ static void handleApiModules() {
     xSemaphoreGive(sfMutex);
     if (!valid) continue;   // list shrank (prune/deprovision) mid-iteration
 
-    char flapBuf[2] = {0, 0};
-    if (m.flapChar >= 32 && m.flapChar <= 126 && m.flapChar != '"') flapBuf[0] = m.flapChar;
+    // Tracked flap char is one Windows-1252 byte; emit it as JSON-safe UTF-8.
+    char flapBuf[6] = {0};
+    if (m.flapChar) flapToJsonUtf8(&m.flapChar, 1, flapBuf, sizeof(flapBuf));
     char obj[288];
     snprintf(obj, sizeof(obj),
       "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"acked\":%s,\"flapIndex\":%d,"
@@ -230,8 +231,8 @@ static void handleApiDisplayState() {
     const SFModule& m = sfModules[i];
     if (!m.provisioned) continue;
     if (m.id < cells) {
-      char c = m.flapChar;
-      cellChar[m.id] = (c >= 32 && c <= 126) ? c : 1;  // 1 = known module, char unknown
+      uint8_t uc = (uint8_t)m.flapChar;                // ASCII or Windows-1252 byte
+      cellChar[m.id] = isFlapByte(uc) ? (char)uc : 1;  // 1 = known module, char unknown
     }
   }
   xSemaphoreGive(sfMutex);
@@ -247,12 +248,15 @@ static void handleApiDisplayState() {
   // Emit cells in batches to keep the number of tiny network writes down.
   char batch[256]; size_t bl = 0;
   for (int i = 0; i < cells; i++) {
-    char cellBuf[8]; int cn;
+    char cellBuf[12]; int cn;
     char c = cellChar[i];
-    if (c == 0)                       cn = snprintf(cellBuf, sizeof(cellBuf), "%snull", i ? "," : "");
-    else if (c == 1)                  cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"?\"", i ? "," : "");
-    else if (c == '"' || c == '\\')   cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"\\%c\"", i ? "," : "", c);
-    else                              cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"%c\"", i ? "," : "", c);
+    if (c == 0)       cn = snprintf(cellBuf, sizeof(cellBuf), "%snull", i ? "," : "");
+    else if (c == 1)  cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"?\"", i ? "," : "");
+    else {
+      // Windows-1252 byte -> JSON-safe UTF-8 (handles euro/accented glyphs).
+      char u[6]; flapToJsonUtf8(&c, 1, u, sizeof(u));
+      cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"%s\"", i ? "," : "", u);
+    }
     if (cn < 0) cn = 0;
     if (bl + (size_t)cn >= sizeof(batch)) { server.sendContent(batch); bl = 0; }
     memcpy(batch + bl, cellBuf, cn); bl += cn;
@@ -273,7 +277,12 @@ static void handleApiChar() {
   int id = doc["id"] | -1;
   const char* ch = doc["char"] | "";
   if (!ch[0]) { sendJsonError(400, "Missing char"); return; }
-  sfSendChar(id, ch[0]);
+  // `ch` is UTF-8: a euro/accented glyph is multi-byte. Transcode to a single
+  // Windows-1252 byte and display the first character (see charset.h).
+  char enc[8];
+  utf8ToFlap(ch, enc, sizeof(enc));
+  if (!enc[0]) { sendJsonError(400, "Unsupported character"); return; }
+  sfSendChar(id, enc[0]);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1128,15 +1137,21 @@ static void handleApiRestoreBySN() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// Validate a flap character set: printable ASCII only (CR/LF would terminate the
-// bus frame; non-ASCII is not a valid flap char), at most SF_MAX_FLAPS bytes.
-// Copies into out on success. Returns NULL on success, or an error message.
+// Validate and transcode a flap character set. `charSet` is UTF-8 (as received
+// over JSON); it is converted to the single-byte flap encoding (Windows-1252)
+// the bus protocol and module firmware use -- so euro signs and accented letters
+// each become one flap byte (see charset.h). On success the encoded bytes are
+// written to `out` (NUL-terminated) and NULL is returned; otherwise a
+// human-readable error message is returned.
 static const char* sfValidateCharSet(const char* charSet, char* out, size_t outLen) {
-  size_t L = strlen(charSet);
-  if (L >= outLen || L > SF_MAX_FLAPS) return "charSet too long (max 64)";
-  for (size_t k = 0; k < L; k++)
-    if (charSet[k] < 0x20 || charSet[k] > 0x7E) return "charSet must be printable ASCII";
-  strlcpy(out, charSet, outLen);
+  char tmp[SF_MAX_FLAPS * 4 + 4];          // hold the transcode before length-check
+  bool allMapped = true;
+  size_t n = utf8ToFlap(charSet, tmp, sizeof(tmp), &allMapped);
+  if (!allMapped)        return "charSet has characters not in Windows-1252";
+  if (n == 0)            return "charSet has no displayable characters";
+  if (n > SF_MAX_FLAPS)  return "charSet too long (max 64 characters)";
+  if (n + 1 > outLen)    return "charSet too long";
+  memcpy(out, tmp, n + 1);
   return nullptr;
 }
 
@@ -1310,15 +1325,12 @@ static void handleApiAll() {
   int aCurIndex   = gDump.curIndex;
   int aReportedId = gDump.reportedId;
   // Configurable flap set from the v31+ 'A' tail (-99 / "" when not provided).
+  // gDump.flapChars holds raw Windows-1252 bytes; convert to JSON-safe UTF-8 so
+  // euro/accented glyphs survive in the JSON response (up to 3 bytes each).
   int aFlapCount  = gDump.flapCount;
-  static char aFlapChars[SF_MAX_FLAPS * 2 + 2];   // JSON-escaped (static: off taskWeb stack)
-  { size_t fi = 0;
-    for (const char* p2 = (const char*)gDump.flapChars; *p2 && fi < sizeof(aFlapChars) - 2; p2++) {
-      if (*p2 == '"' || *p2 == '\\') aFlapChars[fi++] = '\\';
-      aFlapChars[fi++] = *p2;
-    }
-    aFlapChars[fi] = 0;
-  }
+  static char aFlapChars[SF_MAX_FLAPS * 3 + 4];   // static: off taskWeb stack
+  flapToJsonUtf8((const char*)gDump.flapChars, strlen((const char*)gDump.flapChars),
+                   aFlapChars, sizeof(aFlapChars));
 
   // Read the freshest version/serial the reply left in the registry.
   xSemaphoreTake(sfMutex, portMAX_DELAY);

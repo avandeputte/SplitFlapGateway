@@ -108,17 +108,16 @@ void mqttPublishDisplayState() {
   int cells = (int)cfg.gridRows * (int)cfg.gridCols;
   if (cells < 1) cells = 1;
   if (cells > MAX_MODULES) cells = MAX_MODULES;
-  char str[MAX_MODULES + 1];
+  // Each cell is one glyph; a Windows-1252 high byte (euro/accent) expands to up
+  // to 3 UTF-8 bytes, so size the buffer for the worst case.
+  static char str[MAX_MODULES * 3 + 1];   // static: single-caller (taskNetwork)
   int outLen = 0;
   if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     for (int id = 0; id < cells; id++) {
       SFModule* m = sfFindById((uint8_t)id);
-      char c = ' ';
-      if (m && m->provisioned) {
-        if (m->flapChar >= 0x20 && m->flapChar <= 0x7E) c = m->flapChar;
-        else c = '?';   // present but char unknown (e.g. after home / index set)
-      }
-      str[outLen++] = c;
+      uint8_t uc = (m && m->provisioned) ? (uint8_t)m->flapChar : (uint8_t)' ';
+      if (m && m->provisioned && !isFlapByte(uc)) uc = '?';   // present but char unknown
+      outLen += flapByteToUtf8(uc, str + outLen);       // ASCII -> 1 byte, high -> UTF-8
     }
     xSemaphoreGive(sfMutex);
   }
@@ -352,10 +351,14 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
       sfSendText(start, text, false);
       return;
     }
-    // Single char
+    // Single char (UTF-8 -> one Windows-1252 byte for euro/accented glyphs)
     const char* ch = doc["char"] | "";
-  DBG("[API] show char '%c' on module %d\n", ch[0], id);
-    if (strlen(ch) > 0) { sfSendChar(id, ch[0]); return; }
+    if (strlen(ch) > 0) {
+      char enc[8]; utf8ToFlap(ch, enc, sizeof(enc));
+      DBG("[API] show char on module %d\n", id);
+      if (enc[0]) sfSendChar(id, enc[0]);
+      return;
+    }
     // Index
     if (doc["index"].is<int>()) { sfSendIndex(id, doc["index"].as<int>()); }
   }
@@ -371,8 +374,9 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   // Configure flap set ('N', firmware v31+). flapCount (1-64) and charSet are
   // independent and optional; at least one is required. Target by id (id=-1
-  // broadcasts m*N) or by serial number (sn). The char set is sent verbatim; any
-  // control char (which would break the frame) drops the whole request.
+  // broadcasts m*N) or by serial number (sn). The UTF-8 charSet is transcoded to
+  // Windows-1252 (euro/accented glyphs become one flap byte each); an unmappable
+  // char or an over-long / out-of-range request is dropped.
   //   {"id":5,"flapCount":40,"charSet":" ABC..."}   or  {"sn":"AABB...","charSet":"..."}
   else if (strcmp(topic, flapCfgTopic) == 0) {
     const char* sn      = doc["sn"]        | "";
@@ -383,14 +387,14 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     bool hasChars = (charSet[0] != 0);
     if ((!hasCount && !hasChars) ||
         (hasCount && (flapCount < 1 || flapCount > SF_MAX_FLAPS))) return;
+    char enc[SF_MAX_FLAPS * 4 + 4];
     if (hasChars) {
-      size_t L = strlen(charSet);
-      if (L > SF_MAX_FLAPS) return;
-      for (size_t k = 0; k < L; k++)
-        if (charSet[k] < 0x20 || charSet[k] > 0x7E) return;   // not a valid flap char
+      bool allMapped = true;
+      size_t n = utf8ToFlap(charSet, enc, sizeof(enc), &allMapped);
+      if (!allMapped || n == 0 || n > SF_MAX_FLAPS) return;   // unmappable / empty / too long
     }
     int   reqCount = hasCount ? flapCount : 0;
-    const char* reqChars = hasChars ? charSet : nullptr;
+    const char* reqChars = hasChars ? enc : nullptr;
     DBG("[MQTT] flap config %s count=%d chars='%s'\n", sn[0] ? sn : "by-id", flapCount, charSet);
     if (sn[0])               sfSetFlapConfigBySN(sn, reqCount, reqChars);
     else if (id >= -1 && id <= 254) sfSetFlapConfig(id, reqCount, reqChars);

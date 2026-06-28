@@ -171,8 +171,8 @@ static void sfTrackFromFrame(const uint8_t* data, size_t len) {
 
   if (cmd == '-') {                // show character: next byte is the char
     if (i + 1 >= len) return;
-    char c = (char)data[i + 1];
-    if (c < 0x20 || c > 0x7E) return;
+    char c = (char)data[i + 1];    // ASCII or a Windows-1252 high byte (euro/accents)
+    if (!isFlapByte((uint8_t)c)) return;
     sfTrackChar(addr, c);
   } else if (cmd == '+') {         // show index: record index, char unknown
     long idx = 0;

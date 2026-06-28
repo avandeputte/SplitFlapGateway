@@ -311,14 +311,20 @@ void sfTrackChar(int addr, char c) {
   }
 }
 
+// Send one flap character. `c` is a single Windows-1252 byte: ASCII 0x20-0x7E, or
+// a high byte (euro/accents/smart punctuation) -- see charset.h. ASCII letters are
+// normalised to uppercase (to match the default reel order); high bytes are sent
+// verbatim so accented case is preserved. Bytes that aren't a valid flap glyph
+// (controls, undefined slots, the 0x00/0xFF firmware sentinels) are dropped.
 void sfSendChar(int addr, char c) {
-  if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');  // normalize to uppercase
-  if (c < 0x20 || c > 0x7E) return;                     // reject non-printable / non-ASCII
+  uint8_t b = (uint8_t)c;
+  if (b >= 'a' && b <= 'z') b = (uint8_t)(b - 'a' + 'A');     // uppercase ASCII only
+  if (!isFlapByte(b)) return;                                 // not a valid flap glyph
   char buf[24];
   if (addr < 0)
-    snprintf(buf, sizeof(buf), "m*-%c\n", c);
+    snprintf(buf, sizeof(buf), "m*-%c\n", b);
   else
-    snprintf(buf, sizeof(buf), "m%d-%c\n", addr, c);
+    snprintf(buf, sizeof(buf), "m%d-%c\n", addr, b);
   rs485SendStr(buf);
   // Display tracking is handled centrally in rs485Send via sfTrackFromFrame,
   // so every path (including raw frame sends) is covered uniformly.
@@ -626,12 +632,16 @@ static void sfSetAutoHome(int addr, bool enable) {
 // Send a text string across a sequence of module IDs starting at startAddr.
 // Each character is sent to startAddr, startAddr+1, ... up to strlen(text).
 void sfSendText(int startAddr, const char* text, bool blankUnused) {
-  size_t len = strlen(text);
+  // `text` arrives as UTF-8 (from the web UI / MQTT / JSON). Transcode it to the
+  // single-byte flap encoding (Windows-1252) first, so one displayed glyph --
+  // including a euro sign or an accented letter, which are multi-byte in UTF-8 --
+  // maps to exactly one flap module. Unrepresentable code points are dropped.
+  char enc[SF_MAX_FLAPS * 4 + 1];
+  size_t len = utf8ToFlap(text, enc, sizeof(enc));
   for (size_t i = 0; i < len; i++) {
-    // sfSendChar uppercases and rejects non-printable bytes itself; the module
-    // firmware maps the character to a flap index. The gateway does not need
-    // its own character table. A non-ASCII byte is simply dropped by sfSendChar.
-    sfSendChar((int)(startAddr + i), text[i]);
+    // sfSendChar uppercases ASCII and rejects non-printable bytes itself; the
+    // module firmware maps the character byte to a flap index.
+    sfSendChar((int)(startAddr + i), enc[i]);
     delay(10); // inter-message gap to avoid bus collision
   }
   // Optionally blank any previously-set modules beyond the text length
