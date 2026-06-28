@@ -1,5 +1,38 @@
 # Split-Flap Gateway — Release Notes
 
+## v2.0 — 2026-06-28
+
+Adds gateway support for the **runtime-configurable flap set** introduced in **module firmware v31**: the active flap count (1–64) and the ordered character set are now set per module from the gateway, read back, and preserved across backup/restore. It is a drop-in upgrade — every existing endpoint, MQTT topic, and module behaviour is unchanged, and the new controls simply stay inert for modules on older firmware.
+
+### Highlights
+
+**Configurable flap set (requires module firmware v31+)**
+
+Module firmware v31 made the physical flap count and the character order (which character lives at each flap index) configurable at runtime via a new `N` command, persisted in the module's EEPROM, instead of the previously fixed 64-flap built-in set. The gateway now drives that end to end:
+
+- **Module Info dialog** — for a module on firmware **v31+**, shows the live **active flap count** and **character set** (read from the module's `A` dump) and provides an inline editor to change either or both. The flap count and the character set are **independent** — set one and leave the other untouched; leave a field blank to keep the module's current value. The Flap Set section is shown **only** for v31+ modules and is omitted entirely on older firmware.
+- **Whole-panel broadcast** — target `id:-1` to push one flap set to every module on the bus in a single command (the calibrated map and other per-module state are untouched).
+- **By serial number** — a flap set can also be addressed to a specific module's serial number.
+- **Euro sign and accented characters (Windows-1252)** — the flap character set is no longer limited to ASCII. You can use the euro sign `€` (e.g. instead of `$`) and Western-European accented letters (`é à ü ö ä ñ ç ß …`) on the flaps. Characters are entered as normal UTF-8 in the web UI / JSON; the gateway transcodes them to the single-byte Windows-1252 form the RS-485 bus and module firmware use, and back to UTF-8 when reading the set or the live display. Each glyph is one flap; characters with no Windows-1252 representation (emoji, non-Latin scripts) are rejected. This applies to the configured flap set **and** to characters/text sent to the display. No firmware change is required (the module stores raw bytes).
+- **Backup & restore round-trip** — a backup now also captures each module's configured flap count and character set (from the v31+ `A` dump), and a restore re-applies them, so a full backup/restore preserves a custom flap set. Modules on older firmware are unaffected (the tail is simply absent).
+
+### REST / MQTT additions
+
+Additive — existing endpoints and topics are unchanged:
+
+| Interface | Endpoint / Topic | Description |
+|---|---|---|
+| `POST` | `/api/flap/flapconfig` | Configure flap count and/or character set by `id` (`id:-1` broadcasts) or `sn` (firmware v31+) |
+| MQTT | `<prefix>/flap/flapconfig` | Same, e.g. `{"id":5,"flapCount":40,"charSet":" ABC…"}` |
+
+`/api/flap/all` now also returns `flapCount` and `flapChars` (`-99` / `""` for pre-v31 firmware), and `/api/flap/restorebysn` accepts an optional `flapCount`/`charSet` to restore the flap set. The combined `A` reply parser reads the new `:<flapCount>:<flapChars>` tail (and, thanks to the forward-compatible parser added in v1.8, older gateways already ignore it safely).
+
+### Compatibility & upgrade notes
+
+- **The configurable flap set requires module firmware v31 or newer.** The Info dialog hides the Flap Set section entirely for modules below v31 (they use the fixed 64-flap default set); the new endpoint/topic still accept requests but an older module ignores the unknown `N` command. Every other feature works with any module firmware.
+- No breaking changes: existing endpoints, MQTT topics, and backup files from earlier versions still work (an old backup simply has no flap-set tail to restore).
+- Upgrade the gateway over-the-air as usual (Settings → firmware update), then confirm the version badge in the header reads **v2.0**.
+
 ## v1.9 — 2026-06-17
 
 A polish and reliability release: a fix for present-but-quiet modules occasionally dropping off the known-module list, a refreshed browser presence (favicon and header logo), and clearer module action icons. It is a drop-in upgrade from v1.8 — all endpoints, MQTT topics, and module behaviour are unchanged.

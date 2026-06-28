@@ -159,10 +159,12 @@ A deliberate design point: the RS-485 **frame buffers** (`MSG_MAX_BYTES` = 256
 for the monitor ring, `TX_MAX_BYTES` = 768 for outbound frames, `MQTT_BUF_SIZE`
 = 768) are sized by the **largest single frame**, not by module count. The
 worst-case frame is a full 64-flap EEPROM restore (`mXW<sn>:<offset>:<steps>:<map>`,
-~620 bytes) -- a frame always targets one module, so raising the module ceiling
-from 200 to 255 does not change them. Three-digit IDs (vs two) add at most ~1
-byte to a handful of commands, still far inside `TX_MAX_BYTES`. These buffers
-were sized for the frame, and the frame is what bounds them.
+~620 bytes; on firmware v31+ an optional `:<flapCount>:<flapChars>` tail adds up
+to ~67 bytes, still well inside `TX_MAX_BYTES`) -- a frame always targets one
+module, so raising the module ceiling from 200 to 255 does not change them.
+Three-digit IDs (vs two) add at most ~1 byte to a handful of commands, still far
+inside `TX_MAX_BYTES`. These buffers were sized for the frame, and the frame is
+what bounds them.
 
 ## Time handling
 

@@ -1,6 +1,6 @@
 # Split-Flap Gateway
 
-**Firmware version: 1.9**
+**Firmware version: 2.0**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
@@ -21,11 +21,6 @@
 - [Hardware](#hardware)
 - [Features](#features)
 - [Installation](#installation)
-  - [Prerequisites](#prerequisites)
-  - [Step 1 — Install ESP32 board support](#step-1--install-esp32-board-support)
-  - [Step 2 — Install required libraries](#step-2--install-required-libraries)
-  - [Step 3 — Configure the board](#step-3--configure-the-board)
-  - [Step 4 — Upload](#step-4--upload)
 - [Serial Debug Output](#serial-debug-output)
 - [First Boot](#first-boot)
 - [Web UI](#web-ui)
@@ -70,7 +65,8 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 - **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 255: IDs 0-254)
 - **Sticky module list** — the known-module registry persists across reboots in flash; a stale module is version-probed before being dropped (so a merely-quiet module isn't lost), and a gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
 - **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
-- **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs
+- **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs (a v31+ module's configurable flap set is captured and restored too)
+- **Configurable flap set** — modules on firmware v31+ let you set the active flap count (1–64) and the ordered character set per module from the Info dialog, or push one set to a whole panel with a broadcast; the live values are read back from the `A` dump and persist in module EEPROM. Characters aren't limited to ASCII: the **euro sign `€` and accented letters** (Windows-1252) are supported — type them as UTF-8 and the gateway transcodes to the single byte the bus uses
 - **Module self-diagnostics** — modules on firmware v26+ gain a 🩺 icon that runs three built-in tests and interprets the results: an instant **stats snapshot** (reset cause, boot count, supply voltage, EEPROM verify, current flap index), a **Hall sensor self-test** (home-sensor health), and a motor-driven **mechanical self-test** that detects intermittent missed steps (drag / weak supply / failing driver) or a stalled reel — with a selectable rotation count (5–20, firmware v29+) for deeper runs
 - **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
 - **Health metrics** — the Status tab shows minimum-ever free heap and per-task stack high-water marks, surfacing memory pressure before it causes a crash
@@ -85,7 +81,7 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 - **DST-aware timezone** — POSIX TZ string support covering 20 regions, takes effect immediately
 - **MQTT integration** — publishes bus frames and module events; subscribes to control topics
 - **REST API** — full JSON API for programmatic control (OpenAPI spec included)
-- **OTA updates** — flash new firmware over WiFi from a browser or Arduino IDE; no USB cable required after first flash
+- **OTA updates** — flash new firmware over WiFi from a browser (or `espota`); no USB cable required after first flash
 - **Fallback AP** — when no network is configured (or the WiFi connection is lost for ~20 s), the gateway brings up its own access point for setup; once connected to your WiFi it runs station-only and shuts the AP down automatically
 - **Configurable serial debug** — verbose logging toggled from the web UI Settings tab
 - **Watchdog** — detects stalled FreeRTOS tasks and auto-reboots; emergency reboot on low heap
@@ -94,69 +90,39 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 
 ## Installation
 
-### Prerequisites
+This repo is a **[PlatformIO](https://platformio.org/) project** (`platformio.ini`).
+Building from the **Arduino IDE is no longer supported** (there is no `.ino` sketch).
+There are two ways to get the firmware onto a board:
 
-- [Arduino IDE 2.x](https://www.arduino.cc/en/software)
-- ESP32 board support package
-- Two Arduino libraries
+- **Flash a prebuilt binary — no build environment needed.** A precompiled image is
+  published on the [Releases](https://github.com/avandeputte/SplitFlapGateway/releases)
+  page and can be flashed directly. See
+  [SETUP.md ▸ Flash a prebuilt binary](SETUP.md#flash-a-prebuilt-binary-no-build-environment-needed).
 
-### Step 1 — Install ESP32 board support
+- **Build from source with VS Code + PlatformIO.** The complete step-by-step guide —
+  installing VS Code, building, flashing over USB, and OTA updates — is in
+  **[SETUP.md](SETUP.md)**. PlatformIO downloads the ESP32 toolchain and the required
+  libraries (`PubSubClient`, `ArduinoJson`) **automatically** on the first build, and
+  every board setting (PSRAM, 16 MB flash, the 3 MB-app / 9.9 MB-FATFS partition
+  scheme, USB mode, CPU speed, etc.) is already encoded in `platformio.ini` — there is
+  nothing to install or configure by hand.
 
-1. Open Arduino IDE → **File → Preferences**
-2. Add to *Additional boards manager URLs*:
-   ```
-   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-   ```
-3. Open **Tools → Board → Boards Manager**, search for **esp32** by Espressif Systems, install version 3.x
+  ```bash
+  # quickest path once VS Code + PlatformIO are installed (see SETUP.md):
+  pio run -t upload      # build + flash over USB
+  pio device monitor     # view serial output (115200 baud)
+  ```
 
-### Step 2 — Install required libraries
-
-Open **Tools → Manage Libraries** and install:
-
-| Library | Author | Purpose |
-|---|---|---|
-| **PubSubClient** | Nick O'Leary | MQTT client |
-| **ArduinoJson** | Benoit Blanchon | JSON serialisation |
-
-`WiFi`, `WebServer`, `Preferences`, `HardwareSerial`, `Wire`, `ArduinoOTA`, `Update`, and `time` are bundled with the ESP32 core.
-
-### Step 3 — Configure the board
-
-Select **ESP32S3 Dev Module** and set:
-
-| Setting | Value |
-|---|---|
-| USB CDC On Boot | **Enabled** |
-| CPU Frequency | 240MHz (WiFi) |
-| Core Debug Level | None |
-| USB DFU On Boot | Disabled |
-| Erase All Flash Before Sketch Upload | Disabled |
-| Events Run On | Core 1 |
-| Flash Mode | QIO 80MHz |
-| Flash Size | **16MB (128Mb)** |
-| JTAG Adapter | Disabled |
-| Arduino Runs On | Core 1 |
-| USB Firmware MSC On Boot | Enabled (Requires USB-OTG Mode) |
-| Partition Scheme | **16M Flash (3MB APP/9.9MB FATFS)** |
-| PSRAM | OPI PSRAM |
-| Upload Mode | UART0 / Hardware CDC |
-| Upload Speed | 921600 |
-| USB Mode | Hardware CDC and JTAG |
-| Zigbee Mode | Disabled |
-
-### Step 4 — Upload
-
-1. Open `SplitFlapGateway.ino` (must be in a folder named `SplitFlapGateway`)
-2. Connect board via USB, select the correct COM port
-3. Click **Upload**
-
-After the first USB flash, all subsequent firmware updates can be done [over WiFi](#ota-firmware-updates).
+After the first USB flash, all subsequent firmware updates can be done
+[over WiFi](#ota-firmware-updates).
 
 ---
 
 ## Serial Debug Output
 
-The firmware outputs diagnostic messages at **115200 baud** via the native USB CDC port (requires USB CDC On Boot: Enabled).
+The firmware outputs diagnostic messages at **115200 baud** over the board's native
+USB CDC port (the serial monitor baud is preset in `platformio.ini`; open it with the
+PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 | OS | Port |
 |---|---|
@@ -166,7 +132,7 @@ The firmware outputs diagnostic messages at **115200 baud** via the native USB C
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v1.9
+[Boot] Split-Flap Gateway v2.0
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -243,7 +209,7 @@ Navigate to the gateway's IP address in any browser.
 
 | Tab | Description |
 |---|---|
-| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version, sorted by ID (unprovisioned modules last). The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog that queries the module live — refreshing its firmware version and reading its EEPROM — and shows all known module data plus a parsed view of the EEPROM: home offset, steps/rev, and the calibrated flap map), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
+| **Modules** | Grid of all known modules — ID, serial number, current character, firmware version, sorted by ID (unprovisioned modules last). The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog that queries the module live — refreshing its firmware version and reading its EEPROM — and shows all known module data plus a parsed view of the EEPROM: home offset, steps/rev, and the calibrated flap map — and, for a module on firmware v31+, an editable **Flap Set** section for the active flap count and character set), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
 | **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change. Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap's current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through all 64 flaps one at a time. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
@@ -312,17 +278,20 @@ All bus frames are ASCII starting with `m`. On the wire, frames are newline-term
 | `m<id>a<n>\n` | Set auto-home flag (1=home on boot, 0=restore saved position) |
 | `m<id>e\n` | Erase calibrated flap position map |
 | `m<id>i<n>\n` | Set module ID to n |
+| `m<id>N<count>:<chars>\n` | Configure flap count (1–64) and/or character set; both parts optional and independent (firmware v31+) |
 | `m<id>R\n` | Reset — erase stored ID, return to unprovisioned (firmware v9+) |
 | `m<id>F\n` | Factory reset EEPROM defaults (preserves module ID) |
 | `m*h\n` | Broadcast home (all modules) |
+| `m*N<count>:<chars>\n` | Broadcast flap-set config — set a whole panel at once (firmware v31+) |
 | `m*v\n` / `m*v<lo>-<hi>\n` | Broadcast version query (all modules, or an ID range; firmware v25+ for the range) |
 | `m*A\n` / `m*A<lo>-<hi>\n` | Broadcast combined all-fields dump (staggered; prefer ranged batches — each reply is long; firmware v25+) |
 | `mXI<sn>:<id>\n` | Assign ID to module by serial number |
 | `mXH<sn>\n` | Home module by serial number |
 | `mXD<sn>\n` | Dump EEPROM by serial number (firmware v15+) |
 | `mXA<sn>\n` | Combined all-fields dump by serial number (firmware v25+) |
+| `mXN<sn>:<count>:<chars>\n` | Configure flap set by serial number (firmware v31+) |
 | `mXF<sn>\n` | Factory reset by serial number |
-| `mXW<sn>:<offset>:<steps>:<map>\n` | Restore EEPROM to module by serial number |
+| `mXW<sn>:<offset>:<steps>:<map>[:<flapCount>:<flapChars>]\n` | Restore EEPROM to module by serial number; the optional flap-set tail (firmware v31+) round-trips an `A` dump |
 
 > **Framing and sanitization are handled for you.** Whether a frame comes from the bus monitor, `POST /api/rs485/send`, or the MQTT `splitflap/send` topic, the gateway normalizes it at a single transmit choke point. It (1) strips any trailing CR/LF you supplied, (2) **trims anything past a complete, well-formed known command** — so `m4vDSassa` is sent as `m4v` rather than relying on the module to ignore the junk — and (3) re-adds exactly one `\n` terminator, so `m5-A` and `m5-A\n` behave identically and a payload command like `m9o2832` is terminated for you (which also spares it the module's 50 ms idle-timeout wait). By-serial `mX…` frames (e.g. a long restore map) and any command the gateway doesn't model are passed through unchanged, so a legitimate frame is never truncated. The **one exception** to terminating is a direct numeric-id version query `m<id>v`, which the gateway always ships **without** a terminator. This is **not** a module requirement — the module accepts both `m<id>v` and `m<id>v\n` and answers either; it acts on the `v` byte itself. The bare form works around a **gateway-side** limitation in its half-duplex bus turnaround: a module answers a direct version query synchronously, the instant it parses `v` (a dump, by contrast, assembles its EEPROM string first, so its reply is naturally late enough to be safe), but the gateway's hardware driver-enable keeps it driving the line until the whole frame has clocked out, and its receiver is off while it transmits — so a trailing `\n` would keep the gateway transmitting for one extra byte-time (~1 ms at 9600 baud) *after* the module has already started replying, and the reply's leading bytes would be lost. Shipping `m<id>v` bare lets the gateway release the bus and start listening before the module answers. The **broadcast** `m*v` keeps a newline (the gateway adds it): a wildcard query collects an optional `<lo>-<hi>` ID range and the module fires a *staggered, deferred* reply on the newline (or a 50 ms idle timeout), so there's no turnaround race there.
 >
@@ -335,7 +304,7 @@ All bus frames are ASCII starting with `m`. On the wire, frames are newline-term
 | `m<id>v:<version>:<moduleId>:<serialNumber>\n` | Firmware version |
 | `m<id>:<steps>\n` | Calibration result |
 | `m<id>d:<homeOffset>:<stepsPerRev>:<map>\n` | EEPROM dump |
-| `m<id>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<map>\n` | Combined all-fields dump (v25+): everything from `v` and `d`, plus the auto-home flag and the live current flap index |
+| `m<id>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<map>[:<flapCount>:<flapChars>]\n` | Combined all-fields dump (v25+): everything from `v` and `d`, plus the auto-home flag and the live current flap index. Firmware **v31+** appends the configured flap count and character set after the map (`flapChars` is the final field and may itself contain `:`/`,`/`=`); older firmware omits the tail and the gateway's parser ignores it on older boards |
 | `mXadv:<serialNumber>\n` | Unprovisioned module advertisement |
 | `mXack:<serialNumber>:<assignedId>\n` | Provisioning acknowledgement |
 
@@ -343,7 +312,7 @@ All bus frames are ASCII starting with `m`. On the wire, frames are newline-term
 
 ### Character set (64 flaps, index 0–63)
 
-The split-flap character set is owned by the **module firmware**, not the gateway. When you send `m<id>-<char>`, the gateway transmits the character byte verbatim (after uppercasing it and rejecting non-printable/non-ASCII bytes); the module maps it to the correct flap index itself. The gateway only deals in flap indices when you explicitly send `m<id>+<index>`. The table below is the module's flap order, provided for reference when interpreting EEPROM dumps:
+The split-flap character set is owned by the **module firmware**, not the gateway. When you send `m<id>-<char>`, the gateway transcodes the character from UTF-8 to a single **Windows-1252** byte — so a euro sign or an accented letter (which are multi-byte in UTF-8) maps to exactly one flap — uppercases ASCII letters, and drops any character with no Windows-1252 representation; the module then maps that byte to the correct flap index. The gateway only deals in flap indices when you explicitly send `m<id>+<index>`. The table below is the module's **default** flap order, provided for reference when interpreting EEPROM dumps:
 
 ```
  0  SPACE    1  A    2  B    3  C    4  D    5  E    6  F    7  G
@@ -355,6 +324,10 @@ The split-flap character set is owned by the **module firmware**, not the gatewa
 48  q       49  :   50  %   51  '   52  .   53  ,   54  /   55  ?
 56  *       57  r   58  o   59  y   60  g   61  b   62  p   63  w
 ```
+
+On **firmware v31+** both the active flap count (1–64) and this character order are **configurable per module** at runtime via the `N` command, and persist in the module's EEPROM. For a v31+ module the Module Info dialog shows a **Flap Set** section with the live values and an inline editor (`POST /api/flap/flapconfig`); a whole panel can be set at once with a broadcast (`id:-1`). The section is shown **only** for v31+ modules — on older firmware it is omitted and the fixed 64-flap default set above is used. The configured count and characters are also reported at the end of the `A` dump and are captured in backups so a restore round-trips them.
+
+The flap character set may use **any character representable in Windows-1252 (CP1252)** — that's standard ASCII plus the euro sign `€`, the Western-European accented letters (`é à è ü ö ä ñ ç ß …`), and a few typographic symbols (curly quotes, en/em dashes, `…`, `™`), so you can, for example, print euro-sign flaps instead of `$` or use accented characters. You type/configure them as normal UTF-8 (in the web UI or JSON); the gateway transcodes to the single-byte Windows-1252 form the bus and modules use, and transcodes back to UTF-8 when reporting the set or the live display. Each glyph occupies one flap, and characters with no Windows-1252 representation (e.g. emoji, non-Latin scripts) are rejected.
 
 ---
 
@@ -381,7 +354,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `POST` | `/api/flap/home` | `{"id":5}` | Home module (`id:-1` = all) |
 | `POST` | `/api/flap/version` | `{"id":5}` | Query version — waits up to 500ms, returns `{ok,id,ver,sn,stale,lastSeen}` |
 | `POST` | `/api/flap/dump` | `{"id":5}` | Fetch EEPROM fresh — waits up to 500ms (1s if SN fallback needed), returns `{ok,id,sn,dump}` |
-| `POST` | `/api/flap/all` | `{"id":5}` | Refresh version **and** EEPROM together, returns `{ok,id,ver,sn,dump,stale,mode}`. Uses one `A` transaction for v25+ modules (`mode:"A"`), else falls back to version+dump (`mode:"vd"`) |
+| `POST` | `/api/flap/all` | `{"id":5}` | Refresh version **and** EEPROM together, returns `{ok,id,ver,sn,dump,autoHome,curIndex,flapCount,flapChars,stale,mode}`. Uses one `A` transaction for v25+ modules (`mode:"A"`), else falls back to version+dump (`mode:"vd"`). `flapCount`/`flapChars` are populated only by firmware v31+ (`flapCount:-99`, `flapChars:""` otherwise) |
 | `POST` | `/api/flap/identify` | — | Clear the list (memory + saved) and broadcast `m*v` to re-discover all modules |
 
 ### Advanced Module Commands
@@ -395,6 +368,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 | `POST` | `/api/flap/goto` | `{"id":5,"step":100}` | Go to raw step position |
 | `POST` | `/api/flap/writepos` | `{"id":5,"idx":1,"pos":210}` | Write calibrated position for flap |
 | `POST` | `/api/flap/autohome` | `{"id":5,"enable":1}` | Set auto-home on boot |
+| `POST` | `/api/flap/flapconfig` | `{"id":5,"flapCount":40,"charSet":" ABC…€é"}` | Configure flap count (1–64) and/or character set (firmware v31+); `flapCount` and `charSet` are independent and optional. `charSet` is UTF-8 and may use any Windows-1252 character (ASCII plus € and Western-European accents). Target by `id` (`id:-1` broadcasts to the whole panel) or by `sn`. No reply — read back with `/api/flap/all` |
 | `POST` | `/api/flap/erase` | `{"id":5}` | Erase calibration map |
 | `POST` | `/api/flap/factoryreset` | `{"id":5}` | Factory reset EEPROM |
 | `POST` | `/api/flap/diag` | `{"id":5}` | Self-diagnostics (fw v26+): returns the stats snapshot `q` inline and starts the Hall sensor test — poll `/api/flap/diag/status` |
@@ -412,7 +386,7 @@ A module running **firmware v26 or newer** shows a 🩺 diagnostics icon in the 
 | `POST` | `/api/flap/homebysn` | `{"sn":"AABBCCDD"}` | Home by serial number |
 | `POST` | `/api/flap/dumpbysn` | `{"sn":"AABBCCDD"}` | Dump EEPROM by serial number (fw v15+) |
 | `POST` | `/api/flap/factoryresetbysn` | `{"sn":"AABBCCDD"}` | Factory reset by serial number |
-| `POST` | `/api/flap/restorebysn` | `{"sn":"...","homeOffset":42,"totalSteps":4096,"map":"0=210,1=320,..."}` | Restore EEPROM by serial number |
+| `POST` | `/api/flap/restorebysn` | `{"sn":"...","homeOffset":42,"totalSteps":4096,"map":"0=210,1=320,...","flapCount":40,"charSet":" ABC…"}` | Restore EEPROM by serial number. The optional `flapCount`/`charSet` (firmware v31+) restore the configured flap set so a backup round-trips; omit them to leave the module's flap set unchanged |
 
 When a module acknowledges provisioning, the gateway marks it **provisioning-confirmed** and, after a brief settling delay, queries its firmware version (`m<id>v`) to record the version in the registry. The short delay matters: a version request sent the instant the ack arrives reaches the module before it has settled on its new ID, so no reply comes back; the query is also retried a few times until the version is read. A provisioning-confirmed module is never shown as **legacy** — legacy (v7) modules have no serial number and never acknowledge provisioning, so an ack is definitive proof the module is modern, regardless of whether its version has been read back yet. The Modules grid is always sorted by ID (unprovisioned modules last), so a newly provisioned module slots into its proper place rather than appearing at the end.
 
@@ -459,7 +433,7 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/ota` | Browser-based firmware upload page |
-| `POST` | `/api/ota/upload` | Upload the compiled application image `SplitFlapGateway.ino.bin` (multipart). See [OTA Firmware Updates](#ota-firmware-updates) for which file to use |
+| `POST` | `/api/ota/upload` | Upload the compiled application image `firmware.bin` (multipart). See [OTA Firmware Updates](#ota-firmware-updates) for which file to use |
 
 ---
 
@@ -515,6 +489,7 @@ Default topic prefix: **`splitflap`** (configurable in Settings → MQTT).
 | `splitflap/flap/set` | `{"id":5,"char":"A"}` | Show character |
 | `splitflap/flap/home` | `{"id":5}` | Home module |
 | `splitflap/flap/provision` | `{"sn":"AABBCC...","id":5}` | Provision module |
+| `splitflap/flap/flapconfig` | `{"id":5,"flapCount":40,"charSet":" ABC…€é"}` | Configure flap count and/or character set (firmware v31+); `charSet` is UTF-8 and may use any Windows-1252 character (ASCII + € + accents). Target by `id` (`id:-1` broadcasts) or `sn`; both fields independent and optional |
 | `splitflap/display/set` | `HELLO` | Show a plain string across the display from module 0 (Home Assistant text entity) |
 | `splitflap/maintenance/set` | `ON` / `OFF` / `true` / `1` | Set maintenance mode (reachable even while maintenance is on) |
 | `splitflap/quiet/set` | `ON` / `OFF` / `true` / `1` | Set quiet time |
@@ -556,37 +531,43 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
 
 ### Browser upload (recommended)
 
-1. In Arduino IDE: **Sketch → Export Compiled Binary** (Ctrl/Cmd+Alt+S). The files land in a `build/<board-fqbn>/` subfolder next to your sketch.
-2. From that folder, choose **`SplitFlapGateway.ino.bin`** — the plain application image. **This is the only file to upload over OTA.**
+1. Build the firmware in VS Code / PlatformIO (`pio run`, or the **Build** button).
+   The images land in **`.pio/build/esp32s3_devmodule/`**. (Or download `firmware.bin`
+   from the [Releases](https://github.com/avandeputte/SplitFlapGateway/releases) page.)
+2. The file to upload is **`firmware.bin`** — the plain application image. **This is the
+   only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
-4. Select `SplitFlapGateway.ino.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v1.9**).
+4. Select `firmware.bin` and click **Upload Firmware**
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v2.0**).
 
-> **Which file?** The compiler emits several files alongside the app image — pick the right one:
+> **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
+> pick the right one:
 >
 > | File | Use for OTA? | What it is |
 > |---|---|---|
-> | `SplitFlapGateway.ino.bin` | ✅ **Yes** | The application image — what the OTA updater writes to the app partition |
-> | `SplitFlapGateway.ino.merged.bin` | ❌ No | Full-flash image (bootloader + partitions + app) for flashing at offset 0x0 with esptool — **not** an OTA image |
-> | `SplitFlapGateway.ino.bootloader.bin` | ❌ No | Bootloader; USB flash only |
-> | `SplitFlapGateway.ino.partitions.bin` | ❌ No | Partition table; USB flash only |
-> | `SplitFlapGateway.ino.elf` / `.map` | ❌ No | Debug symbols / linker map — not firmware |
+> | `firmware.bin` | ✅ **Yes** | The application image — what the OTA updater writes to the app partition |
+> | `firmware.factory.bin` | ❌ No | Full-flash image (bootloader + partitions + app) for a bare-board USB flash at offset 0x0 — **not** an OTA image |
+> | `bootloader.bin` | ❌ No | Bootloader; USB flash only |
+> | `partitions.bin` | ❌ No | Partition table; USB flash only |
+> | `firmware.elf` / `firmware.map` | ❌ No | Debug symbols / linker map — not firmware |
 >
-> The common mistake is grabbing `*.merged.bin`. For OTA you always want the plain `*.ino.bin`.
+> The common mistake is grabbing `firmware.factory.bin`. For OTA you always want the plain `firmware.bin`.
 
-### Arduino IDE / command line
+### Command line (espota)
 
-As an alternative to the browser upload, you can flash over the network with `espota`. The gateway advertises as `splitflap-gw`:
+As an alternative to the browser upload, you can flash over the network with `espota`. The gateway advertises over mDNS as `splitflap-gw`:
 
 ```bash
-# Arduino IDE: Tools → Port → Network ports → splitflap-gw
+# from .pio/build/esp32s3_devmodule/
+python3 -m espota -i splitflap-gw.local -f firmware.bin
 
-# Command line:
-python3 -m espota -i 192.168.1.105 -f SplitFlapGateway.ino.bin
-
-# With OTA password set:
-python3 -m espota -i 192.168.1.105 -a yourpassword -f SplitFlapGateway.ino.bin
+# or by IP, with an OTA password set:
+python3 -m espota -i 192.168.1.105 -a yourpassword -f firmware.bin
 ```
+
+> PlatformIO can also push OTA directly via its **Upload** action — set
+> `upload_protocol = espota` and `upload_port = splitflap-gw.local` in `platformio.ini`
+> (see [SETUP.md ▸ OTA](SETUP.md#10-later-updates-over-wi-fi-ota)).
 
 ---
 
