@@ -26,8 +26,8 @@ firmware and load it onto the board, starting from a clean computer:
 > required library **automatically** on the first build — you do not install board
 > packages or libraries by hand.
 >
-> Prefer the Arduino IDE instead? The README's [Installation](README.md#installation)
-> section covers that path. **Use one or the other — not both.**
+> Building from the **Arduino IDE is no longer supported** — there is no `.ino` sketch,
+> and all board settings live in `platformio.ini`. This guide is the supported path.
 
 > **Target hardware:** Waveshare **ESP32-S3-RS485-CAN** (ESP32-S3, 16 MB flash,
 > OPI PSRAM), connected to your computer with a **USB-C data cable** (some cables
@@ -164,8 +164,8 @@ build ends with a memory-usage table and:
 The compiled images are written to `.pio/build/esp32s3_devmodule/` — most importantly
 `firmware.bin` (the app image, used later for OTA).
 
-> You do **not** need to change any board settings — every Arduino-IDE board-menu
-> option (PSRAM, 16 MB flash, the 3 MB-app/9.9 MB-FATFS partition scheme, USB mode,
+> You do **not** need to change any board settings — every board option
+> (PSRAM, 16 MB flash, the 3 MB-app/9.9 MB-FATFS partition scheme, USB mode,
 > CPU speed, etc.) is already encoded in `platformio.ini`.
 
 ---
@@ -293,8 +293,8 @@ After the first USB flash you can update without a cable.
 
 1. **Build** the firmware in VS Code (step 5).
 2. The image you upload is **`.pio/build/esp32s3_devmodule/firmware.bin`**.
-   - This is the plain **application image** (the PlatformIO equivalent of Arduino's
-     `*.ino.bin`).
+   - This is the plain **application image** — what the OTA updater writes to the app
+     partition.
    - ⚠️ **Do not** upload `firmware.factory.bin` — that's the full-flash
      (bootloader + partitions + app) image for USB/esptool only, **not** an OTA image.
 3. In the gateway web UI: **Settings ▸ Open Firmware Updater →** (or browse to

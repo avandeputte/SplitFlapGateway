@@ -167,11 +167,12 @@ paths:
                   description: Module ID (0–254), or -1 to broadcast to all
                 char:
                   type: string
-                  maxLength: 1
                   description: >
-                    A single character. The gateway uppercases it and rejects
-                    non-printable / non-ASCII bytes, then sends it verbatim as
-                    m<id>-<char>; the module firmware maps it to a flap index.
+                    A single character (UTF-8). The gateway uppercases ASCII
+                    letters and transcodes the character to a single Windows-1252
+                    byte (so € and accented letters work), then sends m<id>-<char>;
+                    the module firmware maps the byte to a flap index. Characters
+                    with no Windows-1252 representation are rejected.
             example: { id: 5, char: "A" }
       responses:
         "200":
@@ -398,8 +399,9 @@ paths:
                         type: string
                         description: >-
                           Ordered character set (character at each flap index) from the
-                          configurable flap set. Firmware v31+ only; empty string when not
-                          provided.
+                          configurable flap set, as UTF-8 (the gateway transcodes the
+                          module's Windows-1252 bytes, so € and accents round-trip).
+                          Firmware v31+ only; empty string when not provided.
                         example: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
               examples:
                 combined_A:
@@ -775,8 +777,11 @@ paths:
         the module. Target a module by `id` (use `id: -1` to broadcast the same
         flap set to every module on the bus) or by serial number (`sn`). The
         module applies the change silently (no reply); read it back with
-        `/api/flap/all`. `charSet` must be printable ASCII (0x20–0x7E) and at most
-        64 characters. On modules older than v31 the command is ignored.
+        `/api/flap/all`. `charSet` is UTF-8 and may use any character representable
+        in Windows-1252 — ASCII plus the euro sign and Western-European
+        accents; the gateway transcodes it to the single-byte form the bus uses.
+        Characters with no Windows-1252 representation are rejected. At most 64
+        characters. On modules older than v31 the command is ignored.
       requestBody:
         required: true
         content:
@@ -787,10 +792,12 @@ paths:
                 id:        { type: integer, minimum: -1, maximum: 254, description: "Module ID; -1 broadcasts. Use this OR sn." }
                 sn:        { type: string, description: "Target by serial number instead of id." }
                 flapCount: { type: integer, minimum: 1, maximum: 64, description: "Active flap count; omit to leave unchanged." }
-                charSet:   { type: string, maxLength: 64, description: "Ordered character set (index 0..n); omit to leave unchanged." }
+                charSet:   { type: string, maxLength: 64, description: "Ordered character set (index 0..n), UTF-8; any Windows-1252 char (ASCII + € + accents). Omit to leave unchanged." }
             examples:
               byId:
                 value: { id: 5, flapCount: 40, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }
+              euroAndAccents:
+                value: { id: 5, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ€éàüöç0123456789" }
               broadcast:
                 value: { id: -1, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }
               bySerial:
@@ -939,7 +946,8 @@ paths:
         flap position map are overwritten. Map entries not present are cleared.
         The optional `flapCount`/`charSet` (firmware v31+) restore the configurable
         flap set so a backup round-trips; omit them to leave the module's flap set
-        unchanged. `charSet` must be printable ASCII and at most 64 characters.
+        unchanged. `charSet` is UTF-8 (any Windows-1252 character — ASCII plus € and
+        Western-European accents) and at most 64 characters.
       requestBody:
         required: true
         content:
@@ -956,7 +964,7 @@ paths:
                   description: Comma-separated `idx=steps` pairs
                   example: "0=210,1=320,2=430"
                 flapCount:   { type: integer, minimum: 1, maximum: 64, description: "Active flap count (firmware v31+); omit to leave unchanged." }
-                charSet:     { type: string, maxLength: 64, description: "Ordered character set (firmware v31+); omit to leave unchanged." }
+                charSet:     { type: string, maxLength: 64, description: "Ordered character set (firmware v31+), UTF-8; any Windows-1252 char (ASCII + € + accents). Omit to leave unchanged." }
       responses:
         "200":
           $ref: "#/components/responses/Ok"
