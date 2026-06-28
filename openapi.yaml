@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "2.5"
+  version: "2.6"
   description: |
-    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v1.3).
+    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v2.0).
 
     **Base URL:** `http://<gateway-ip>` — replace with the IP shown in the
     gateway status badge, or use `http://192.168.4.1` when connected to the
@@ -387,13 +387,27 @@ paths:
                           Module's self-reported ID from the `A` reply, for diagnosing an
                           address/identity mismatch against `id`. `-99` when not provided.
                         example: 5
+                      flapCount:
+                        type: integer
+                        description: >-
+                          Active flap count (1..64) from the configurable flap set. Firmware
+                          v31+ only; `-99` when not provided (older firmware, the `vd`
+                          fallback, or a stale read).
+                        example: 40
+                      flapChars:
+                        type: string
+                        description: >-
+                          Ordered character set (character at each flap index) from the
+                          configurable flap set. Firmware v31+ only; empty string when not
+                          provided.
+                        example: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
               examples:
                 combined_A:
-                  value: { ok: true, id: 5, ver: "25", sn: "AABBCCDD", dump: "42:4096:0=210,1=320", autoHome: 1, curIndex: 5, reportedId: 5, stale: false, mode: "A" }
+                  value: { ok: true, id: 5, ver: "31", sn: "AABBCCDD", dump: "42:4096:0=210,1=320", autoHome: 1, curIndex: 5, reportedId: 5, flapCount: 40, flapChars: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", stale: false, mode: "A" }
                 fallback_vd:
-                  value: { ok: true, id: 5, ver: "23", sn: "AABBCCDD", dump: "42:4096:0=210,1=320", autoHome: -99, curIndex: -99, reportedId: -99, stale: false, mode: "vd" }
+                  value: { ok: true, id: 5, ver: "23", sn: "AABBCCDD", dump: "42:4096:0=210,1=320", autoHome: -99, curIndex: -99, reportedId: -99, flapCount: -99, flapChars: "", stale: false, mode: "vd" }
                 stale:
-                  value: { ok: true, id: 5, ver: "25", sn: "AABBCCDD", dump: "", autoHome: -99, curIndex: -99, reportedId: -99, stale: true, mode: "A" }
+                  value: { ok: true, id: 5, ver: "31", sn: "AABBCCDD", dump: "", autoHome: -99, curIndex: -99, reportedId: -99, flapCount: -99, flapChars: "", stale: true, mode: "A" }
 
   /api/flap/calibrate:
     post:
@@ -749,6 +763,44 @@ paths:
         "200":
           $ref: "#/components/responses/Ok"
 
+  /api/flap/flapconfig:
+    post:
+      tags: [Advanced]
+      summary: Configure a module's flap count and/or character set (firmware v31+)
+      description: |
+        Sets the runtime-configurable flap set introduced in module firmware v31:
+        the active flap count (1–64) and the ordered character set (the character
+        at each flap index). `flapCount` and `charSet` are **independent and
+        optional** — supply either or both; an omitted side is left unchanged on
+        the module. Target a module by `id` (use `id: -1` to broadcast the same
+        flap set to every module on the bus) or by serial number (`sn`). The
+        module applies the change silently (no reply); read it back with
+        `/api/flap/all`. `charSet` must be printable ASCII (0x20–0x7E) and at most
+        64 characters. On modules older than v31 the command is ignored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:        { type: integer, minimum: -1, maximum: 254, description: "Module ID; -1 broadcasts. Use this OR sn." }
+                sn:        { type: string, description: "Target by serial number instead of id." }
+                flapCount: { type: integer, minimum: 1, maximum: 64, description: "Active flap count; omit to leave unchanged." }
+                charSet:   { type: string, maxLength: 64, description: "Ordered character set (index 0..n); omit to leave unchanged." }
+            examples:
+              byId:
+                value: { id: 5, flapCount: 40, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }
+              broadcast:
+                value: { id: -1, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }
+              bySerial:
+                value: { sn: "AABBCCDD0011223344", flapCount: 48 }
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
   /api/flap/erase:
     post:
       tags: [Advanced]
@@ -882,9 +934,12 @@ paths:
       tags: [Provision]
       summary: Restore EEPROM to a module by serial number
       description: |
-        Sends `mXW<sn>:<homeOffset>:<totalSteps>:<map>\n`.
+        Sends `mXW<sn>:<homeOffset>:<totalSteps>:<map>[:<flapCount>:<flapChars>]\n`.
         Module ID is always preserved; all other calibration fields and the
         flap position map are overwritten. Map entries not present are cleared.
+        The optional `flapCount`/`charSet` (firmware v31+) restore the configurable
+        flap set so a backup round-trips; omit them to leave the module's flap set
+        unchanged. `charSet` must be printable ASCII and at most 64 characters.
       requestBody:
         required: true
         content:
@@ -900,9 +955,13 @@ paths:
                   type: string
                   description: Comma-separated `idx=steps` pairs
                   example: "0=210,1=320,2=430"
+                flapCount:   { type: integer, minimum: 1, maximum: 64, description: "Active flap count (firmware v31+); omit to leave unchanged." }
+                charSet:     { type: string, maxLength: 64, description: "Ordered character set (firmware v31+); omit to leave unchanged." }
       responses:
         "200":
           $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   # ── Status / Config ──────────────────────────────────────────────
 
