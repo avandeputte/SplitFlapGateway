@@ -95,6 +95,17 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 
 ## Installation
 
+> **Don't want to build at all?** A precompiled binary is published on the
+> [Releases](https://github.com/avandeputte/SplitFlapGateway/releases) page and can
+> be flashed directly — no build environment required. See
+> [SETUP.md ▸ Flash a prebuilt binary](SETUP.md#flash-a-prebuilt-binary-no-build-environment-needed).
+>
+> **Using VS Code + PlatformIO?** This repo is a PlatformIO project (`platformio.ini`),
+> and **[SETUP.md](SETUP.md)** is a step-by-step guide covering everything from
+> installing VS Code through building, flashing over USB, and OTA updates — with the
+> board settings already encoded in the project (no manual library install). The
+> section below is the **Arduino IDE** alternative; use one path or the other.
+
 ### Prerequisites
 
 - [Arduino IDE 2.x](https://www.arduino.cc/en/software)
