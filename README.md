@@ -1,6 +1,6 @@
 # Split-Flap Gateway
 
-**Firmware version: 2.0**
+**Firmware version: 2.1**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
@@ -132,7 +132,7 @@ PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v2.0
+[Boot] Split-Flap Gateway v2.1
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -212,7 +212,7 @@ Navigate to the gateway's IP address in any browser.
 | **Modules** | Grid of all known modules — ID, serial number, current character, firmware version, sorted by ID (unprovisioned modules last). The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog that queries the module live — refreshing its firmware version and reading its EEPROM — and shows all known module data plus a parsed view of the EEPROM: home offset, steps/rev, and the calibrated flap map — and, for a module on firmware v31+, an editable **Flap Set** section for the active flap count and character set), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
 | **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change. Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
-| **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap's current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through all 64 flaps one at a time. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
+| **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap (in the module's own character order, with colour flaps as swatches) and its current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through every flap one at a time. The map, the Wizard, and the whole-board walk all honour a module's **custom flap set** (character order and flap count) on firmware v31+, falling back to the default 64-flap reel on older modules. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
 | **Backup** | Download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
 | **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update |
@@ -312,7 +312,7 @@ All bus frames are ASCII starting with `m`. On the wire, frames are newline-term
 
 ### Character set (64 flaps, index 0–63)
 
-The split-flap character set is owned by the **module firmware**, not the gateway. When you send `m<id>-<char>`, the gateway transcodes the character from UTF-8 to a single **Windows-1252** byte — so a euro sign or an accented letter (which are multi-byte in UTF-8) maps to exactly one flap — uppercases ASCII letters, and drops any character with no Windows-1252 representation; the module then maps that byte to the correct flap index. The gateway only deals in flap indices when you explicitly send `m<id>+<index>`. The table below is the module's **default** flap order, provided for reference when interpreting EEPROM dumps:
+The split-flap character set is owned by the **module firmware**, not the gateway. When you send `m<id>-<char>`, the gateway transcodes the character from UTF-8 to a single **Windows-1252** byte — so a euro sign or an accented letter (which are multi-byte in UTF-8) maps to exactly one flap — uppercases ASCII letters (**except** the seven lowercase colour codes `r o y g b p w`, which address the colour flaps and are sent as-is), and drops any character with no Windows-1252 representation; the module then maps that byte to the correct flap index. The gateway only deals in flap indices when you explicitly send `m<id>+<index>`. The table below is the module's **default** flap order, provided for reference when interpreting EEPROM dumps:
 
 ```
  0  SPACE    1  A    2  B    3  C    4  D    5  E    6  F    7  G
@@ -324,6 +324,8 @@ The split-flap character set is owned by the **module firmware**, not the gatewa
 48  q       49  :   50  %   51  '   52  .   53  ,   54  /   55  ?
 56  *       57  r   58  o   59  y   60  g   61  b   62  p   63  w
 ```
+
+Indices 57–63 (`r o y g b p w`) are the **colour flaps** — red, orange, yellow, green, blue, pink, white — addressed by those lowercase letters. The gateway sends them verbatim (it does not uppercase them, unlike ordinary lowercase letters) and renders them as colour swatches in the Live Display and the calibration Character Map.
 
 On **firmware v31+** both the active flap count (1–64) and this character order are **configurable per module** at runtime via the `N` command, and persist in the module's EEPROM. For a v31+ module the Module Info dialog shows a **Flap Set** section with the live values and an inline editor (`POST /api/flap/flapconfig`); a whole panel can be set at once with a broadcast (`id:-1`). The section is shown **only** for v31+ modules — on older firmware it is omitted and the fixed 64-flap default set above is used. The configured count and characters are also reported at the end of the `A` dump and are captured in backups so a restore round-trips them.
 
@@ -538,7 +540,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
    only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `firmware.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v2.0**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v2.1**).
 
 > **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
 > pick the right one:

@@ -169,10 +169,12 @@ paths:
                   type: string
                   description: >
                     A single character (UTF-8). The gateway uppercases ASCII
-                    letters and transcodes the character to a single Windows-1252
-                    byte (so € and accented letters work), then sends m<id>-<char>;
-                    the module firmware maps the byte to a flap index. Characters
-                    with no Windows-1252 representation are rejected.
+                    letters — except the seven lowercase colour codes r/o/y/g/b/p/w,
+                    which address the colour flaps and are sent as-is — and transcodes
+                    the character to a single Windows-1252 byte (so € and accented
+                    letters work), then sends m<id>-<char>; the module firmware maps
+                    the byte to a flap index. Characters with no Windows-1252
+                    representation are rejected.
             example: { id: 5, char: "A" }
       responses:
         "200":

@@ -20,9 +20,10 @@ own EEPROM:
   slightly different (e.g. `4097`) or substantially different on other hardware.
 - **Home Offset** — how many steps past the hall-sensor trigger the reel must
   move to land the blank flap (index 0) centered in the window. Default `2832`.
-- **Character Map** — an optional per-flap fine-tune. For each of the 64 flaps
-  the module can store a custom step position. If a flap has no custom value,
-  the module computes its position as `(index × Total Steps) / 64`.
+- **Character Map** — an optional per-flap fine-tune. For each flap the module
+  can store a custom step position. If a flap has no custom value, the module
+  computes its position as `(index × Total Steps) / flap count` — the flap count
+  is 64 by default, or the module's configured count on firmware v31+.
 
 **The golden order.** Always calibrate in this order, because each step depends
 on the one before it:
@@ -178,9 +179,11 @@ from Total Steps. The cell returns to grey.
 ## The Calibration Wizard (guided, recommended)
 
 Steps 1–3 above can all be done by hand, but the **Calibration Wizard** walks you
-through the entire process automatically: it steps through all 64 flaps one at a
+through the entire process automatically: it steps through every flap one at a
 time, moves the reel to each one so you can see it, and lets you confirm or adjust
-each before saving. It's the easiest way to do a full pass on a new module.
+each before saving. It's the easiest way to do a full pass on a new module. The
+Wizard and the Character Map follow the module's own character order and flap
+count (its custom flap set on firmware v31+, or the default 64-flap reel otherwise).
 
 Start it from the **Calibration Wizard (step through all flaps)** button under the
 Character Map.

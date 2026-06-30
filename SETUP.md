@@ -131,7 +131,7 @@ Pick **one** of the following.
 ## 4. Open the project in VS Code
 
 PlatformIO identifies a project by the folder that **directly contains
-`platformio.ini`**. For this repo that is the **`2.0`** folder.
+`platformio.ini`**. For this repo that is the **`2.1`** folder.
 
 1. In VS Code: **File ▸ Open Folder…**
 2. Select the **`SplitFlapGateway/2.0`** folder (the one with `platformio.ini`,
@@ -258,7 +258,7 @@ To watch boot logs and the periodic `[WDG]` diagnostics (115200 baud):
 You should see something like:
 
 ```
-[Boot] Split-Flap Gateway v2.0
+[Boot] Split-Flap Gateway v2.1
 [Boot] reset=... heap=... psram=8388608 flash=16384KB sdk=...
 [WDG] up=30s heap=... mqtt=1 mods=11 ...
 ```
@@ -332,7 +332,7 @@ upload_port     = splitflap-gw.local   ; or the gateway IP
 
 PlatformIO Core (`pio`) is installed with the extension. Open the PlatformIO
 terminal (👽 sidebar ▸ **Quick Access ▸ Miscellaneous ▸ New Terminal**) and run these
-from the `2.0` folder:
+from the `2.1` folder:
 
 ```bash
 pio run                  # build (compile) the firmware
@@ -354,7 +354,7 @@ pio pkg update           # update platform + libraries
 
 | Symptom | Fix |
 |---|---|
-| PlatformIO toolbar/icons are missing or greyed out | You opened the wrong folder. Open the **`2.0`** folder that contains `platformio.ini` (step 4). |
+| PlatformIO toolbar/icons are missing or greyed out | You opened the wrong folder. Open the **`2.1`** folder that contains `platformio.ini` (step 4). |
 | First build fails downloading the platform/toolchain | Check internet access/proxy/VPN and rebuild; PlatformIO needs the network only on the first build. |
 | Upload: *"could not open port" / "port is busy"* | Close the **Serial Monitor** (it holds the port), then upload. Only one program can use the port at a time. |
 | Upload: *"Failed to connect to ESP32-S3"* | Force bootloader mode: hold **BOOT**, tap **RESET**, release **BOOT**, upload again (step 7). |

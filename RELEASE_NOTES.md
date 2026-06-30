@@ -1,5 +1,22 @@
 # Split-Flap Gateway — Release Notes
 
+## v2.1 — 2026-06-29
+
+A bug-fix release that makes the **colour flaps** work correctly end to end and the **calibration tools honour a module's custom flap set**. It is a drop-in upgrade from v2.0 — all endpoints, MQTT topics, and module behaviour are unchanged.
+
+### Fixes
+
+- **Colour flaps are no longer turned into letters.** The seven colour flaps are addressed by the lowercase letters `r o y g b p w` (red, orange, yellow, green, blue, pink, white), but the gateway was normalising *all* lowercase ASCII to uppercase before sending — so a request for blue (`b`) went out as the letter `B`. Lowercase letters are still uppercased to match the default reel, **except** those seven colour codes, which now pass through verbatim. Ordinary text is unaffected (`hello` → `HELLO`); lowercase is now meaningful for colours (`b` → blue flap).
+- **Calibration Wizard and Character Map now reflect a module's custom flap set.** Both were hardcoded to the default 64-flap reel, so a module on firmware v31+ with a custom character set or flap count was still calibrated against `A B C …`. They now read the module's live character set and flap count (via the combined `A` dump / `/api/flap/all`) and use them throughout — the map labels, the Wizard's per-flap glyph and progress, the whole-board walk, and the default per-flap step positions (spaced by the module's actual flap count, not a fixed 64).
+- **Live Display renders colour flaps.** A flap currently showing a colour now appears as a colour swatch on the Live Display wall, matching the Character Map, instead of printing the bare colour letter.
+- **Lowercase is visible on the Display tab.** The Send Text and Send Single Character inputs no longer force-uppercase what you type on screen, so you can enter and see the lowercase colour codes you are sending.
+- **The web UI no longer serves a stale page after an update.** The embedded page is now sent with `Cache-Control: no-cache`, so a normal reload always loads the new UI after a firmware flash — previously the browser could keep serving the cached HTML/JS, making an update look like it had no effect.
+
+### Compatibility & upgrade notes
+
+- No API, MQTT, or wiring changes; backups are unaffected. The custom-flap-set calibration display requires module firmware **v31+** (older modules use the fixed 64-flap default reel, exactly as before).
+- Upgrade the gateway over-the-air as usual (Settings → firmware update), then confirm the version badge in the header reads **v2.1**. Because of the caching fix, do **one** hard refresh (Cmd/Ctrl + Shift + R) after this upgrade; subsequent updates refresh on a normal reload.
+
 ## v2.0 — 2026-06-28
 
 Adds gateway support for the **runtime-configurable flap set** introduced in **module firmware v31**: the active flap count (1–64) and the ordered character set are now set per module from the gateway, read back, and preserved across backup/restore. It is a drop-in upgrade — every existing endpoint, MQTT topic, and module behaviour is unchanged, and the new controls simply stay inert for modules on older firmware.
