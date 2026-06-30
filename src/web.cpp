@@ -104,6 +104,10 @@ static void handleRoot() {
   wdgWebMs = millis();                 // streaming response can take a while
   // Cap per-write blocking so a stalled browser cannot wedge taskWeb.
   server.client().setTimeout(3000);    // 3s per socket operation
+  // The page is embedded in the firmware, so it changes with every FW update.
+  // Without this, browsers cache the old HTML/JS and keep serving stale UI after
+  // a flash -- tell them never to cache it so a reload always gets the new page.
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   // Stream the static page (web_ui.h), substituting the single {FWVER} token

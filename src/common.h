@@ -99,7 +99,7 @@
 #define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
 
 /* ---- Firmware identity ---- */
-#define FW_VERSION           "2.0"           // gateway firmware version (UI + boot log)
+#define FW_VERSION           "2.1"           // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured

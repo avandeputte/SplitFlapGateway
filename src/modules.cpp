@@ -314,11 +314,15 @@ void sfTrackChar(int addr, char c) {
 // Send one flap character. `c` is a single Windows-1252 byte: ASCII 0x20-0x7E, or
 // a high byte (euro/accents/smart punctuation) -- see charset.h. ASCII letters are
 // normalised to uppercase (to match the default reel order); high bytes are sent
-// verbatim so accented case is preserved. Bytes that aren't a valid flap glyph
-// (controls, undefined slots, the 0x00/0xFF firmware sentinels) are dropped.
+// verbatim so accented case is preserved. The seven colour flaps are the EXCEPTION:
+// the protocol conveys them as the lowercase letters r/o/y/g/b/p/w, so those pass
+// through verbatim -- uppercasing them would turn a colour request into a letter.
+// Bytes that aren't a valid flap glyph (controls, undefined slots, the 0x00/0xFF
+// firmware sentinels) are dropped.
 void sfSendChar(int addr, char c) {
   uint8_t b = (uint8_t)c;
-  if (b >= 'a' && b <= 'z') b = (uint8_t)(b - 'a' + 'A');     // uppercase ASCII only
+  if (b >= 'a' && b <= 'z' && !strchr("roygbpw", (char)b))   // uppercase ASCII only,
+    b = (uint8_t)(b - 'a' + 'A');                            // but keep colour codes
   if (!isFlapByte(b)) return;                                 // not a valid flap glyph
   char buf[24];
   if (addr < 0)
