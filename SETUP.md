@@ -258,7 +258,7 @@ To watch boot logs and the periodic `[WDG]` diagnostics (115200 baud):
 You should see something like:
 
 ```
-[Boot] Split-Flap Gateway v2.1
+[Boot] Split-Flap Gateway v3.0
 [Boot] reset=... heap=... psram=8388608 flash=16384KB sdk=...
 [WDG] up=30s heap=... mqtt=1 mods=11 ...
 ```
@@ -276,9 +276,9 @@ The board has no Wi-Fi credentials yet, so it starts its own access point.
    **`12345678`**).
 2. Open **<http://192.168.4.1>** in a browser.
 3. Go to **Settings ▸ Wi-Fi**, enter your network's SSID and password, and **Save Wi-Fi**.
-4. The gateway joins your network and shows its IP in the header status badge. After
-   that it's reachable on your LAN at that IP or at **<http://splitflap-gw.local>**
-   (mDNS).
+4. The gateway joins your network; its IP appears on the **Status** page (and in
+   the serial log). After that it's reachable on your LAN at that IP or at
+   **<http://splitflap-gw.local>** (mDNS).
 
 For provisioning modules, calibration, MQTT, etc., see the [README](README.md) and
 [CALIBRATION_GUIDE](CALIBRATION_GUIDE.md).

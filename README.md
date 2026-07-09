@@ -1,9 +1,21 @@
 # Split-Flap Gateway
 
-**Firmware version: 2.1**
+**Firmware version: 3.0**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
+
+> [!TIP]
+> **New in 3.0**
+> - **Batch RS-485 send** — `POST /api/rs485/batch` sends many frames in one
+>   request (with optional device-side pacing), so a host can draw a whole
+>   animated page in a single HTTP call instead of one request per module.
+> - **Quiet-Time schedule** — Quiet Time can now turn on/off automatically on a
+>   daily schedule (Settings → *Quiet Time Schedule*: a start/end time and the
+>   days it applies). Evaluated once a second against the RTC.
+> - **Companion app (coming soon)** — a companion app that adds apps, playlists,
+>   and triggers is on the way and will integrate tightly with the gateway. More
+>   in a future release.
 
 ---
 
@@ -73,8 +85,8 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 - **Diagnostic boot/telemetry log** — on boot the gateway prints its reset reason (POWERON / PANIC / TASK_WDT / BROWNOUT, etc.), a chip/heap snapshot, and where its large buffers were allocated (`[MEM] … in PSRAM`); the periodic `[WDG]` line reports heap, min-ever heap, largest free block, heap-fragmentation %, per-task stack watermarks, RX/TX/parse-reject counters, WiFi station and fallback-AP state, WiFi RSSI, and MQTT state
 - **PSRAM-backed buffers** — the bus-monitor ring, MQTT publish queue, and module registry (~60 KB combined) live in the board's PSRAM, keeping internal RAM free for the WiFi/TCP stack (which makes large over-the-air updates reliable); falls back to internal RAM if PSRAM is unavailable
 - **mDNS** — the web UI is reachable at `http://splitflap-gw.local` (no IP lookup needed)
-- **Maintenance mode** — a header toggle that makes the gateway ignore all externally-originated MQTT commands (the web UI keeps working), so calibration and backup work isn't disturbed by home-automation traffic; always resets to off on reboot
-- **Quiet time** — a header toggle (and REST/MQTT/Home Assistant control) that keeps the gateway responsive to commands but stops it from moving any flaps for normal display updates; deliberate calibration moves still work. When turned off, the reels resync to the last requested display. Always resets to off on reboot
+- **Maintenance mode** — makes the gateway ignore all externally-originated MQTT commands (the web UI keeps working), so calibration and backup work isn't disturbed by home-automation traffic. Enable it from the Calibration tab or via REST/MQTT/Home Assistant; while it's on, the dashboard shows a yellow border and a banner with a one-click **Turn Off**. Always resets to off on reboot
+- **Quiet time** — controllable via REST/MQTT/Home Assistant or a daily schedule (Settings → *Quiet Time Schedule*), it keeps the gateway responsive to commands but stops it from moving any flaps for normal display updates; deliberate calibration moves still work. A teal border and banner mark the dashboard while it's active. When turned off, the reels resync to the last requested display. Always resets to off on reboot
 - **Home Assistant integration** — optional MQTT auto-discovery (opt-in on the Settings tab) that exposes the gateway as a Home Assistant device: a display text control, Maintenance and Quiet Time switches, an availability sensor (via MQTT LWT), and the full `[WDG]` diagnostic set as sensors, plus a clickable Gateway URL
 - **Real-time bus monitor** — live RS-485 traffic with protocol decoding and local timestamps
 - **NTP time sync** — RTC backed by PCF85063; syncs on WiFi connect and persists through power loss. The NTP server is configurable in Settings (default `pool.ntp.org`)
@@ -132,7 +144,7 @@ PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v2.1
+[Boot] Split-Flap Gateway v3.0
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -183,7 +195,7 @@ With no WiFi configured, the gateway brings up a fallback Access Point so you ca
 | Password | `12345678` |
 | Web UI | http://192.168.4.1 |
 
-Connect to the AP, open the web UI, go to **Settings → WiFi**, enter your network credentials, and click **Save WiFi**. The gateway connects to your network and displays its IP in the status badge. NTP syncs automatically on first WiFi connection.
+Connect to the AP, open the web UI, go to **Settings → WiFi**, enter your network credentials, and click **Save WiFi**. The gateway connects to your network; its IP appears on the **Status** page (and in the serial log). NTP syncs automatically on first WiFi connection.
 
 The Access Point is **fallback-only**: once the gateway is connected to your WiFi it runs station-only and the AP is shut down (so it can't be joined by mistake, and its resources stay free). The AP only comes back if the station connection is lost for more than ~20 seconds, and it drops again automatically when the connection returns. You can confirm the AP is off in the `[WDG]` serial log — `ap=0` whenever `wifi=1`.
 
@@ -344,6 +356,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 |---|---|---|---|
 | `GET` | `/api/rs485/messages` | — | Drain buffered frames (up to 64) |
 | `POST` | `/api/rs485/send` | `{"data":"m5-A\n"}` (optional `"raw":true`) | Send raw ASCII frame. Framing/junk is normalized by default; `"raw":true` sends bytes verbatim |
+| `POST` | `/api/rs485/batch` | `{"frames":["m00-A\n","m01-B\n",…],"step_ms":15}` | **(v3.0)** Send many frames in one request (each normalized like `/send`); optional `step_ms` (0–30) paces the cascade device-side. Lets a host draw a whole animated page in one HTTP call instead of one request per module. Capped at 512 frames / 8 s of pacing |
 
 ### Module Control
 
@@ -424,6 +437,8 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/maintenance` | `{"on":true}` | Enable/disable maintenance mode (ignores external MQTT commands) |
 | `GET` | `/api/quiet` | — | Returns `{ok,on}` — current quiet-time state |
 | `POST` | `/api/quiet` | `{"on":true}` | Enable/disable quiet time (flaps stop moving for display updates; reels resync when disabled) |
+| `GET` | `/api/quiet/schedule` | — | Returns `{enabled,start,end,days}` — the daily quiet-time schedule (`days` is a bitmask, bit0=Sun … bit6=Sat) |
+| `POST` | `/api/quiet/schedule` | `{"enabled":true,"start":"22:00","end":"07:00","days":127}` | Set the schedule. When enabled, quiet time toggles automatically as local time crosses the window (overnight windows supported) |
 | `GET` | `/api/config` | — | Current configuration (passwords excluded) |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
@@ -540,7 +555,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
    only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `firmware.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v2.1**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.0**).
 
 > **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
 > pick the right one:

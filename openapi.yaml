@@ -1,13 +1,13 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "2.6"
+  version: "3.0"
   description: |
-    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v2.0).
+    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v3.0).
 
-    **Base URL:** `http://<gateway-ip>` — replace with the IP shown in the
-    gateway status badge, or use `http://192.168.4.1` when connected to the
-    AP fallback network.
+    **Base URL:** `http://<gateway-ip>` — replace with the gateway's IP
+    (shown on the Status page), or use `http://192.168.4.1` when connected to
+    the AP fallback network.
 
     All `POST` endpoints accept and return `application/json`.
     All endpoints include `Access-Control-Allow-Origin: *`.
@@ -93,6 +93,45 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/Ok"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/rs485/batch:
+    post:
+      tags: [Bus]
+      summary: Send many raw frames in one request (v3.0)
+      description: >
+        Sends each frame in `frames` to the bus in order, normalized like
+        `/api/rs485/send`. An optional `step_ms` paces the cascade device-side.
+        Lets a host draw a whole animated page in one HTTP call instead of one
+        request per module. Capped at 512 frames and 8 s of total pacing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [frames]
+              properties:
+                frames:
+                  type: array
+                  items: { type: string }
+                  description: ASCII frames, e.g. ["m00-A\n","m01-B\n"]
+                step_ms:
+                  type: integer
+                  default: 0
+                  description: Delay (0–30 ms) between frames, for a paced cascade.
+            example: { frames: ["m00-A\n", "m01-B\n", "m02-y\n"], step_ms: 15 }
+      responses:
+        "200":
+          description: How many frames were sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:   { type: boolean, example: true }
+                  sent: { type: integer, example: 45 }
         "400":
           $ref: "#/components/responses/BadRequest"
 
@@ -535,8 +574,7 @@ paths:
                   started: { type: boolean, description: "true once the Hall test is running", example: true }
                   id:      { type: integer, example: 11 }
                   q:
-                    type: object
-                    nullable: true
+                    type: [object, "null"]
                     description: "Stats snapshot, or null if the module did not answer the Q query"
                     properties:
                       resetCause: { type: integer, description: "Raw RSTFR bits: 1 power-on, 2 brown-out, 4 external, 8 watchdog, 16 software (combinable)", example: 1 }
@@ -1111,6 +1149,36 @@ paths:
                   ok: { type: boolean, example: true }
                   on: { type: boolean, example: true }
 
+  /api/quiet/schedule:
+    get:
+      tags: [Status]
+      summary: Get the daily quiet-time schedule (v3.0)
+      responses:
+        "200":
+          description: Current schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuietSchedule" }
+    post:
+      tags: [Status]
+      summary: Set the daily quiet-time schedule (v3.0)
+      description: |
+        When enabled, quiet time is toggled automatically as local time crosses
+        the window (overnight windows supported). Transition-based, so a manual
+        toggle within a window is respected until the next boundary. Persisted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuietSchedule" }
+            example: { enabled: true, start: "22:00", end: "07:00", days: 127 }
+      responses:
+        "200":
+          description: New schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuietSchedule" }
+
   /api/config:
     get:
       tags: [Config]
@@ -1293,6 +1361,15 @@ components:
               error: { type: string, example: "id required" }
 
   schemas:
+    QuietSchedule:
+      type: object
+      description: Daily quiet-time schedule (v3.0).
+      properties:
+        enabled: { type: boolean, example: true }
+        start:   { type: string, description: "Window start HH:MM", example: "22:00" }
+        end:     { type: string, description: "Window end HH:MM (overnight allowed)", example: "07:00" }
+        days:    { type: integer, description: "Active-day bitmask, bit0=Sun … bit6=Sat", example: 127 }
+        offset:  { type: integer, description: "Client UTC offset in minutes east of UTC; the window is evaluated in this local time. The web UI sends it on load.", example: -300 }
     BusFrame:
       type: object
       properties:

@@ -1,5 +1,58 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.0 — 2026-07-07
+
+Adds **batch RS-485 send** and an automatic **Quiet-Time schedule**, plus a
+cleaner dashboard and a more robust bus monitor. Drop-in upgrade from v2.1 — all
+existing endpoints, MQTT topics, and module behaviour are unchanged; the
+additions are purely new config + endpoints.
+
+### New
+
+- **Batch RS-485 send.** `POST /api/rs485/batch` accepts many frames in one
+  request (`{"frames":[…],"step_ms":15}`), each normalized like `/api/rs485/send`,
+  with an optional device-side `step_ms` pacing the cascade. A host can now draw
+  a whole animated page in a single HTTP call instead of one request per module.
+  Capped at 512 frames / 8 s of pacing; feeds the web watchdog during long
+  batches.
+- **Quiet-Time schedule.** Quiet Time can turn on/off automatically on a daily
+  schedule. Configure it under **Settings → Quiet Time Schedule** (enable, a
+  start/end time, and the days it applies). The schedule is evaluated once a
+  second against the RTC and toggles Quiet Time as local time crosses the window
+  (overnight windows supported). Transition-based, so a manual toggle within a
+  window is respected until the next boundary. Persisted in NVS.
+  - `GET`/`POST /api/quiet/schedule` → `{enabled,start,end,days}` (`days` is a
+    bitmask, bit0=Sun … bit6=Sat).
+
+### Web UI
+
+- **Cleaner top bar.** The maintenance checkbox and the IP address were removed
+  from the header, which now shows just the logo and version badge. Maintenance
+  mode is still signalled by the yellow border and banner — and that banner now
+  carries a one-click **Turn Off Maintenance** button. (The gateway's IP remains
+  on the **Status** page.)
+
+### Fixes
+
+- **Valid JSON on the bus-monitor MQTT topics.** A frame containing a `"` or `\`
+  could emit malformed JSON on the `<prefix>/rx` and `<prefix>/tx` monitor topics
+  (those characters weren't escaped). They are now escaped; the MQTT and
+  web-monitor encoders share one transcoder; and the MQTT buffer was enlarged so
+  a full frame of accented / multi-byte glyphs is never truncated mid-message.
+
+### Coming soon
+
+- **Companion app.** A companion application — apps, playlists, and triggers — is
+  in the works and will integrate tightly with the gateway. More in a future
+  release.
+
+### Compatibility & upgrade notes
+
+- No breaking changes: existing REST endpoints, MQTT topics, and backups from
+  earlier versions are unchanged. Upgrade the gateway over-the-air as usual
+  (Settings → firmware update), then confirm the version badge in the header
+  reads **v3.0**.
+
 ## v2.1 — 2026-06-29
 
 A bug-fix release that makes the **colour flaps** work correctly end to end and the **calibration tools honour a module's custom flap set**. It is a drop-in upgrade from v2.0 — all endpoints, MQTT topics, and module behaviour are unchanged.
