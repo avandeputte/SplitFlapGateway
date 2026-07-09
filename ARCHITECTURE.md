@@ -166,6 +166,41 @@ Three-digit IDs (vs two) add at most ~1 byte to a handful of commands, still far
 inside `TX_MAX_BYTES`. These buffers were sized for the frame, and the frame is
 what bounds them.
 
+## Companion settings blob (v3.1)
+
+The companion app parks its settings on the gateway (`GET`/`PUT
+/api/companion/settings`) so its container can be stateless. The gateway is a
+**dumb blob store**: the payload is `gzip(minified JSON)` whose schema belongs
+entirely to the companion, and the firmware stores the bytes verbatim, hands them
+back byte-for-byte, and never parses them. That boundary is the whole point --
+the companion's schema can evolve freely without ever touching firmware.
+
+It reuses the FATFS partition and the same temp-file-then-rename atomicity as the
+module registry above (`/compset.gz`, via `/compset.tmp`), so an interrupted
+upload cannot corrupt a good copy. The blob is capped at 64 KB; real ones are
+1-2 KB, and the companion debounces its writes, so flash wear is negligible.
+Because it lives on FATFS rather than in the app partition, it survives OTA.
+
+The non-obvious part is **receiving the body at all**. The synchronous
+`WebServer` copies a non-form request body into a `String` via its `char*`
+constructor, so `server.arg("plain")` stops at the first NUL byte -- and a gzip
+stream carries one at offset 3 (the FLG header byte). A 127-byte blob would
+arrive as 3 bytes. So the PUT is registered with the four-argument
+`server.on(uri, HTTP_PUT, fn, ufn)` overload: supplying that upload callback is
+what makes `WebServer` route the request down its **raw** path
+(`RequestHandler::canRaw()` is true whenever a handler has a `ufn` and isn't a
+GET), streaming the body to the callback in `HTTP_RAW_BUFLEN` (1436 B) chunks
+that we append straight to the temp file. The final handler then sends the
+response, reading a status the raw callback left behind.
+
+Two consequences worth remembering: the raw callback **cannot stop** the server's
+read loop, so a request that fails validation early (too large, no filesystem)
+must keep draining chunks and simply drop them, or the response never reaches the
+client; and the response is deliberately served as `application/gzip` **without**
+`Content-Encoding: gzip`, because those bytes are the payload rather than a
+transfer encoding of it -- declaring the encoding would make HTTP clients
+transparently gunzip the body, leaving the companion to decompress plain JSON.
+
 ## Time handling
 
 The RTC stores UTC. Local time is derived at format time using the configured

@@ -1,9 +1,20 @@
 # Split-Flap Gateway
 
-**Firmware version: 3.0**
+**Firmware version: 3.1**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
+
+> [!TIP]
+> **New in 3.1**
+> - **Companion settings stored on the gateway** — the [Companion App](#companion-app)
+>   can now park its settings, playlists and triggers in the gateway's flash
+>   (`GET`/`PUT /api/companion/settings`), so a companion container becomes
+>   stateless: spin one up on any host and it inherits its configuration from the
+>   gateway. See [Companion Settings Storage](#companion-settings-storage).
+> - **Firmware version in `/api/config`** — the config response now carries a
+>   `"version"` field (e.g. `"3.1.0"`), which is how the companion detects a
+>   gateway new enough to store its settings.
 
 > [!TIP]
 > **New in 3.0**
@@ -13,9 +24,8 @@
 > - **Quiet-Time schedule** — Quiet Time can now turn on/off automatically on a
 >   daily schedule (Settings → *Quiet Time Schedule*: a start/end time and the
 >   days it applies). Evaluated once a second against the RTC.
-> - **Companion app (coming soon)** — a companion app that adds apps, playlists,
->   and triggers is on the way and will integrate tightly with the gateway. More
->   in a future release.
+> - **Companion app** — the companion that adds apps, playlists and triggers is
+>   **released**: [SplitFlapGatewayCompanion](https://github.com/avandeputte/SplitFlapGatewayCompanion).
 
 ---
 
@@ -36,6 +46,8 @@
 - [Serial Debug Output](#serial-debug-output)
 - [First Boot](#first-boot)
 - [Web UI](#web-ui)
+- [Companion App](#companion-app)
+  - [Companion Settings Storage](#companion-settings-storage)
 - [Split-Flap Protocol](#split-flap-protocol)
 - [REST API](#rest-api)
   - [RS-485 Bus](#rs-485-bus)
@@ -74,6 +86,7 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 ## Features
 
 - **Web UI** — single-page dashboard accessible from any browser
+- **[Companion app](#companion-app)** — an optional content engine (apps, playlists, schedules, triggers) that runs on a Raspberry Pi or any Linux box and drives the display over REST. It registers itself with the gateway, which then shows a **Companion** tab, and it can keep its own settings in the gateway's flash so its container stays stateless
 - **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 255: IDs 0-254)
 - **Sticky module list** — the known-module registry persists across reboots in flash; a stale module is version-probed before being dropped (so a merely-quiet module isn't lost), and a gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
 - **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
@@ -144,7 +157,7 @@ PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v3.0
+[Boot] Split-Flap Gateway v3.1.0
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -229,6 +242,98 @@ Navigate to the gateway's IP address in any browser.
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
 | **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update |
 | **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
+
+---
+
+## Companion App
+
+The gateway owns the **hardware**: the RS-485 bus, module discovery, provisioning,
+calibration and diagnostics. It has no concept of a "weather app" or a playlist.
+That's the job of the **companion** — an optional web app that owns the
+**content** and drives this gateway over REST.
+
+> **Get it:** **[avandeputte/SplitFlapGatewayCompanion](https://github.com/avandeputte/SplitFlapGatewayCompanion)**
+
+The two run on separate machines (the companion wants a Raspberry Pi, a NAS, or any
+x86-64 Linux box — anything that can run Docker) but are meant to feel like **one
+integrated product**: they share the same look, and a unified tab bar cross-links
+between them. The companion registers itself with the gateway, which then grows a
+**Companion** tab pointing back at it, and reports the companion's running status on
+the **Status** page.
+
+**What it does:**
+
+| | |
+|---|---|
+| **Apps** | 45 ready-made apps — clocks, weather, stocks, crypto, sports scores, transit times, countdowns, quotes, animations. Tile grid, one-tap run |
+| **Compose** | A click-to-type grid with colour tiles and every transition style (`ltr`, `rtl`, `spiral`, `slot`, …) |
+| **Playlists** | Sequence apps and messages with per-entry durations and per-entry settings, then save, run and loop them |
+| **Schedules** | Time-of-day windows, per weekday, that run an app or playlist — or turn the display off |
+| **Triggers** | Apps that watch for an event (the ISS overhead, a goal, a storm) and briefly interrupt whatever is showing |
+| **Localization** | A global language (US/UK/Australian English plus the Western-European languages that fit the modules' Windows-1252 flaps), with currency and public holidays following your location. Both overridable per app |
+| **App Library** | Add, remove, or **upload your own** apps as a `.zip` — the app format is [csader/splitflap-os](https://github.com/csader/splitflap-os)'s plugin library, reused through a behavior-identical runtime, so any splitflap-os app drops in unchanged |
+| **Display tab** | This gateway's own calibration/modules/diagnostics UI, reverse-proxied under the companion's origin so the whole thing is one app |
+| **Home Assistant** | Adds **App** and **Playlist** selects and a **Stop** button — the companion-unique controls the gateway's own HA device doesn't cover |
+
+**How it talks to this gateway:**
+
+- **Always REST.** A whole page is drawn in one `POST /api/rs485/batch` request — the
+  v3.0 endpoint exists precisely for this. No broker sits in the display path, so
+  animations stay smooth. Each batch shows as a single **REST** row in the Bus Monitor.
+- **MQTT only for Home Assistant.** It never carries display frames.
+- **This gateway is the source of truth.** The companion reads its grid size and MQTT
+  broker from `GET /api/config` on startup and on demand, rather than keeping its own copy.
+- **It registers itself** with `POST /api/companion` (its URL, plus a status heartbeat).
+
+Install is a single command on a Pi or any Linux box — it installs Docker if needed,
+asks for this gateway's URL, and starts the container:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/avandeputte/SplitFlapGatewayCompanion/main/install.sh | bash
+```
+
+> The companion **requires Gateway 3.0 or newer** (it depends on batch send and
+> `/api/companion` registration), and it is licensed CC BY-NC-SA 4.0 as a derivative
+> of splitflap-os. This gateway's own firmware is unaffected — the companion is
+> entirely optional, and the gateway works standalone without it.
+
+### Companion Settings Storage
+
+**New in firmware 3.1.** The companion can store its settings, playlists and triggers
+**in this gateway's flash** instead of on its own disk. A companion container then
+becomes effectively **stateless**: destroy it, start another on a different host, and
+it restores its configuration from the gateway on boot.
+
+The gateway is deliberately a **dumb blob store**. The payload is
+`gzip(minified JSON)` whose schema belongs entirely to the companion; the firmware
+stores the bytes **verbatim**, hands them back byte-for-byte, and never parses them.
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /api/companion/settings` | Returns the stored gzipped body as `application/gzip`, or **404** when nothing is stored yet |
+| `PUT /api/companion/settings` | Stores the gzipped request body, atomically. Replies `200 {"ok":true,"bytes":N}` |
+
+Details worth knowing:
+
+- **Atomic writes.** The body streams to a temp file which is renamed over the live
+  one only once the last byte has landed, so a crash or a dropped connection
+  mid-upload can never corrupt settings that were already good.
+- **No `Content-Encoding: gzip`.** The gzip bytes *are* the payload, not a transfer
+  encoding of it — declaring the encoding would make HTTP clients silently
+  decompress the body, and the companion decompresses it itself.
+- **It survives OTA updates.** The blob lives on the FATFS partition
+  (`/compset.gz`), which a firmware update doesn't touch.
+- **Bounded.** A blob larger than 64 KB is rejected with `413`. Real ones are 1–2 KB,
+  so this costs the gateway negligible flash; the companion also debounces its writes
+  so a burst of edits becomes one write.
+- **Errors:** `400` empty or truncated body, `413` too large, `503` filesystem not
+  mounted, `507` write failed.
+
+On the companion side this is the `COMPANION_SETTINGS_STORE` setting — `mirror`
+(default: local file primary, mirrored here), `local` (never touch the gateway), or
+`gateway` (diskless, stored only here). It's backward compatible: against a **3.0**
+gateway the companion sees no `"version"` field new enough in `/api/config` and
+quietly falls back to local storage.
 
 ---
 
@@ -439,7 +544,11 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/quiet` | `{"on":true}` | Enable/disable quiet time (flaps stop moving for display updates; reels resync when disabled) |
 | `GET` | `/api/quiet/schedule` | — | Returns `{enabled,start,end,days}` — the daily quiet-time schedule (`days` is a bitmask, bit0=Sun … bit6=Sat) |
 | `POST` | `/api/quiet/schedule` | `{"enabled":true,"start":"22:00","end":"07:00","days":127}` | Set the schedule. When enabled, quiet time toggles automatically as local time crosses the window (overnight windows supported) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded) |
+| `GET` | `/api/companion` | — | Returns `{url,status}` — the registered [companion app](#companion-app)'s URL and its last reported running status |
+| `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather"}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. The URL is persisted; the status is runtime-only |
+| `GET` | `/api/companion/settings` | — | **(v3.1)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
+| `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.1)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.1.0"` |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
@@ -555,7 +664,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
    only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `firmware.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.0**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.1.0**).
 
 > **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
 > pick the right one:

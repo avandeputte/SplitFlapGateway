@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "3.0"
+  version: "3.1"
   description: |
-    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v3.0).
+    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v3.1).
 
     **Base URL:** `http://<gateway-ip>` — replace with the gateway's IP
     (shown on the Status page), or use `http://192.168.4.1` when connected to
@@ -35,6 +35,8 @@ tags:
     description: System status and diagnostics
   - name: Config
     description: Persistent configuration
+  - name: Companion
+    description: Companion-app registration and its settings blob store
   - name: OTA
     description: Over-the-air firmware update
 
@@ -1179,6 +1181,112 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/QuietSchedule" }
 
+  # ── Companion app ───────────────────────────────────────────────
+
+  /api/companion:
+    get:
+      tags: [Companion]
+      summary: Get the registered companion app (v3.0)
+      responses:
+        "200":
+          description: Registered companion URL and its last reported status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Companion" }
+    post:
+      tags: [Companion]
+      summary: Register the companion app and heartbeat its status (v3.0)
+      description: |
+        The companion app posts its own URL here so the gateway can show a
+        **Companion** tab linking back to it. The URL is persisted in NVS (and
+        only rewritten when it actually changes, to spare the flash from
+        heartbeats); the status is runtime-only and clears on reboot.
+
+        An empty `url` deregisters the companion. Either field may be sent alone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Companion" }
+            example: { url: "http://192.168.1.60:8000", status: "Running: Weather" }
+      responses:
+        "200":
+          description: The stored registration after the update
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Companion" }
+
+  /api/companion/settings:
+    get:
+      tags: [Companion]
+      summary: Fetch the companion's stored settings blob (v3.1)
+      description: |
+        Returns the blob exactly as it was stored by `PUT`, byte for byte.
+
+        The body is `gzip(minified JSON)` whose schema belongs entirely to the
+        companion — the gateway never parses it. It is served as
+        `application/gzip` and **not** with `Content-Encoding: gzip`: these bytes
+        are the payload, not a transfer encoding of it, so HTTP clients must not
+        transparently decompress them. The caller decompresses it itself.
+      responses:
+        "200":
+          description: The stored gzipped JSON blob
+          content:
+            application/gzip:
+              schema: { type: string, format: binary }
+        "404":
+          description: Nothing stored yet (or the filesystem is unavailable)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    put:
+      tags: [Companion]
+      summary: Store the companion's settings blob (v3.1)
+      description: |
+        Stores the request body **verbatim** and **atomically**: it streams to a
+        temp file on the FATFS partition and is renamed over the live copy only
+        once the final byte lands, so an interrupted upload can never corrupt
+        settings that were already good. The blob survives OTA firmware updates.
+
+        The body must be `gzip(minified JSON)`, at most 64 KB (real blobs are
+        1–2 KB). The gateway stores whatever bytes it is given and does not
+        validate that they are valid gzip or valid JSON.
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean, example: true }
+                  bytes: { type: integer, description: "Bytes stored", example: 1284 }
+        "400":
+          description: Empty or truncated body — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: Blob larger than 64 KB — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Filesystem not mounted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "507":
+          description: Write failed (storage full or I/O error)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/config:
     get:
       tags: [Config]
@@ -1361,6 +1469,25 @@ components:
               error: { type: string, example: "id required" }
 
   schemas:
+    Error:
+      type: object
+      description: The error body sent by a failing endpoint.
+      properties:
+        error: { type: string, example: "Settings blob too large" }
+
+    Companion:
+      type: object
+      description: Companion-app registration (v3.0).
+      properties:
+        url:
+          type: string
+          description: "The companion's own base URL. Persisted; blank means no companion is registered. Posting a blank url deregisters it"
+          example: "http://192.168.1.60:8000"
+        status:
+          type: string
+          description: "The companion's last reported running status. Runtime-only -- clears on reboot. Quotes, backslashes and control characters are sanitised"
+          example: "Running: Weather"
+
     QuietSchedule:
       type: object
       description: Daily quiet-time schedule (v3.0).
@@ -1436,6 +1563,7 @@ components:
     Config:
       type: object
       properties:
+        version:      { type: string,  example: "3.1.0", description: "Gateway firmware version (v3.1+). Absent on older firmware, which is how a client detects a pre-3.1 gateway" }
         wSSID:        { type: string,  example: "MyNetwork" }
         mqHost:       { type: string,  example: "192.168.1.50" }
         mqPort:       { type: integer, example: 1883 }

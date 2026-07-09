@@ -1,5 +1,52 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.1 — 2026-07-09
+
+Lets the **[Companion App](https://github.com/avandeputte/SplitFlapGatewayCompanion)**
+store its settings in the gateway's flash, so a companion container becomes
+stateless — destroy it, start another on any host, and it restores its
+configuration from the gateway. Drop-in upgrade from v3.0: every existing
+endpoint, MQTT topic and module behaviour is unchanged, and the additions are
+purely a new endpoint pair plus one new config field.
+
+### New
+
+- **Companion settings blob store.** The gateway now offers a small, dumb blob
+  store that the companion owns end to end:
+  - `GET /api/companion/settings` → the stored `gzip(minified JSON)` body as
+    `application/gzip`, or `404` when nothing is stored yet.
+  - `PUT /api/companion/settings` → stores the gzipped body **verbatim**; replies
+    `{"ok":true,"bytes":N}`.
+
+  The firmware never parses the payload — the companion owns the schema and
+  compresses/decompresses at its own end. Writes are **atomic**: the body streams
+  to a temp file on the FATFS partition and is renamed over the live copy only
+  once the last byte lands, so an interrupted upload cannot corrupt settings that
+  were already good. The blob (`/compset.gz`) survives OTA firmware updates, is
+  capped at 64 KB (real ones are 1–2 KB), and the companion debounces its writes,
+  so this costs the flash almost nothing.
+
+  Errors are `400` (empty or truncated body), `413` (too large), `503`
+  (filesystem not mounted) and `507` (write failed) — in every one of them the
+  previously stored blob is left untouched.
+
+- **Firmware version in `GET /api/config`.** The response now carries
+  `"version"` (e.g. `"3.1.0"`). This is how the companion decides whether a
+  gateway is new enough to hold its settings; against a 3.0 gateway the field is
+  absent and the companion quietly falls back to storing them locally.
+
+### Notes
+
+- The gzipped body is served as `application/gzip` and deliberately **without**
+  `Content-Encoding: gzip` — those bytes are the payload, not a transfer encoding
+  of it. Declaring the encoding would make HTTP clients transparently decompress
+  the body, and the companion decompresses it itself.
+- `OPTIONS` preflights now advertise `PUT` alongside `GET,POST`.
+- The v3.0 `/api/companion` registration endpoint, previously undocumented, is now
+  described in `openapi.yaml` along with the new pair.
+
+---
+
 ## v3.0 — 2026-07-07
 
 Adds **batch RS-485 send** and an automatic **Quiet-Time schedule**, plus a
@@ -40,11 +87,13 @@ additions are purely new config + endpoints.
   web-monitor encoders share one transcoder; and the MQTT buffer was enlarged so
   a full frame of accented / multi-byte glyphs is never truncated mid-message.
 
-### Coming soon
+### Companion app
 
-- **Companion app.** A companion application — apps, playlists, and triggers — is
-  in the works and will integrate tightly with the gateway. More in a future
-  release.
+- **[SplitFlapGatewayCompanion](https://github.com/avandeputte/SplitFlapGatewayCompanion)
+  is released.** A content engine — apps, playlists, schedules and triggers — that
+  drives the display over this release's batch endpoint and registers itself with
+  `POST /api/companion`, which makes a **Companion** tab appear on the gateway. It
+  requires v3.0 or newer. See [Companion App](README.md#companion-app).
 
 ### Compatibility & upgrade notes
 
