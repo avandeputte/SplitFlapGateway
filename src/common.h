@@ -99,7 +99,9 @@
 #define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
 
 /* ---- Firmware identity ---- */
-#define FW_VERSION           "3.0"           // gateway firmware version (UI + boot log)
+// Also reported as "version" by GET /api/config: the companion app gates its
+// 3.1 features (the settings blob store below) on reading >= 3.1 here.
+#define FW_VERSION           "3.1.0"         // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -171,6 +173,17 @@
 /* ---- Persisted module-registry file (FFat) ---- */
 #define MODULES_FILE     "/modules.dat"
 #define MODULES_MAGIC    0x53464732UL   // "SFG2" (bumped: PersistedModule gained 'acked')
+
+/* ---- Companion settings blob (FFat) -- v3.1 --------------------------------
+ * The companion app can park its settings here so its container stays stateless.
+ * The gateway is a dumb blob store: the body is gzip(minified JSON) whose schema
+ * the companion owns, stored verbatim and handed back byte-for-byte. Written via
+ * a temp file + rename so a crash mid-write cannot corrupt the good copy.
+ * Names are 8.3-safe, like MODULES_FILE, so they work without FATFS long-name
+ * support. Real blobs are ~1-2 KB; the cap only exists to bound a rogue PUT. */
+#define COMPANION_FILE       "/compset.gz"
+#define COMPANION_TMP        "/compset.tmp"
+#define COMPANION_MAX_BYTES  (64UL * 1024UL)
 
 /* ==========================================================================*/
 #define DBG(...) do { if (gSerialDebug) printf(__VA_ARGS__); } while(0)

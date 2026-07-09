@@ -45,6 +45,9 @@ static void handleApiProvision();
 static void handleApiQuiet();
 static void handleApiQuietSchedule();
 static void handleApiCompanion();
+static void handleApiCompanionSettingsGet();
+static void handleApiCompanionSettingsPut();
+static void handleApiCompanionSettingsRaw();
 static void handleApiRestoreBySN();
 static void handleApiSend();
 static void handleApiSendBatch();
@@ -802,6 +805,7 @@ static void handleApiStatus() {
 static void handleApiConfigGet() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   JsonDocument doc;
+  doc["version"]  = FW_VERSION;   // v3.1: lets the companion feature-gate on the firmware
   doc["wSSID"]    = cfg.wifiSSID;
   doc["mqHost"]   = cfg.mqttHost;
   doc["mqPort"]   = cfg.mqttPort;
@@ -818,7 +822,7 @@ static void handleApiConfigGet() {
   doc["serialDebug"]   = cfg.serialDebug;
   doc["haEnabled"]     = cfg.haEnabled;
   doc["otaPasswordSet"] = (strlen(cfg.otaPassword) > 0);
-  char out[640];
+  char out[768];   // headroom for "version" + JSON-escaped SSID/TZ strings
   serializeJson(doc, out, sizeof(out));
   server.send(200, "application/json", out);
 }
@@ -975,7 +979,8 @@ static void handleApiConfigSettings() {
 
 static void handleOptions() {
   server.sendHeader("Access-Control-Allow-Origin",  "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  // PUT is used by /api/companion/settings (v3.1); the rest of the API is GET/POST.
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
   server.send(204);
 }
@@ -1619,6 +1624,122 @@ static void handleApiCompanion() {
   server.send(200, "application/json", buf);
 }
 
+/* ----------------------------------------------------------
+   Companion settings blob  (v3.1)
+
+   A stateless companion keeps its settings/playlists/triggers here instead of on
+   its own disk. The payload is gzip(minified JSON) whose schema belongs entirely
+   to the companion -- the gateway stores the bytes verbatim and never parses them.
+
+   The body is binary, which rules out server.arg("plain"): the WebServer copies a
+   non-form body through String(char*), so it would stop at the first NUL byte --
+   and a gzip header carries one at offset 3. Instead the PUT registers an upload
+   callback, which makes the WebServer take its "raw" path and stream the body to
+   us in HTTP_RAW_BUFLEN chunks. handleApiCompanionSettingsRaw writes those chunks
+   straight to a temp file; handleApiCompanionSettingsPut then sends the response.
+---------------------------------------------------------- */
+static File   compFile;          // temp file, open across the RAW_WRITE chunks
+static size_t compRecvd = 0;     // bytes written so far this request
+static int    compErr   = 0;     // 0 = ok, else the HTTP status to report
+
+// Give up on the transfer: close + delete the temp file, remember the status.
+// The WebServer keeps draining the socket either way (we cannot stop its read
+// loop), so every later chunk is simply dropped and the response still lands.
+static void compAbort(int status) {
+  if (compFile) compFile.close();
+  if (sfFsReady) FFat.remove(COMPANION_TMP);
+  compErr = status;
+}
+
+// PUT /api/companion/settings -- raw body callback (one call per chunk)
+static void handleApiCompanionSettingsRaw() {
+  HTTPRaw& raw = server.raw();
+  wdgWebMs = millis();          // a slow client must not trip the web watchdog
+
+  switch (raw.status) {
+    case RAW_START: {
+      compRecvd = 0;
+      compErr   = 0;
+      size_t len = (size_t)server.clientContentLength();
+      // Decide before opening anything, so a bad request never touches flash.
+      if (!sfFsReady)                  { compErr = 503; break; }  // no filesystem mounted
+      if (len == 0)                    { compErr = 400; break; }  // nothing to store
+      if (len > COMPANION_MAX_BYTES)   { compErr = 413; break; }
+      FFat.remove(COMPANION_TMP);                                 // clear a stale temp file
+      compFile = FFat.open(COMPANION_TMP, "w");
+      if (!compFile) compErr = 507;
+      break;
+    }
+
+    case RAW_WRITE:
+      if (compErr || !compFile) break;                         // already failed -- drain
+      // Content-Length was checked up front, but a body may overrun it; re-check
+      // so a lying header still cannot fill the flash.
+      if (compRecvd + raw.currentSize > COMPANION_MAX_BYTES) { compAbort(413); break; }
+      if (compFile.write(raw.buf, raw.currentSize) != raw.currentSize) { compAbort(507); break; }
+      compRecvd += raw.currentSize;
+      break;
+
+    case RAW_END:
+      if (compErr) { compAbort(compErr); break; }              // reuse the cleanup path
+      compFile.close();
+      // A truncated body (fewer bytes than promised) must not overwrite good settings.
+      if (compRecvd != (size_t)server.clientContentLength()) { compAbort(400); break; }
+      // Publish atomically: the old blob survives intact until the rename lands.
+      FFat.remove(COMPANION_FILE);
+      if (!FFat.rename(COMPANION_TMP, COMPANION_FILE)) { compAbort(507); break; }
+      DBG("[CFG] Companion settings stored (%u bytes)\n", (unsigned)compRecvd);
+      break;
+
+    case RAW_ABORTED:
+      compAbort(400);
+      break;
+  }
+}
+
+// PUT /api/companion/settings -- response, after the raw body has been consumed
+static void handleApiCompanionSettingsPut() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int err = compErr;
+  compErr = 0;                  // never leak this request's verdict into the next
+  switch (err) {
+    case 0:   break;
+    case 400: sendJsonError(400, "Empty or truncated body"); return;
+    case 413: sendJsonError(413, "Settings blob too large"); return;
+    case 503: sendJsonError(503, "No filesystem");         return;
+    default:  sendJsonError(507, "Write failed");          return;
+  }
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"ok\":true,\"bytes\":%u}", (unsigned)compRecvd);
+  server.send(200, "application/json", buf);
+}
+
+// GET /api/companion/settings -- hand the stored blob back byte-for-byte
+static void handleApiCompanionSettingsGet() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  if (!sfFsReady || !FFat.exists(COMPANION_FILE)) { sendJsonError(404, "No settings stored"); return; }
+  File f = FFat.open(COMPANION_FILE, "r");
+  if (!f) { sendJsonError(404, "No settings stored"); return; }
+  size_t n = f.size();
+  if (n == 0) { f.close(); sendJsonError(404, "No settings stored"); return; }
+
+  wdgWebMs = millis();
+  server.client().setTimeout(3000);        // cap per-write blocking on a stalled client
+  server.setContentLength(n);
+  // Deliberately NOT "Content-Encoding: gzip": these bytes are the payload, not a
+  // transfer encoding of it. Declaring the encoding would make HTTP clients gunzip
+  // the body transparently, and the companion -- which decompresses itself -- would
+  // then be handed plain JSON it tries to decompress again.
+  server.send(200, "application/gzip", "");
+  uint8_t buf[512];
+  while (size_t got = f.read(buf, sizeof(buf))) {
+    server.sendContent((const char*)buf, got);
+    wdgWebMs = millis();
+  }
+  f.close();
+}
+
 void webInit() {
   server.on("/",                     HTTP_GET,     handleRoot);
   server.on("/favicon.svg",          HTTP_GET,     handleFavicon);
@@ -1701,6 +1822,12 @@ void webInit() {
   server.on("/api/companion",        HTTP_GET,     handleApiCompanion);
   server.on("/api/companion",        HTTP_POST,    handleApiCompanion);
   server.on("/api/companion",        HTTP_OPTIONS, handleOptions);
+  // v3.1 blob store. Passing the 4th (upload) callback is what puts the PUT on the
+  // WebServer's raw-body path, so the binary gzip arrives intact.
+  server.on("/api/companion/settings", HTTP_GET,     handleApiCompanionSettingsGet);
+  server.on("/api/companion/settings", HTTP_PUT,     handleApiCompanionSettingsPut,
+                                                     handleApiCompanionSettingsRaw);
+  server.on("/api/companion/settings", HTTP_OPTIONS, handleOptions);
   server.on("/api/config",           HTTP_GET,     handleApiConfigGet);
   server.on("/api/config/wifi",      HTTP_POST,    handleApiConfigWifi);
   server.on("/api/config/wifi",      HTTP_OPTIONS, handleOptions);
