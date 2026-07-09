@@ -54,6 +54,25 @@ void ringPush(const RS485Msg& m) {
   xSemaphoreGive(msgMutex);
 }
 
+// Log a synthetic "command received" row (dir 'C') just above the TX frames it
+// produces, so a single REST batch or MQTT send is visible as one line in the
+// monitor. origin is 'R' (REST) or 'M' (MQTT); desc is a short human label.
+// This is a UI-log marker only -- it is not published to the MQTT rx/tx mirror.
+void ringPushCommand(char origin, const char* desc) {
+  RS485Msg m;
+  m.timestamp = millis();
+  m.dir       = 'C';
+  m.origin    = origin;
+  m.sanitized = false;
+  size_t n = desc ? strlen(desc) : 0;
+  if (n > MSG_MAX_BYTES) n = MSG_MAX_BYTES;
+  if (n) memcpy(m.data, desc, n);
+  m.len = n;
+  rtcFormatTime(m.wallTime, sizeof(m.wallTime));
+  m.epoch = rtcEpochNow();
+  ringPush(m);
+}
+
 String ringDrain() {
   if (!msgMutex || !msgRing) return "[]";
   xSemaphoreTake(msgMutex, portMAX_DELAY);
@@ -73,22 +92,20 @@ String ringDrain() {
     const RS485Msg& m = msgRing[i];
     if (!first) out += ',';
     first = false;
-    // Stack buffer -- no heap allocation per message
-    char ascii[MSG_MAX_BYTES * 2 + 1]; size_t ai = 0;
-    for (size_t j = 0; j < m.len && ai < sizeof(ascii)-2; j++) {
-      uint8_t b = m.data[j];
-      if      (b == '\n' || b == '\r') { /* skip newlines */ }
-      else if (b == '"'  ) { ascii[ai++] = '\\'; ascii[ai++] = '"';}  // escape quote
-      else if (b == '\\' ) { ascii[ai++] = '\\'; ascii[ai++] = '\\';}// escape backslash
-      else if (b >= 32 && b <= 126) { ascii[ai++] = (char)b; }
-      else { ascii[ai++] = '.'; }
-    }
-    ascii[ai] = 0;
+    // Stack buffer -- no heap allocation per message. Render as JSON-safe UTF-8
+    // via the shared helper: escapes "/\, strips newlines, maps unprintable
+    // bytes to a space, and shows high Windows-1252 flap bytes (accent/euro/
+    // symbol) as their REAL glyph rather than a placeholder. The byte on the bus
+    // is unchanged; this only affects how it reads back to the browser. Sized
+    // for up to 3 UTF-8 bytes per flap byte.
+    char utf8[MSG_MAX_BYTES * 3 + 1];
+    flapToJsonUtf8((const char*)m.data, m.len, utf8, sizeof(utf8), ' ');
     out += "{\"ts\":";      out += m.timestamp;
     out += ",\"ep\":";      out += m.epoch;
     out += ",\"wt\":\"";    out += m.wallTime;  out += '"';
     out += ",\"dir\":\"";   out += m.dir;       out += '"';
-    out += ",\"command\":\""; out += ascii;       out += '"';
+    if (m.dir == 'C') { out += ",\"src\":\""; out += m.origin; out += '"'; }  // REST/MQTT command marker
+    out += ",\"command\":\""; out += utf8;        out += '"';
     out += ",\"len\":";     out += m.len;
     if (m.sanitized) out += ",\"san\":1";
     out += '}';
@@ -173,6 +190,10 @@ static void sfTrackFromFrame(const uint8_t* data, size_t len) {
     if (i + 1 >= len) return;
     char c = (char)data[i + 1];    // ASCII or a Windows-1252 high byte (euro/accents)
     if (!isFlapByte((uint8_t)c)) return;
+    // Record for the display wall so it shows every written cell -- provisioned
+    // or not, straight from the frame (independent of the module registry).
+    if (addr < 0) memset(gWallChars, c, sizeof(gWallChars));       // broadcast
+    else if (addr < (int)sizeof(gWallChars)) gWallChars[addr] = c;
     sfTrackChar(addr, c);
   } else if (cmd == '+') {         // show index: record index, char unknown
     long idx = 0;
@@ -202,6 +223,8 @@ static void sfTrackFromFrame(const uint8_t* data, size_t len) {
     // Guard against false matches: 'h' must be the whole command, not a prefix
     // of something else. (There is no other 'h...' display command, but this
     // keeps the matcher strict.)
+    if (addr < 0) memset(gWallChars, 0, sizeof(gWallChars));        // broadcast home
+    else if (addr < (int)sizeof(gWallChars)) gWallChars[addr] = 0;  // -> blank cell
     sfTrackChar(addr, 0);
   }
 }
@@ -448,6 +471,7 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
   RS485Msg m;
   m.timestamp = millis();
   m.dir = 'T';
+  m.origin = 0;          // origin only labels 'C' (command) rows, not bus TX/RX
   m.sanitized = sanitized;
   // Reconstruct the on-wire frame for the monitor ring (bare command plus the
   // terminator we actually sent), bounded to MSG_MAX_BYTES. This keeps TX ring

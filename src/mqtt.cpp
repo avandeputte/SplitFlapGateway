@@ -33,24 +33,27 @@ static void mqttEnqueue(const char* topic, const char* payload, size_t len) {
 
 void mqttPublishMsg(const RS485Msg& m) {
   if (!mqtt.connected()) return;
-  // Build ASCII representation of frame (no heap allocation)
-  char ascii[MSG_MAX_BYTES + 1]; size_t ai = 0;
-  for (size_t ii = 0; ii < m.len && ai < sizeof(ascii)-1; ii++) {
-    uint8_t b = m.data[ii];
-    if      (b == '\n' || b == '\r') { /* skip */ }
-    else if (b >= 32 && b <= 126)    { ascii[ai++] = (char)b; }
-    else                             { ascii[ai++] = '.'; }
-  }
-  ascii[ai] = 0;
-  // Build JSON with snprintf -- avoids JsonDocument heap allocation in hot path.
-  // The monitor frame (ascii) is capped at MSG_MAX_BYTES, so the JSON is at most
-  // ~313 bytes; a 384-byte buffer is ample and keeps this off-stack pressure low
-  // (this runs in taskRS485, which has a modest stack).
-  char buf[384];
-  size_t n = (size_t)snprintf(buf, sizeof(buf),
-    "{\"ts\":%lu,\"wt\":\"%s\",\"command\":\"%s\"}",
-    m.timestamp, m.wallTime, ascii);
-  if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+  // Build the JSON with snprintf + a direct transcode -- no JsonDocument heap
+  // allocation in this hot path. One worst-case buffer holds the whole message
+  // so it is NEVER truncated: the fixed prefix is <=59 bytes, the command body
+  // is at most MSG_MAX_BYTES*3 (every flap byte -> a 3-byte UTF-8 glyph), and
+  // the "} suffix is 2 -- all inside MSG_MAX_BYTES*3 + 80. A single buffer (vs a
+  // separate transcode scratch) keeps stack use modest: mqttPublishMsg runs on
+  // taskRS485 and taskNetwork, both of which have only a 6KB stack.
+  char buf[MSG_MAX_BYTES * 3 + 80];
+  int pre = snprintf(buf, sizeof(buf),
+    "{\"ts\":%lu,\"wt\":\"%s\",\"command\":\"", m.timestamp, m.wallTime);
+  if (pre < 0) return;
+  // Transcode the frame straight into buf after the prefix: escapes "/\, strips
+  // line breaks, maps unprintable bytes to a space, and shows high Windows-1252
+  // bytes as their real glyph (shared with the web monitor). Reserve 3 bytes for
+  // the closing "} and NUL.
+  size_t body = flapToJsonUtf8((const char*)m.data, m.len,
+                               buf + pre, sizeof(buf) - (size_t)pre - 3, ' ');
+  size_t n = (size_t)pre + body;
+  buf[n++] = '"';
+  buf[n++] = '}';
+  buf[n]   = '\0';
   char _t[80];
   snprintf(_t, sizeof(_t), "%s/%s", cfg.mqttPrefix, m.dir=='R'?"rx":"tx");
   mqttEnqueue(_t, buf, n);
@@ -101,8 +104,11 @@ void mqttPublishStatus() {
   mqttEnqueue(_t, buf, n);
 }
 
-// Assemble the best-known display string from per-module tracked characters,
-// in module-id order across the configured grid. Unknown chars render as '?'.
+// Assemble the display string in module-id order across the configured grid,
+// from the SAME source as the live-display wall: gWallChars, the last flap byte
+// transmitted to each grid cell. This mirrors exactly what the gateway sent --
+// independent of the module registry, so it is unaffected by provisioning state
+// or stale-probe eviction. A provisioned cell never written reads '?'.
 void mqttPublishDisplayState() {
   if (!mqtt.connected()) return;
   int cells = (int)cfg.gridRows * (int)cfg.gridCols;
@@ -114,9 +120,11 @@ void mqttPublishDisplayState() {
   int outLen = 0;
   if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     for (int id = 0; id < cells; id++) {
-      SFModule* m = sfFindById((uint8_t)id);
-      uint8_t uc = (m && m->provisioned) ? (uint8_t)m->flapChar : (uint8_t)' ';
-      if (m && m->provisioned && !isFlapByte(uc)) uc = '?';   // present but char unknown
+      uint8_t uc = (id < (int)sizeof(gWallChars)) ? (uint8_t)gWallChars[id] : 0;
+      if (!(uc && isFlapByte(uc))) {          // nothing valid sent to this cell
+        SFModule* m = sfFindById((uint8_t)id);
+        uc = (m && m->provisioned) ? (uint8_t)'?' : (uint8_t)' ';
+      }
       outLen += flapByteToUtf8(uc, str + outLen);       // ASCII -> 1 byte, high -> UTF-8
     }
     xSemaphoreGive(sfMutex);
@@ -261,6 +269,15 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     snprintf(ctl, sizeof(ctl), "%s/quiet/set", cfg.mqttPrefix);
     if (strcmp(topic, ctl) == 0) {
+      // The quiet SCHEDULE is authoritative inside its window: refuse an external
+      // OFF (a retained message, an HA switch, an automation) so it can't fight
+      // the schedule -- that fight caused quiet to flap and its resync churn to
+      // break OTA uploads. Republish state so the sender re-syncs to ON.
+      if (!on && quietSchedInWindow()) {
+        printf("[QUIET] MQTT quiet/set OFF ignored -- schedule active (in window)\n");
+        mqttPublishStateTopics();
+        return;
+      }
       sfSetQuietTime(on);
       mqttPublishStateTopics();
       return;
@@ -299,6 +316,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     size_t L = strlen(buf);
     if (L && (buf[L-1]=='\n'||buf[L-1]=='\r')) buf[L-1]=0;
     DBG("[MQTT] display set: %s\n", buf);
+    { char cd[MSG_MAX_BYTES]; snprintf(cd, sizeof(cd), "display %s", buf); ringPushCommand('M', cd); }
     sfSendText(0, buf, false);
     mqttPublishDisplayState();
     return;
@@ -332,6 +350,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
       static uint8_t outBuf[TX_MAX_BYTES];  // static: see note on buf above
       size_t  outLen = min(strlen(d), (size_t)TX_MAX_BYTES);
       memcpy(outBuf, d, outLen);
+      { char cd[MSG_MAX_BYTES]; snprintf(cd, sizeof(cd), "send %s", d); ringPushCommand('M', cd); }
       rs485Send(outBuf, outLen, raw);
     }
     return;
@@ -348,6 +367,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     const char* text = doc["text"] | "";
     if (strlen(text) > 0) {
       int start = doc["start"] | id;
+      { char cd[MSG_MAX_BYTES]; snprintf(cd, sizeof(cd), "text@%d %s", start, text); ringPushCommand('M', cd); }
       sfSendText(start, text, false);
       return;
     }

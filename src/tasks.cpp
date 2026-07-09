@@ -84,6 +84,7 @@ void taskRS485(void* pv) {
         RS485Msg m;
         m.timestamp = millis();
         m.dir       = 'R';
+        m.origin    = 0;       // origin only labels 'C' (command) rows, not bus TX/RX
         m.sanitized = false;   // RX frames are never sanitized
         // The monitor ring entry is fixed-size; store at most MSG_MAX_BYTES.
         // The full frame is still parsed below -- this copy is display-only.
@@ -151,8 +152,71 @@ void taskRS485(void* pv) {
   }
 }
 
+// v3.0: evaluate the Quiet-Time schedule and toggle Quiet Time when local time
+// crosses a window boundary. Transition-based (only acts on a change), so a
+// manual Quiet toggle within a window is respected until the next boundary.
+// True if the schedule is enabled and the current user-local time is in-window.
+// The schedule (start/end/days) is entered in the browser's local time, and the
+// browser sends its UTC offset with it, so we apply that offset and read the
+// result as UTC fields -- independent of the gateway posixTZ (which defaults to
+// UTC), and consistent with how the web UI renders every other timestamp.
+bool quietSchedInWindow() {
+  if (!cfg.quietSchedEnabled) return false;
+  time_t utc = (time_t)rtcEpochNow();
+  if (!utc) return false;            // RTC/NTP not valid yet
+  time_t local = utc + (time_t)cfg.quietTzOffsetMin * 60;
+  struct tm lt;
+  gmtime_r(&local, &lt);             // offset already applied -> read fields directly
+  int cur = lt.tm_hour * 60 + lt.tm_min;
+  int sh = 22, sm = 0, eh = 7, em = 0;
+  sscanf(cfg.quietStart, "%d:%d", &sh, &sm);
+  sscanf(cfg.quietEnd,   "%d:%d", &eh, &em);
+  int s = sh * 60 + sm, e = eh * 60 + em;
+  bool dayOn = (cfg.quietDays >> lt.tm_wday) & 1;
+  bool inWin = (s <= e) ? (cur >= s && cur < e) : (cur >= s || cur < e);  // overnight ok
+  return dayOn && inWin;
+}
+
+static void quietScheduleTick() {
+  static int prevWant = -1;
+  if (gOtaInProgress) return;        // never touch quiet/resync mid-flash (OTA safety)
+
+  // Does the schedule currently want Quiet ON? A DISABLED schedule counts as
+  // want=0 (not a hard early-return) so that disabling an active schedule flows
+  // through the same falling-edge turn-off below and RELEASES Quiet Time, rather
+  // than leaving it stuck on.
+  int want;
+  if (!cfg.quietSchedEnabled) {
+    want = 0;
+  } else {
+    if (!rtcEpochNow()) return;      // enabled but no valid time yet -- don't change state
+    want = quietSchedInWindow() ? 1 : 0;
+  }
+
+  // Self-healing, not edge-only: inside the window keep Quiet ON, re-asserting if
+  // anything turned it off (external OFF is also refused mid-window; see the
+  // MQTT/REST guards). On the falling edge -- window end OR the schedule being
+  // disabled -- turn OFF, but only if the schedule was the one holding it
+  // (prevWant==1), so a manual Quiet Time outside the schedule is left alone.
+  if (want) {
+    if (!gQuietTime) { DBG("[QUIET] schedule: in window, asserting ON\n"); sfSetQuietTime(true); }
+  } else if (prevWant == 1 && gQuietTime) {
+    DBG("[QUIET] schedule: released (window ended or disabled), turning OFF\n");
+    sfSetQuietTime(false);
+  }
+  prevWant = want;
+}
+
 void taskRTC(void* pv) {
-  while (true) { rtcRead(); vTaskDelay(pdMS_TO_TICKS(1000)); }
+  uint32_t lastSched = 0;
+  while (true) {
+    rtcRead();
+    if (lastSched == 0 || millis() - lastSched > 5000UL) {
+      lastSched = millis();
+      quietScheduleTick();     // evaluate the quiet window every 5s (prompt flip)
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 }
 
 void taskWeb(void* pv) {

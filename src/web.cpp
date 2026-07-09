@@ -43,8 +43,11 @@ static void handleApiMqttTest();
 static void handleApiNudge();
 static void handleApiProvision();
 static void handleApiQuiet();
+static void handleApiQuietSchedule();
+static void handleApiCompanion();
 static void handleApiRestoreBySN();
 static void handleApiSend();
+static void handleApiSendBatch();
 static void handleApiStatus();
 static void handleApiText();
 static void handleApiTotalSteps();
@@ -145,9 +148,51 @@ static void handleApiSend() {
   size_t  outLen = min(strlen(d), (size_t)TX_MAX_BYTES);
   memcpy(outBuf, d, outLen);
   if (!outLen) { sendJsonError(400, "Empty data"); return; }
+  { char cd[MSG_MAX_BYTES]; snprintf(cd, sizeof(cd), "send %s", d);
+    ringPushCommand('R', cd); }   // one 'REST' row, then the TX frame below
   rs485Send(outBuf, outLen, raw);
   char resp[64];
   snprintf(resp, sizeof(resp), "{\"ok\":true,\"bytes\":%zu,\"raw\":%s}", outLen, raw ? "true" : "false");
+  server.send(200, "application/json", resp);
+}
+
+// POST /api/rs485/batch  (v3.0) -- send many frames in one request.
+// Body: {"frames":["m00-A\n","m01-B\n",...], "step_ms":15}. Each frame is sent
+// normalized (like /api/rs485/send); an optional step_ms paces the cascade
+// device-side. Lets the companion draw a whole animated page in ONE HTTP call
+// instead of one request per module. Caps keep the request bounded and the web
+// watchdog fed.
+static void handleApiSendBatch() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendJsonError(400, "Bad JSON"); return;
+  }
+  JsonArray frames = doc["frames"].as<JsonArray>();
+  if (frames.isNull()) { sendJsonError(400, "'frames' array required"); return; }
+  int step = doc["step_ms"] | 0;
+  if (step < 0)  step = 0;
+  if (step > 30) step = 30;          // keep per-frame pacing small
+  // One 'REST' row marking the batch, just above the TX frames it produces.
+  { char cd[48]; snprintf(cd, sizeof(cd), "batch %u frames, step=%dms",
+      (unsigned)frames.size(), step); ringPushCommand('R', cd); }
+  int sent = 0;
+  unsigned long budget = 0;          // total artificial delay (ms), capped
+  for (JsonVariant v : frames) {
+    if (sent >= 512) break;          // bound the batch
+    const char* f = v.as<const char*>();
+    if (!f || !*f) continue;
+    uint8_t outBuf[TX_MAX_BYTES];
+    size_t outLen = min(strlen(f), (size_t)TX_MAX_BYTES);
+    memcpy(outBuf, f, outLen);
+    rs485Send(outBuf, outLen, false);
+    sent++;
+    wdgWebMs = millis();             // feed the web watchdog during a long batch
+    if (step > 0 && budget < 8000UL) { delay(step); budget += (unsigned long)step; }
+  }
+  char resp[48];
+  snprintf(resp, sizeof(resp), "{\"ok\":true,\"sent\":%d}", sent);
   server.send(200, "application/json", resp);
 }
 
@@ -230,14 +275,19 @@ static void handleApiDisplayState() {
   static char cellChar[64 * 64];   // matches the 64x64 grid cap enforced in settings
   if (cells > (int)sizeof(cellChar)) cells = sizeof(cellChar);
   memset(cellChar, 0, cells);
+  // Primary source: the last flap byte transmitted to each grid cell, so the wall
+  // mirrors EVERYTHING the gateway sent -- provisioned or not, and independent of
+  // the module registry (which only tracks provisioned ids).
+  for (int i = 0; i < cells && i < (int)sizeof(gWallChars); i++) {
+    uint8_t wc = (uint8_t)gWallChars[i];
+    if (wc && isFlapByte(wc)) cellChar[i] = (char)wc;
+  }
+  // A provisioned module that hasn't been sent a character yet still reads as
+  // present ("?") rather than empty.
   xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < sfModuleCount; i++) {
     const SFModule& m = sfModules[i];
-    if (!m.provisioned) continue;
-    if (m.id < cells) {
-      uint8_t uc = (uint8_t)m.flapChar;                // ASCII or Windows-1252 byte
-      cellChar[m.id] = isFlapByte(uc) ? (char)uc : 1;  // 1 = known module, char unknown
-    }
+    if (m.provisioned && m.id < cells && cellChar[m.id] == 0) cellChar[m.id] = 1;
   }
   xSemaphoreGive(sfMutex);
 
@@ -722,13 +772,16 @@ static void handleApiStatus() {
   unsigned stkNet = hTaskNet   ? uxTaskGetStackHighWaterMark(hTaskNet)   : 0;
   unsigned stkOta = hTaskOTA   ? uxTaskGetStackHighWaterMark(hTaskOTA)   : 0;
   unsigned stkRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
-  char out[560];
+  // v3.0: seconds since the companion last checked in (-1 = never / deregistered)
+  long compAge = gCompanionSeenMs ? (long)((millis() - gCompanionSeenMs) / 1000UL) : -1;
+  char out[720];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
     "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
-    "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s}",
+    "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
+    "\"companion\":{\"status\":\"%s\",\"age\":%ld}}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -740,7 +793,8 @@ static void handleApiStatus() {
     rtcBuf,
     ntpSynced?"true":"false",
     gMaintenanceMode?"true":"false",
-    gQuietTime?"true":"false");
+    gQuietTime?"true":"false",
+    gCompanionStatus, compAge);
   server.send(200, "application/json", out);
 }
 
@@ -1469,12 +1523,100 @@ static void handleApiQuiet() {
       sendJsonError(400, "Bad JSON"); return;
     }
     if (!doc["on"].is<bool>()) { sendJsonError(400, "'on' (bool) required"); return; }
-    sfSetQuietTime(doc["on"].as<bool>());
+    bool on = doc["on"].as<bool>();
+    // The schedule wins inside its window: refuse a manual OFF here too (see the
+    // MQTT handler for the rationale). Disable the schedule to override.
+    if (!on && quietSchedInWindow()) {
+      printf("[QUIET] REST quiet OFF ignored -- schedule active (in window)\n");
+    } else {
+      sfSetQuietTime(on);
+    }
     mqttPublishStateTopics();
   }
   char out[40];
   snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s}", gQuietTime ? "true" : "false");
   server.send(200, "application/json", out);
+}
+
+// GET/POST /api/quiet/schedule  -- daily Quiet-Time schedule (v3.0).
+// The schedule is evaluated once a second in taskRTC; when the current local
+// time enters/leaves the window, Quiet Time is toggled automatically.
+static void handleApiQuietSchedule() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_POST) {
+    if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+      sendJsonError(400, "Bad JSON"); return;
+    }
+    if (doc["enabled"].is<bool>())        cfg.quietSchedEnabled = doc["enabled"].as<bool>();
+    if (doc["start"].is<const char*>())   strlcpy(cfg.quietStart, doc["start"].as<const char*>(), sizeof(cfg.quietStart));
+    if (doc["end"].is<const char*>())     strlcpy(cfg.quietEnd,   doc["end"].as<const char*>(),   sizeof(cfg.quietEnd));
+    if (doc["days"].is<int>())            cfg.quietDays = (uint8_t)(doc["days"].as<int>() & 0x7F);
+    if (doc["offset"].is<int>()) {        // browser's UTC offset (minutes east of UTC)
+      int o = doc["offset"].as<int>();
+      if (o < -720) o = -720;             // clamp to the valid TZ range (UTC-12:00 .. UTC+14:00)
+      if (o >  840) o =  840;
+      cfg.quietTzOffsetMin = (int16_t)o;
+    }
+    saveConfig();
+    DBG("[CFG] Quiet schedule %s %s-%s days=0x%02X tzoff=%dmin\n",
+        cfg.quietSchedEnabled ? "on" : "off", cfg.quietStart, cfg.quietEnd,
+        cfg.quietDays, (int)cfg.quietTzOffsetMin);
+  }
+  JsonDocument out;
+  out["enabled"] = cfg.quietSchedEnabled;
+  out["start"]   = cfg.quietStart;
+  out["end"]     = cfg.quietEnd;
+  out["days"]    = cfg.quietDays;
+  out["offset"]  = cfg.quietTzOffsetMin;   // browser's UTC offset, echoed back for the client
+  char buf[128];
+  serializeJson(out, buf, sizeof(buf));
+  server.send(200, "application/json", buf);
+}
+
+// GET/POST /api/companion  -- the companion app registers its URL here (v3.0)
+// and heartbeats its running status. The URL is persisted (only rewritten to
+// NVS when it changes, to avoid flash wear from heartbeats); the status is
+// runtime-only. An empty url deregisters.
+static void handleApiCompanion() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_POST) {
+    if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+      sendJsonError(400, "Bad JSON"); return;
+    }
+    if (doc["url"].is<const char*>()) {
+      const char* url = doc["url"].as<const char*>();
+      if (strcmp(url, cfg.companionUrl) != 0) {      // persist only on change
+        strlcpy(cfg.companionUrl, url, sizeof(cfg.companionUrl));
+        saveConfig();
+        DBG("[CFG] Companion URL set to %s\n", cfg.companionUrl);
+      }
+      if (url[0] == '\0') { gCompanionStatus[0] = '\0'; gCompanionSeenMs = 0; }  // deregister
+      else gCompanionSeenMs = millis();
+    }
+    if (doc["status"].is<const char*>()) {
+      // Copy + sanitise so the string is always JSON-safe when echoed back.
+      const char* st = doc["status"].as<const char*>();
+      size_t n = 0;
+      for (size_t i = 0; st[i] && n < sizeof(gCompanionStatus) - 1; i++) {
+        char c = st[i];
+        if (c == '"' || c == '\\') c = '\'';
+        if ((unsigned char)c < 0x20) c = ' ';
+        gCompanionStatus[n++] = c;
+      }
+      gCompanionStatus[n] = '\0';
+      gCompanionSeenMs = millis();
+    }
+  }
+  JsonDocument out;
+  out["url"]    = cfg.companionUrl;
+  out["status"] = gCompanionStatus;
+  char buf[256];
+  serializeJson(out, buf, sizeof(buf));
+  server.send(200, "application/json", buf);
 }
 
 void webInit() {
@@ -1486,6 +1628,8 @@ void webInit() {
   server.on("/api/rs485/messages",   HTTP_GET,     handleApiMessages);
   server.on("/api/rs485/send",       HTTP_POST,    handleApiSend);
   server.on("/api/rs485/send",       HTTP_OPTIONS, handleOptions);
+  server.on("/api/rs485/batch",      HTTP_POST,    handleApiSendBatch);
+  server.on("/api/rs485/batch",      HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/modules",     HTTP_GET,     handleApiModules);
   server.on("/api/display/state",    HTTP_GET,     handleApiDisplayState);
   server.on("/api/flap/identify",    HTTP_POST,    handleApiIdentify);
@@ -1551,6 +1695,12 @@ void webInit() {
   server.on("/api/quiet",            HTTP_GET,     handleApiQuiet);
   server.on("/api/quiet",            HTTP_POST,    handleApiQuiet);
   server.on("/api/quiet",            HTTP_OPTIONS, handleOptions);
+  server.on("/api/quiet/schedule",   HTTP_GET,     handleApiQuietSchedule);
+  server.on("/api/quiet/schedule",   HTTP_POST,    handleApiQuietSchedule);
+  server.on("/api/quiet/schedule",   HTTP_OPTIONS, handleOptions);
+  server.on("/api/companion",        HTTP_GET,     handleApiCompanion);
+  server.on("/api/companion",        HTTP_POST,    handleApiCompanion);
+  server.on("/api/companion",        HTTP_OPTIONS, handleOptions);
   server.on("/api/config",           HTTP_GET,     handleApiConfigGet);
   server.on("/api/config/wifi",      HTTP_POST,    handleApiConfigWifi);
   server.on("/api/config/wifi",      HTTP_OPTIONS, handleOptions);

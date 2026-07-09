@@ -22,6 +22,13 @@ void cfgSetDefaults() {
   cfg.haEnabled   = false;
   strlcpy(cfg.otaPassword, "", sizeof(cfg.otaPassword));
   strlcpy(gPosixTZ,    "UTC0", sizeof(gPosixTZ));
+  // v3.0 defaults
+  strlcpy(cfg.companionUrl, "", sizeof(cfg.companionUrl));
+  cfg.quietSchedEnabled = false;
+  strlcpy(cfg.quietStart, "22:00", sizeof(cfg.quietStart));
+  strlcpy(cfg.quietEnd,   "07:00", sizeof(cfg.quietEnd));
+  cfg.quietDays = 0x7F;  // all days
+  cfg.quietTzOffsetMin = 0;   // captured from the browser on Save Schedule
 }
 // Migrate settings from old NVS namespace "rs485gw" to "splitflap".
 // Runs once after firmware update; no-op on subsequent boots.
@@ -48,6 +55,13 @@ void loadConfig() {
   gSerialDebug    = cfg.serialDebug;
   cfg.haEnabled   = prefs.getBool("haEnabled", false);
   strlcpy(cfg.otaPassword, prefs.getString("otaPass", "").c_str(), sizeof(cfg.otaPassword));
+  // v3.0
+  strlcpy(cfg.companionUrl, prefs.getString("compUrl", "").c_str(), sizeof(cfg.companionUrl));
+  cfg.quietSchedEnabled = prefs.getBool("qsEn", false);
+  strlcpy(cfg.quietStart, prefs.getString("qsStart", "22:00").c_str(), sizeof(cfg.quietStart));
+  strlcpy(cfg.quietEnd,   prefs.getString("qsEnd",   "07:00").c_str(), sizeof(cfg.quietEnd));
+  cfg.quietDays = prefs.getUChar("qsDays", 0x7F);
+  cfg.quietTzOffsetMin = prefs.getShort("qsTzOff", 0);
   strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
   setenv("TZ", gPosixTZ, 1);
   tzset();
@@ -74,5 +88,12 @@ void saveConfig() {
   prefs.putBool  ("dbgSerial", cfg.serialDebug);
   prefs.putBool  ("haEnabled", cfg.haEnabled);
   prefs.putString("otaPass",   cfg.otaPassword);
+  // v3.0
+  prefs.putString("compUrl",   cfg.companionUrl);
+  prefs.putBool  ("qsEn",      cfg.quietSchedEnabled);
+  prefs.putString("qsStart",   cfg.quietStart);
+  prefs.putString("qsEnd",     cfg.quietEnd);
+  prefs.putUChar ("qsDays",    cfg.quietDays);
+  prefs.putShort ("qsTzOff",   cfg.quietTzOffsetMin);
   prefs.end();
 }

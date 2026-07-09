@@ -220,8 +220,13 @@ void sfModulesClear() {
 //            sent a version query (m<id>v) and given MODULE_PROBE_GRACE_MS to
 //            reply. A reply (sfTouch) clears the probe and keeps the module.
 //   Phase 2: a probed module whose grace window has elapsed without a reply is
-//            actually dropped. This avoids evicting a module that has merely
-//            been quiet (modules only speak when addressed).
+//            RE-probed, up to MODULE_PROBE_MAX_TRIES times, and only dropped
+//            once all attempts are exhausted. One lost reply is not proof of
+//            absence: modules only speak when addressed, and a single probe
+//            reply is easily lost to a bus collision while the host is streaming
+//            display frames on the half-duplex bus. Retrying across cycles lets
+//            the reply land during a quieter moment before we evict a live,
+//            still-displaying module.
 // Version queries are sent OUTSIDE sfMutex (rs485Send re-takes the lock via
 // frame tracking, so probing under it would deadlock): IDs to probe are
 // collected under the lock, then queried after release.
@@ -238,21 +243,29 @@ void sfModulesPruneStale() {
     SFModule& m = sfModules[i];
     bool stale = (m.lastSeenEpoch && nowEp > m.lastSeenEpoch &&
                   (nowEp - m.lastSeenEpoch) > MODULE_STALE_SECS);
-    if (stale && m.probeMs == 0 && probeN < MODULE_PROBE_BATCH) {
-      // Phase 1: start a probe -- give it a chance to answer before dropping.
-      // Bounded batch per cycle; further stale modules are probed on a later
-      // cycle so the probe burst stays short and collision-free.
-      m.probeMs = nowMs + MODULE_PROBE_GRACE_MS;
-      toProbe[probeN++] = m.id;
-      i++;
-    } else if (stale && m.probeMs != 0 && nowMs >= m.probeMs) {
-      // Phase 2: probed and the grace window elapsed with no reply -> drop it.
+    if (!stale || (m.probeMs != 0 && nowMs < m.probeMs)) {
+      i++;   // fresh, or a probe is still within its grace window -> leave it
+      continue;
+    }
+    // Stale, and either never probed or the last probe's grace elapsed with no
+    // reply (a reply would have called sfTouch, clearing probeMs/probeTries).
+    if (m.probeTries >= MODULE_PROBE_MAX_TRIES) {
+      // Exhausted all probe attempts -> actually drop it.
       for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
       sfModuleCount--;
       memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
       changed = true;
+      // list compacted -- do not advance i
+    } else if (probeN < MODULE_PROBE_BATCH) {
+      // (Re)probe -- give it another chance to answer before dropping. Bounded
+      // batch per cycle keeps the probe burst short and collision-free; further
+      // stale modules are (re)probed on later cycles.
+      m.probeMs = nowMs + MODULE_PROBE_GRACE_MS;
+      m.probeTries++;
+      toProbe[probeN++] = m.id;
+      i++;
     } else {
-      i++;   // fresh, or probe still pending -> leave it
+      i++;   // batch full this cycle -> retry next cycle (never drop here)
     }
   }
   if (sfMutex) xSemaphoreGive(sfMutex);
@@ -701,6 +714,7 @@ static inline void sfTouch(SFModule* m) {
   if (!m) return;
   m->lastSeen = millis();
   m->probeMs  = 0;   // any activity means it's alive -> cancel any pending probe
+  m->probeTries = 0; // ...and reset the stale-probe retry count
   unsigned long ep = rtcEpochNow();
   if (ep) m->lastSeenEpoch = ep;
 }

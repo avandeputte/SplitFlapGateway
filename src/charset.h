@@ -46,11 +46,16 @@ bool isFlapByte(uint8_t b);
 // at least 3 bytes.
 size_t flapByteToUtf8(uint8_t b, char* out);
 
-// Transcode a flap-byte buffer (`inLen` bytes, or until a NUL) into a
-// JSON-string-safe UTF-8 sequence in `out`: `"` and `\` are backslash-escaped,
-// control bytes are dropped, and high bytes become their UTF-8 encoding. `out`
-// is NUL-terminated. Returns bytes written (excluding the NUL). Size `out` for
-// up to 3 UTF-8 bytes (or 2 for an escape) per input byte plus a terminator.
-size_t flapToJsonUtf8(const char* in, size_t inLen, char* out, size_t outSize);
+// Transcode `inLen` flap bytes into a JSON-string-safe UTF-8 sequence in `out`:
+//   * `"` and `\` are backslash-escaped
+//   * line breaks (`\n`/`\r`) are stripped (structural, not content)
+//   * representable flap glyphs (see isFlapByte) become their UTF-8 encoding
+//   * every other byte -- control, sentinel, undefined CP1252 slot -- becomes
+//     `junk`, or is dropped when `junk` is 0
+// `out` is NUL-terminated and never split mid-glyph if it fills: output is
+// capped at a glyph/escape boundary. Returns bytes written (excluding the NUL).
+// Size `out` for up to 3 UTF-8 bytes (or 2 for an escape) per input byte plus a
+// terminator. `junk` defaults to 0 (drop) to preserve existing call sites.
+size_t flapToJsonUtf8(const char* in, size_t inLen, char* out, size_t outSize, char junk = 0);
 
 #endif // SFGW_CHARSET_H

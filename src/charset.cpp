@@ -90,18 +90,22 @@ size_t flapByteToUtf8(uint8_t b, char* out) {
   return 3;
 }
 
-size_t flapToJsonUtf8(const char* in, size_t inLen, char* out, size_t outSize) {
+size_t flapToJsonUtf8(const char* in, size_t inLen, char* out, size_t outSize, char junk) {
   size_t oi = 0;
-  for (size_t i = 0; i < inLen && in[i]; i++) {
+  for (size_t i = 0; i < inLen; i++) {
     uint8_t b = (uint8_t)in[i];
-    if (b == '"' || b == '\\') {
+    if (b == '\n' || b == '\r') continue;        // strip line breaks
+    if (b == '"' || b == '\\') {                 // JSON-escape
       if (oi + 2 >= outSize) break;
       out[oi++] = '\\';
       out[oi++] = (char)b;
       continue;
     }
-    if (b < 0x20) continue;                      // drop control bytes
-    char enc[4];
+    if (!isFlapByte(b)) {                         // control / sentinel / undefined slot
+      if (junk) { if (oi + 1 >= outSize) break; out[oi++] = junk; }
+      continue;                                   // junk == 0: drop
+    }
+    char enc[4];                                  // representable glyph -> UTF-8
     size_t n = flapByteToUtf8(b, enc);
     if (oi + n + 1 > outSize) break;
     for (size_t k = 0; k < n; k++) out[oi++] = enc[k];

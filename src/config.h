@@ -27,6 +27,15 @@ struct GwConfig {
   char          otaPassword[32]; // OTA update password (blank = no auth)
   uint8_t       gridRows;      // visual display wall: rows (>=1)
   uint8_t       gridCols;      // visual display wall: columns (>=1)
+  // ---- v3.0 ----
+  char          companionUrl[128]; // registered companion-app URL (blank = none)
+  bool          quietSchedEnabled; // auto-enable Quiet Time on a daily schedule
+  char          quietStart[6];     // quiet window start "HH:MM" (the user's LOCAL time)
+  char          quietEnd[6];       // quiet window end   "HH:MM" (the user's LOCAL time)
+  uint8_t       quietDays;         // active-day bitmask, bit0=Sun .. bit6=Sat (local)
+  int16_t       quietTzOffsetMin;  // minutes EAST of UTC for the schedule (browser-supplied);
+                                   // local = UTC + this. Independent of the gateway posixTZ so the
+                                   // user just enters their own local time. See quietScheduleTick.
 };
 
 // ---- owned globals (defined in globals.cpp) ----

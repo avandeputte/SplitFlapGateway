@@ -24,6 +24,13 @@ volatile bool gMaintenanceMode = false;
 // module is remembered so the reels can resync when Quiet Time turns off.
 // Runtime-only -- OFF at boot, never persisted -- like maintenance mode.
 volatile bool gQuietTime = false;
+// Last flap byte transmitted to each module id (= grid cell). Drives the display
+// wall so it mirrors every cell the gateway sent to, provisioned or not. Written
+// in sfTrackFromFrame (the single frame choke point); 0 = nothing sent yet.
+char gWallChars[256] = {0};
+// v3.0: last status the companion app reported, and when (millis). Runtime-only.
+char gCompanionStatus[80] = "";
+volatile unsigned long gCompanionSeenMs = 0;
 // Set when display tracking changes (in rs485Send); the network task publishes
 // the HA display-state topic (rate-limited) so HA reflects what's shown without
 // spamming. rs485Send sets it; the network task (tasks.cpp) reads and clears it.

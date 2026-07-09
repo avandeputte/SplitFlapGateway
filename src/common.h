@@ -99,7 +99,7 @@
 #define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
 
 /* ---- Firmware identity ---- */
-#define FW_VERSION           "2.1"           // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.0"           // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -126,7 +126,10 @@
 #define MSG_RING_SIZE        64    // monitor ring: number of frames retained
 #define MSG_MAX_BYTES        256   // monitor ring: bytes stored per frame
 #define TX_MAX_BYTES         768   // max bytes rs485Send will transmit in one frame
-#define MQTT_BUF_SIZE        768   // holds a full restore command via MQTT
+#define MQTT_BUF_SIZE        1024  // MQTT packet buffer + queue slot: holds a full
+                                   // restore command AND the worst-case rx/tx monitor
+                                   // JSON (256 wire bytes -> 3-byte UTF-8 glyphs =
+                                   // ~830B payload + topic/header) without truncation
 #define MQTT_Q_SIZE          32    // outbound MQTT publish queue depth
 
 /* ---- Flap set sizing ----
@@ -139,10 +142,11 @@
 
 /* ---- Housekeeping cadences ---- */
 #define STATUS_INTERVAL_MS      60000UL   // MQTT status publish cadence (1/min)
-#define MODULE_STALE_SECS       21600UL   // 6h: prune modules not seen in this long
-#define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before dropping it
+#define MODULE_STALE_SECS       86400UL   // 24h: prune modules not seen in this long. Modules only speak when addressed, so a module that's merely displaying static content ages toward staleness normally -- keep the window generous so a long-lived message doesn't churn the whole wall through the stale-probe path.
+#define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before the next probe attempt
 #define MODULE_PROBE_SPACING_MS 150UL     // gap between consecutive stale probes: a module answers a bare 'v' INSTANTLY, so back-to-back queries make each reply collide with the next probe -- space them so every reply is received (and clears the probe) before the next query goes out
 #define MODULE_PROBE_BATCH      8         // max stale modules probed per prune cycle; the rest are probed on later cycles (bounds the net task's spaced-probe burst)
+#define MODULE_PROBE_MAX_TRIES  4         // stale-probe attempts before a module is actually dropped. A single reply is easily lost to a bus collision while the host is streaming display frames, so one probe is not proof of absence -- retry across several prune cycles (~1/min) before evicting a module that may well be alive and displaying.
 #define MODULE_POSTPROV_VER_MS  4000UL    // delay after a provisioning ack before the first version query. A freshly-provisioned module writes its new ID to EEPROM and then runs a staggered startup (~150ms x new-ID), so it can be unresponsive for several seconds; wait well past that before the first query.
 #define MODULE_VER_RETRY_MS     2500UL    // gap between post-provision version-query retries
 #define MODULE_VER_MAX_TRIES    6         // give up after this many version-query attempts (covers ~4s + 5x2.5s ~= 16s)
@@ -177,8 +181,14 @@
 extern volatile bool gSerialDebug;
 extern volatile bool gMaintenanceMode;
 extern volatile bool gQuietTime;
+extern char gCompanionStatus[80];          // v3.0: companion running-status
+extern volatile unsigned long gCompanionSeenMs;  // millis() of last companion post
 extern volatile bool gDisplayDirty;
 extern volatile bool gOtaInProgress;
+// Last flap byte transmitted to each module id (= grid cell, row-major). Lets the
+// display wall show EVERY cell that was written -- provisioned or not -- straight
+// from the frame stream, independent of the module registry. 0 = nothing sent.
+extern char gWallChars[256];
 extern bool gApActive;
 extern SemaphoreHandle_t timeMutex;
 extern StaticSemaphore_t timeMutexBuf;

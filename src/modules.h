@@ -29,6 +29,7 @@ struct SFModule {
   // is the millis() deadline by which it must reply; 0 = not being probed. A
   // reply (any frame -> sfTouch) clears it; if the deadline passes, it's dropped.
   unsigned long probeMs;     // probe-response deadline (0 = not probing)
+  uint8_t       probeTries;  // stale-probe attempts made so far (drop at MODULE_PROBE_MAX_TRIES). Reset on any reply (sfTouch).
   // Provisioning-confirmed: set true when this module produces a provisioning
   // ack (mXack). A legacy (v7) module has no serial and never acks provisioning,
   // so an acked module is, by definition, NOT legacy -- regardless of whether
