@@ -2,12 +2,26 @@
 
 ## v3.2 — 2026-07-10
 
+Adds a **Home All** button to the web UI. Drop-in upgrade from v3.1 — no API,
+MQTT, or module-behaviour changes; the only change is in the dashboard.
+
+### New
+
+- **Home All button.** The Display tab (under the Live Display) and the
+  Calibration tab (in the module picker) each gained a **Home All** button that
+  homes every module at once — it broadcasts `m*h` via the existing
+  `POST /api/flap/home` with `{"id":-1}`, so there's no new endpoint.
+
+---
+
+## v3.1 — 2026-07-09
+
 Lets the **[Companion App](https://github.com/avandeputte/SplitFlapGatewayCompanion)**
 store its settings in the gateway's flash, so a companion container becomes
 stateless — destroy it, start another on any host, and it restores its
 configuration from the gateway. Drop-in upgrade from v3.0: every existing
 endpoint, MQTT topic and module behaviour is unchanged, and the additions are
-purely a new endpoint pair, one new config field, and a UI button.
+purely a new endpoint pair plus one new config field.
 
 ### New
 
@@ -31,14 +45,9 @@ purely a new endpoint pair, one new config field, and a UI button.
   previously stored blob is left untouched.
 
 - **Firmware version in `GET /api/config`.** The response now carries
-  `"version"` (e.g. `"3.2.0"`). This is how the companion decides whether a
+  `"version"` (e.g. `"3.1.0"`). This is how the companion decides whether a
   gateway is new enough to hold its settings; against a 3.0 gateway the field is
   absent and the companion quietly falls back to storing them locally.
-
-- **Home All button.** The Display tab (under the Live Display) and the
-  Calibration tab (in the module picker) each gained a **Home All** button that
-  homes every module at once — it broadcasts `m*h` via the existing
-  `POST /api/flap/home` with `{"id":-1}`, so there's no new endpoint.
 
 ### Notes
 

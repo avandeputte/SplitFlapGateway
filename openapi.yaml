@@ -1219,7 +1219,7 @@ paths:
   /api/companion/settings:
     get:
       tags: [Companion]
-      summary: Fetch the companion's stored settings blob (v3.2)
+      summary: Fetch the companion's stored settings blob (v3.1)
       description: |
         Returns the blob exactly as it was stored by `PUT`, byte for byte.
 
@@ -1241,7 +1241,7 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
     put:
       tags: [Companion]
-      summary: Store the companion's settings blob (v3.2)
+      summary: Store the companion's settings blob (v3.1)
       description: |
         Stores the request body **verbatim** and **atomically**: it streams to a
         temp file on the FATFS partition and is renamed over the live copy only
@@ -1563,7 +1563,7 @@ components:
     Config:
       type: object
       properties:
-        version:      { type: string,  example: "3.2.0", description: "Gateway firmware version. Added in v3.2 and absent on older firmware, so a client can detect a gateway that predates the companion settings store" }
+        version:      { type: string,  example: "3.2.0", description: "Gateway firmware version. Added in v3.1 and absent on older firmware, so a client can detect a gateway that predates the companion settings store" }
         wSSID:        { type: string,  example: "MyNetwork" }
         mqHost:       { type: string,  example: "192.168.1.50" }
         mqPort:       { type: integer, example: 1883 }
