@@ -99,9 +99,10 @@
 #define RTC_YEAR_OFFSET   2000     // PCF85063 reg 6 is 0-99 = 2000-2099
 
 /* ---- Firmware identity ---- */
-// Also reported as "version" by GET /api/config: the companion app gates its
-// 3.1 features (the settings blob store below) on reading >= 3.1 here.
-#define FW_VERSION           "3.1.0"         // gateway firmware version (UI + boot log)
+// The companion reads this back as "version" from GET /api/config and stores its
+// settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
+// omits the field, so it keeps settings local). This firmware clears that floor.
+#define FW_VERSION           "3.2.0"         // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -174,7 +175,7 @@
 #define MODULES_FILE     "/modules.dat"
 #define MODULES_MAGIC    0x53464732UL   // "SFG2" (bumped: PersistedModule gained 'acked')
 
-/* ---- Companion settings blob (FFat) -- v3.1 --------------------------------
+/* ---- Companion settings blob (FFat) -- v3.2 --------------------------------
  * The companion app can park its settings here so its container stays stateless.
  * The gateway is a dumb blob store: the body is gzip(minified JSON) whose schema
  * the companion owns, stored verbatim and handed back byte-for-byte. Written via
