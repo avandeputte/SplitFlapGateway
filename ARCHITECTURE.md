@@ -166,7 +166,7 @@ Three-digit IDs (vs two) add at most ~1 byte to a handful of commands, still far
 inside `TX_MAX_BYTES`. These buffers were sized for the frame, and the frame is
 what bounds them.
 
-## Companion settings blob (v3.1)
+## Companion settings blob (v3.2)
 
 The companion app parks its settings on the gateway (`GET`/`PUT
 /api/companion/settings`) so its container can be stateless. The gateway is a

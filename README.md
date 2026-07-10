@@ -1,20 +1,22 @@
 # Split-Flap Gateway
 
-**Firmware version: 3.1**
+**Firmware version: 3.2**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
 
 > [!TIP]
-> **New in 3.1**
+> **New in 3.2**
 > - **Companion settings stored on the gateway** — the [Companion App](#companion-app)
 >   can now park its settings, playlists and triggers in the gateway's flash
 >   (`GET`/`PUT /api/companion/settings`), so a companion container becomes
 >   stateless: spin one up on any host and it inherits its configuration from the
 >   gateway. See [Companion Settings Storage](#companion-settings-storage).
 > - **Firmware version in `/api/config`** — the config response now carries a
->   `"version"` field (e.g. `"3.1.0"`), which is how the companion detects a
+>   `"version"` field (e.g. `"3.2.0"`), which is how the companion detects a
 >   gateway new enough to store its settings.
+> - **Home All** — the Display and Calibration tabs each gained a **Home All**
+>   button that homes every module at once (broadcasts `m*h`).
 
 > [!TIP]
 > **New in 3.0**
@@ -157,7 +159,7 @@ PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v3.1.0
+[Boot] Split-Flap Gateway v3.2.0
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -235,9 +237,9 @@ Navigate to the gateway's IP address in any browser.
 | Tab | Description |
 |---|---|
 | **Modules** | Grid of all known modules — ID, serial number, current character, firmware version, sorted by ID (unprovisioned modules last). The list is sticky: it persists across reboots and only drops modules not seen for 6 hours. Each provisioned module card carries three action icons: **⌂ Home** (homes the module), **ℹ Info** (opens a dialog that queries the module live — refreshing its firmware version and reading its EEPROM — and shows all known module data plus a parsed view of the EEPROM: home offset, steps/rev, and the calibrated flap map — and, for a module on firmware v31+, an editable **Flap Set** section for the active flap count and character set), and a red **🗑 trash** icon that opens a destructive-actions dialog offering Erase EEPROM, Factory Reset, or De-provision, each behind a confirmation prompt. Modules running firmware v7 or earlier are flagged **LEGACY** (they have no serial number, no provisioning, and no factory reset, but full homing and calibration support); their unsupported destructive actions are greyed out. **↻ Identify All** clears the list (memory and saved file) and broadcasts `m*v` so every module re-announces itself. |
-| **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change. Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
+| **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change, with a **Home All** button beneath it that homes every module at once (broadcasts `m*h`). Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
-| **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly. For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap (in the module's own character order, with colour flaps as swatches) and its current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through every flap one at a time. The map, the Wizard, and the whole-board walk all honour a module's **custom flap set** (character order and flap count) on firmware v31+, falling back to the default 64-flap reel on older modules. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
+| **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly, or **Home All** to home every module at once (broadcasts `m*h`). For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap (in the module's own character order, with colour flaps as swatches) and its current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through every flap one at a time. The map, the Wizard, and the whole-board walk all honour a module's **custom flap set** (character order and flap count) on firmware v31+, falling back to the default 64-flap reel on older modules. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
 | **Backup** | Download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
 | **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update |
@@ -299,7 +301,7 @@ curl -fsSL https://raw.githubusercontent.com/avandeputte/SplitFlapGatewayCompani
 
 ### Companion Settings Storage
 
-**New in firmware 3.1.** The companion can store its settings, playlists and triggers
+**New in firmware 3.2.** The companion can store its settings, playlists and triggers
 **in this gateway's flash** instead of on its own disk. A companion container then
 becomes effectively **stateless**: destroy it, start another on a different host, and
 it restores its configuration from the gateway on boot.
@@ -546,9 +548,9 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/quiet/schedule` | `{"enabled":true,"start":"22:00","end":"07:00","days":127}` | Set the schedule. When enabled, quiet time toggles automatically as local time crosses the window (overnight windows supported) |
 | `GET` | `/api/companion` | — | Returns `{url,status}` — the registered [companion app](#companion-app)'s URL and its last reported running status |
 | `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather"}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. The URL is persisted; the status is runtime-only |
-| `GET` | `/api/companion/settings` | — | **(v3.1)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
-| `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.1)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.1.0"` |
+| `GET` | `/api/companion/settings` | — | **(v3.2)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
+| `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.2)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.2.0"` |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
@@ -664,7 +666,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
    only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `firmware.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.1.0**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.2.0**).
 
 > **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
 > pick the right one:
