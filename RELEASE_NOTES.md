@@ -1,11 +1,112 @@
 # Split-Flap Gateway — Release Notes
 
-## v3.2.1 — 2026-07-12
+## v3.4 — 2026-07-12
 
-The dashboard now uses **Home Assistant's design language** — the same look the
-companion app ships — light and dark following your browser/OS. UI-only: no API, MQTT,
-or module-behaviour changes. (The companion also injects this look when proxying an
-older gateway, so mixed versions still match.)
+Gives the dashboard the **companion's look**, folds **backup & restore** into the
+Settings page, teaches the gateway and the companion to **tell each other which tabs
+they have**, and fixes a group of real robustness bugs — most importantly a **web
+server that froze during a paced batch** and a **watchdog reboot on large walls**.
+Drop-in upgrade: no module, MQTT or wiring changes, and backups themselves are
+untouched.
+
+### Changed
+
+- **A new look — the Home Assistant design language.** The dashboard is restyled to
+  match the companion (which ships the same look), so the two feel like one product.
+  It follows the browser/OS **light or dark** preference; there is no theme setting.
+  Purely cosmetic — no control moved or changed behaviour.
+
+- **Backup & restore moved to Settings.** The **Backup Calibration** and **Restore
+  Calibration** cards now sit at the end of the Settings page; the **Backup** tab is
+  gone. Nothing about the backup format or the restore-by-serial behaviour changed —
+  only where the controls live. (The backup file is assembled in the browser from the
+  existing module/EEPROM endpoints; restore posts to `/api/flap/restorebysn`.) An old
+  `#backup` deep link now lands on Settings rather than breaking.
+
+- **Batch pacing no longer blocks the web server.** `POST /api/rs485/batch` used to
+  produce its `step_ms` stagger by **sleeping between frames**, on the web task — and
+  the HTTP server handles one connection at a time, so a paced batch froze the whole
+  web UI for the length of the cascade (up to the old 8 s cap) while further
+  connections piled up in the TCP accept queue holding window buffers. The handler now
+  stamps each frame with a due time, hands it to the RS-485 task (which already wakes
+  every 5 ms) and returns immediately. The cascade on the wall is unchanged.
+
+  Two contract notes: **`200` now means *accepted*, not *transmitted*** (`sent` counts
+  frames accepted), and the 8 s total-pacing cap is replaced by a queue depth of **127
+  paced frames in flight**. A frame goes out immediately instead of paced when
+  `step_ms` is 0, when it is longer than 48 bytes, or when the queue is full — so a
+  cascade beyond 127 paced frames loses its stagger past that point. A whole-page
+  redraw is one frame per module, so that only bites above 127 modules.
+
+- **The companion URL is persisted on a debounce.** Two companions pointed at one
+  gateway each re-register their own URL on their ~30 s heartbeat, so the stored URL
+  flipped back and forth — and saving on every change meant **an NVS write every ~30 s,
+  forever** (observed in the wild). The URL now applies to RAM instantly (the tab is
+  live at once) but only reaches flash once it has held still for two minutes. A
+  contested URL therefore never gets written at all, which is the right answer; a
+  companion re-registers within a heartbeat of any reboot, so nothing is lost.
+
+### New
+
+- **Tab advertisement (`POST /api/companion`).** The companion may now send `tabs` —
+  the deep links its own UI offers — and the response always carries `gwTabs`, this
+  firmware's. Each side then renders the other's real tabs instead of a list hard-coded
+  on the far side, which is what made the Backup tab above a two-release problem.
+
+  Both halves are optional and independent, so **every old/new pairing works**: an older
+  companion advertises nothing and the dashboard falls back to its built-in companion
+  tabs; an older gateway returns no `gwTabs` and the companion falls back to its own list
+  (which still includes **Backup**, because a pre-3.4 gateway really does have that tab).
+
+  An advertised list is taken **whole or not at all** — any malformed entry, a bad id
+  (not `[A-Za-z0-9_-]{1,24}`), a label over 24 printable ASCII characters, more than 10
+  tabs, or a list over 384 bytes drops the list, and the peer then shows its built-in one.
+  The list is runtime-only (no flash writes: the companion re-sends it on every heartbeat)
+  and is cleared when the companion deregisters.
+
+### Fixes
+
+- **Watchdog reboot on a large wall.** `GET /api/flap/modules` sent one chunk per
+  module. Each chunk could block on a slow client for up to the 3 s socket timeout, so
+  ~41 modules × 3 s exceeded the 120 s web-stall threshold — the supervisor logged
+  `STALL: Web=0` and **rebooted the gateway**. It never fired below ~40 modules, which
+  is why it hid for so long. The response is now coalesced into ~1400-byte chunks, feeds
+  the watchdog on each flush, and aborts early if the client has gone away.
+
+- **A changed MQTT broker now takes effect.** `POST /api/config/mqtt` saved the new
+  host/port but never told PubSubClient about it, so the client kept dialling the
+  **boot-time** broker and failed forever with `rc=-2` until a reboot. It now re-points
+  the client and resets the failure counter.
+
+- **TCP connect timeouts were never actually set.** Several call sites used
+  `setTimeout()`, which on `NetworkClient` sets the *read* timeout and leaves the
+  **connect** timeout at its 3 s default — the MQTT client and three web handlers all
+  meant the latter. They now call `setConnectionTimeout()`.
+
+- **The dashboard re-downloaded its whole page on every navigation.** `GET /` now sends
+  an `ETag` and answers a matching `If-None-Match` with `304 Not Modified` (~53 KB
+  saved per navigation); the favicon and logo are cached for a week. The dashboard also
+  gates its periodic polls so they can't stack up on the one-connection web server.
+
+### New
+
+- **Tab advertisement (`POST /api/companion`).** The companion may now send `tabs` —
+  the deep links its own UI offers — and the response always carries `gwTabs`, this
+  firmware's. Each side then renders the other's real tabs instead of a list hard-coded
+  on the far side, which is what made the Backup tab above a two-release problem.
+
+  Both halves are optional and independent, so **every old/new pairing works**: an older
+  companion advertises nothing and the dashboard falls back to its built-in companion
+  tabs; an older gateway returns no `gwTabs` and the companion falls back to its own list
+  (which still includes **Backup**, because a pre-3.4 gateway really does have that tab).
+
+  An advertised list is taken **whole or not at all** — any malformed entry, a bad id
+  (not `[A-Za-z0-9_-]{1,24}`), a label over 24 printable ASCII characters, more than 10
+  tabs, or a list over 384 bytes drops the list, and the peer then shows its built-in one.
+  The list is runtime-only (no flash writes: the companion re-sends it on every heartbeat)
+  and is cleared when the companion deregisters.
+
+---
 
 ## v3.2 — 2026-07-10
 

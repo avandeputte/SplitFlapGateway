@@ -424,7 +424,10 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // Called once from setup(). Initialises MQTT settings that allocate heap
 // and must not be called repeatedly.
 void mqttInit() {
-  mqttWifiClient.setTimeout(5000);  // 5s TCP connect timeout
+  // setConnectionTimeout(), NOT setTimeout(): NetworkClient declares its own `_timeout`
+  // and does not override Stream::setTimeout(), so setTimeout() writes the *read* timeout
+  // and leaves the connect timeout at its 3 s default.
+  mqttWifiClient.setConnectionTimeout(5000);  // 5s TCP connect timeout
   mqtt.setClient(mqttWifiClient);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(MQTT_BUF_SIZE);

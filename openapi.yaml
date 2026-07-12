@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "3.2"
+  version: "3.4"
   description: |
-    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v3.2).
+    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v3.4).
 
     **Base URL:** `http://<gateway-ip>` — replace with the gateway's IP
     (shown on the Status page), or use `http://192.168.4.1` when connected to
@@ -102,11 +102,24 @@ paths:
     post:
       tags: [Bus]
       summary: Send many raw frames in one request (v3.0)
-      description: >
+      description: |
         Sends each frame in `frames` to the bus in order, normalized like
         `/api/rs485/send`. An optional `step_ms` paces the cascade device-side.
         Lets a host draw a whole animated page in one HTTP call instead of one
-        request per module. Capped at 512 frames and 8 s of total pacing.
+        request per module. Capped at 512 frames per request.
+
+        **v3.4 — pacing is queued, not blocking.** A paced frame is stamped with a
+        due time and handed to the bus task, which sends it when due; the handler
+        no longer sleeps between frames. So the call **returns immediately** and
+        `200` means the frames were **accepted**, not that they are on the wire —
+        `sent` counts frames accepted. (Before 3.4 the handler blocked for the whole
+        cascade, freezing the single-connection web server for up to 8 s; that 8 s
+        total-pacing cap is gone with it.)
+
+        Up to 127 paced frames are in flight at once. A frame is sent immediately
+        instead of being paced when `step_ms` is 0, when the frame exceeds 48 bytes,
+        or when the queue is full — so a cascade longer than 127 paced frames loses
+        its pacing beyond that point.
       requestBody:
         required: true
         content:
@@ -1197,18 +1210,37 @@ paths:
       tags: [Companion]
       summary: Register the companion app and heartbeat its status (v3.0)
       description: |
-        The companion app posts its own URL here so the gateway can show a
-        **Companion** tab linking back to it. The URL is persisted in NVS (and
+        The companion app posts its own URL here so the gateway can show
+        **Companion** tabs linking back to it. The URL is persisted in NVS (and
         only rewritten when it actually changes, to spare the flash from
         heartbeats); the status is runtime-only and clears on reboot.
 
         An empty `url` deregisters the companion. Either field may be sent alone.
+
+        **v3.4 — tab advertisement.** The companion may also send `tabs`: the deep
+        links its own UI has. The dashboard then links exactly those, instead of a
+        list hard-coded in this firmware that goes stale whenever the companion gains
+        or loses a tab. The response always carries `gwTabs`, this gateway's own tabs,
+        for the same reason in the other direction.
+
+        Both halves are optional and independent, so every pairing works: an older
+        companion sends no `tabs` (the dashboard falls back to its built-in list), and
+        an older gateway sends no `gwTabs` (the companion falls back to its own). A
+        `tabs` list is only stored while a companion is registered — a deregister
+        clears it.
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Companion" }
-            example: { url: "http://192.168.1.60:8000", status: "Running: Weather" }
+            example:
+              url: "http://192.168.1.60:8000"
+              status: "Running: Weather"
+              tabs:
+                - { id: "apps", label: "Apps" }
+                - { id: "compose", label: "Compose" }
+                - { id: "playlists", label: "Playlists" }
+                - { id: "triggers", label: "Triggers" }
       responses:
         "200":
           description: The stored registration after the update
@@ -1477,7 +1509,7 @@ components:
 
     Companion:
       type: object
-      description: Companion-app registration (v3.0).
+      description: Companion-app registration (v3.0; tab advertisement added in v3.4).
       properties:
         url:
           type: string
@@ -1487,6 +1519,39 @@ components:
           type: string
           description: "The companion's last reported running status. Runtime-only -- clears on reboot. Quotes, backslashes and control characters are sanitised"
           example: "Running: Weather"
+        tabs:
+          type: array
+          description: >
+            The tabs (deep links) the companion's own UI offers, sent on registration
+            and re-sent on every heartbeat; the dashboard links exactly these instead of
+            a list hard-coded in this firmware. Runtime-only, and cleared on deregister.
+            Omitted by a pre-3.4 companion, in which case the dashboard falls back to its
+            built-in list. Rejected **whole** -- not partially -- if any entry is
+            malformed, an id is not `[A-Za-z0-9_-]{1,24}`, a label exceeds 24 printable
+            ASCII characters, there are more than 10 tabs, or the list exceeds 384 bytes;
+            a rejected list is treated exactly like an absent one (v3.4)
+          items: { $ref: "#/components/schemas/UiTab" }
+        gwTabs:
+          type: array
+          readOnly: true
+          description: >
+            This firmware's own tabs, so the companion's nav links exactly the tabs this
+            gateway has. Always present in a v3.4+ response; a companion that doesn't see
+            it is talking to an older gateway and falls back to its built-in list (v3.4)
+          items: { $ref: "#/components/schemas/UiTab" }
+
+    UiTab:
+      type: object
+      description: One tab in a peer's UI, as a deep link (v3.4).
+      properties:
+        id:
+          type: string
+          description: "The URL hash the peer's UI routes on -- e.g. `calibration` links to `<base>/#calibration`. Not the internal pane name"
+          example: "calibration"
+        label:
+          type: string
+          description: "What the nav shows for it"
+          example: "Calibration"
 
     QuietSchedule:
       type: object
@@ -1563,7 +1628,7 @@ components:
     Config:
       type: object
       properties:
-        version:      { type: string,  example: "3.2.0", description: "Gateway firmware version. Added in v3.1 and absent on older firmware, so a client can detect a gateway that predates the companion settings store" }
+        version:      { type: string,  example: "3.4.0", description: "Gateway firmware version. Added in v3.1 and absent on older firmware, so a client can detect a gateway that predates the companion settings store" }
         wSSID:        { type: string,  example: "MyNetwork" }
         mqHost:       { type: string,  example: "192.168.1.50" }
         mqPort:       { type: integer, example: 1883 }

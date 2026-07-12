@@ -90,6 +90,74 @@ hours before the single observed stall, recovering cleanly.
 migration becomes justified. The real work there is redesigning the two blocking
 endpoints, not the boilerplate.
 
+### The corollary: never block `taskWeb` (v3.4)
+
+Choosing the one-connection-at-a-time server makes a rule out of what would
+otherwise be a style preference: **a handler that blocks blocks the whole web UI.**
+Two handlers were violating it, and both produced real failures.
+
+**1. Batch pacing (`/api/rs485/batch`).** The handler produced its `step_ms` stagger
+with `delay()` between frames. That is a cascade-length sleep — up to the old 8 s cap —
+inside a handler, during which nothing else could be served and further connections
+piled up in lwIP's accept queue holding TCP window buffers. On a companion driving
+animations this is not an edge case; it is the steady state.
+
+The fix moves the *pacing* off `taskWeb` without moving the *work*: the handler stamps
+each frame with a due time (`millis()` timebase), pushes it into a small PSRAM ring
+(`TxQItem`, `rs485.h`), and returns. `taskRS485` — which already wakes every 5 ms —
+drains whatever is due on each tick. The 5 ms tick quantises `step_ms`, which is 5–30 ms
+anyway, so the cascade is visually identical.
+
+The ring is **SPSC**: `taskWeb` is the only producer, `taskRS485` the only consumer,
+guarded by `txQMutex`. That mutex is deliberately **released before** `rs485Send` runs
+(which takes `txMutex`), so the two locks are never nested and the producer is never
+stalled for the duration of a send. Due-time comparison is wrap-safe
+(`(int32_t)(now - dueMs) >= 0`), so the 49-day `millis()` rollover is a non-event.
+
+The trade-offs are deliberate and worth knowing. `200` now means **accepted**, not
+transmitted. The ring holds 127 frames (one slot kept empty as the full/empty
+discriminator); a frame that cannot be queued — `step_ms == 0`, longer than
+`TXQ_FRAME_MAX` (48 B), or a full ring — is sent **inline, immediately**. So a cascade
+longer than 127 paced frames stops being paced past that point, and an over-long frame
+jumps ahead of frames still waiting in the ring. Display/index/home frames are all far
+under 48 bytes and a whole-page redraw is one frame per module, so neither case arises
+below a 127-module wall; both are graceful (the frames still go out) rather than errors.
+If the PSRAM allocation fails, `txQueue` is `NULL`, every enqueue returns false, and the
+endpoint degrades to sending everything inline.
+
+**2. The module list (`/api/flap/modules`).** It sent one `sendContent()` per module.
+Each of those can block on a slow client up to the socket timeout (3 s), so the total
+scaled with module count: ~41 modules × 3 s crosses the 120 s web-stall threshold, the
+supervisor sees `Web=0` and **reboots the gateway**. The bug was latent for as long as
+it was because it simply cannot fire below ~40 modules. The response is now coalesced
+into ~1400 B chunks, feeds `wdgWebMs` on each flush, and bails out early once
+`server.client().connected()` goes false.
+
+The general lesson, worth applying to any new handler: if it can sleep, wait on a
+module, or scale its send count with the size of the registry, it belongs on another
+task or in a chunked loop that feeds the watchdog.
+
+## Companion URL: why it is persisted on a debounce (v3.4)
+
+`cfg.companionUrl` is the one config value written by a *machine* rather than a person,
+on a heartbeat, and that changes what "persist on change" costs. Point two companions at
+one gateway and each re-registers its own URL every ~30 s, so the value flips back and
+forth forever — and the original `saveConfig()`-on-change turned that into an NVS write
+every ~30 s for the life of the device. This was observed in the wild, not theorised.
+
+So the URL is applied to RAM immediately (the dashboard's companion tab is live at once)
+while the **flash write waits for the value to hold still** for
+`COMPANION_SAVE_DEBOUNCE_MS` (120 s), with the clock **restarting on every change**. The
+debounce is deliberately longer than a heartbeat, which means a *contested* URL is never
+written to flash at all — the correct outcome, since nothing durable should be committed
+for a value two clients are still arguing over. A single genuine change persists after
+two quiet minutes, and a companion re-registers within a heartbeat of any reboot, so
+nothing is actually lost by not persisting a contested one.
+
+The companion's **status** and advertised **tabs** are runtime-only for the same reason,
+one step further: they are re-sent on every heartbeat, so there is nothing a flash write
+would buy.
+
 ## Memory management
 
 The gateway is intended to run for weeks unattended, so heap stability is

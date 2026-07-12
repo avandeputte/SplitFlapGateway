@@ -1,9 +1,25 @@
 # Split-Flap Gateway
 
-**Firmware version: 3.2**
+**Firmware version: 3.4**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
+
+> [!TIP]
+> **New in 3.4**
+> - **A new look** — the dashboard now wears the same **Home Assistant design
+>   language** as the companion, so the two feel like one product. It follows your
+>   browser/OS **light or dark** preference.
+> - **Backup & restore moved into Settings** — the separate **Backup** tab is gone
+>   (an old `#backup` link now lands on Settings). Nothing about the backup format
+>   or the restore-by-serial behaviour changed.
+> - **Tab advertisement** — the gateway and the companion now **tell each other
+>   which tabs they have** (`tabs` / `gwTabs` on `POST /api/companion`), so neither
+>   hard-codes a list of the other's. Old↔new pairings both still work.
+> - **A steadier web server** — batch pacing no longer blocks the HTTP server (see
+>   [Batch pacing](#batch-pacing-v34)), the module list streams in chunks (fixing a
+>   watchdog reboot on large walls), and a changed MQTT broker now takes effect
+>   without a reboot.
 
 > [!TIP]
 > **New in 3.2**
@@ -63,7 +79,7 @@
   - [OTA Firmware Update](#ota-firmware-update)
 - [OpenAPI Specification](#openapi-specification)
 - [MQTT](#mqtt)
-- [Timezone Configuration](#timezone-configuration)
+- [Time Configuration](#time-configuration)
 - [OTA Firmware Updates](#ota-firmware-updates)
 - [Default Settings](#default-settings)
 - [License](#license)
@@ -90,12 +106,12 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 
 ## Features
 
-- **Web UI** — single-page dashboard accessible from any browser
+- **Web UI** — single-page dashboard accessible from any browser, in the same **Home Assistant design language** as the companion (light or dark, following your browser/OS)
 - **[Companion app](#companion-app)** — an optional content engine (apps, playlists, schedules, triggers) that runs on a Raspberry Pi or any Linux box and drives the display over REST. It registers itself with the gateway, which then shows a **Companion** tab, and it can keep its own settings in the gateway's flash so its container stays stateless
 - **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 255: IDs 0-254)
 - **Sticky module list** — the known-module registry persists across reboots in flash; a stale module is version-probed before being dropped (so a merely-quiet module isn't lost), and a gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
 - **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
-- **Backup & restore** — download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs (a v31+ module's configurable flap set is captured and restored too)
+- **Backup & restore** — on the Settings tab: download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs (a v31+ module's configurable flap set is captured and restored too)
 - **Configurable flap set** — modules on firmware v31+ let you set the active flap count (1–64) and the ordered character set per module from the Info dialog, or push one set to a whole panel with a broadcast; the live values are read back from the `A` dump and persist in module EEPROM. Characters aren't limited to ASCII: the **euro sign `€` and accented letters** (Windows-1252) are supported — type them as UTF-8 and the gateway transcodes to the single byte the bus uses
 - **Module self-diagnostics** — modules on firmware v26+ gain a 🩺 icon that runs three built-in tests and interprets the results: an instant **stats snapshot** (reset cause, boot count, supply voltage, EEPROM verify, current flap index), a **Hall sensor self-test** (home-sensor health), and a motor-driven **mechanical self-test** that detects intermittent missed steps (drag / weak supply / failing driver) or a stalled reel — with a selectable rotation count (5–20, firmware v29+) for deeper runs
 - **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
@@ -162,7 +178,7 @@ PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v3.2.0
+[Boot] Split-Flap Gateway v3.4.0
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -223,6 +239,11 @@ The Access Point is **fallback-only**: once the gateway is connected to your WiF
 
 Navigate to the gateway's IP address in any browser.
 
+Since **v3.4** the dashboard wears the **Home Assistant design language** — the same
+look the [companion](#companion-app) ships, so the two halves feel like one product
+rather than two tools bolted together. It follows your browser/OS **light or dark**
+preference automatically; there is no theme setting to configure.
+
 <p align="center">
 <a href="screenshots/modules.png"><img src="screenshots/modules.png" width="260" alt="Modules tab"></a>
 <a href="screenshots/modules_info.png"><img src="screenshots/modules_info.png" width="260" alt="Module info dialog with parsed EEPROM"></a>
@@ -232,7 +253,7 @@ Navigate to the gateway's IP address in any browser.
 <a href="screenshots/calibration.png"><img src="screenshots/calibration.png" width="260" alt="Calibration tab — module grid, in-place home offset and total steps with Count Steps, and the per-character map"></a>
 <a href="screenshots/bus_monitor.png"><img src="screenshots/bus_monitor.png" width="260" alt="Bus Monitor tab"></a>
 <a href="screenshots/settings.png"><img src="screenshots/settings.png" width="260" alt="Settings tab"></a>
-<a href="screenshots/backups.png"><img src="screenshots/backups.png" width="260" alt="Backup tab"></a>
+<a href="screenshots/backups.png"><img src="screenshots/backups.png" width="260" alt="Backup &amp; restore, on the Settings tab"></a>
 <a href="screenshots/status.png"><img src="screenshots/status.png" width="260" alt="Status tab"></a>
 </p>
 
@@ -243,9 +264,8 @@ Navigate to the gateway's IP address in any browser.
 | **Display** | A **Live Display** at the top renders what the wall is currently showing as a grid of split-flap cells, updating as characters change, with a **Home All** button beneath it that homes every module at once (broadcasts `m*h`). Below it: send a text string across sequential modules by start ID, send a single character to one module (or broadcast to all), or send a specific flap index to a module |
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly, or **Home All** to home every module at once (broadcasts `m*h`). For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap (in the module's own character order, with colour flaps as swatches) and its current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through every flap one at a time. The map, the Wizard, and the whole-board walk all honour a module's **custom flap set** (character order and flap count) on firmware v31+, falling back to the default 64-flap reel on older modules. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
-| **Backup** | Download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
-| **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update |
+| **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update, and **backup & restore** — download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
 | **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
 
 ---
@@ -289,6 +309,11 @@ the **Status** page.
 - **This gateway is the source of truth.** The companion reads its grid size and MQTT
   broker from `GET /api/config` on startup and on demand, rather than keeping its own copy.
 - **It registers itself** with `POST /api/companion` (its URL, plus a status heartbeat).
+- **Each side advertises its own tabs** in that same exchange (v3.4). The companion sends
+  the deep links its UI has (`tabs`), the gateway answers with its own (`gwTabs`), and each
+  nav links exactly what the other really has — so a tab added or removed on one side shows
+  up on the other without a matching release. Both halves are optional: an older peer that
+  says nothing simply gets the built-in list, which is why any old/new pairing still works.
 
 Install is a single command on a Pi or any Linux box — it installs Docker if needed,
 asks for this gateway's URL, and starts the container:
@@ -466,7 +491,29 @@ All `POST` endpoints accept `Content-Type: application/json`.
 |---|---|---|---|
 | `GET` | `/api/rs485/messages` | — | Drain buffered frames (up to 64) |
 | `POST` | `/api/rs485/send` | `{"data":"m5-A\n"}` (optional `"raw":true`) | Send raw ASCII frame. Framing/junk is normalized by default; `"raw":true` sends bytes verbatim |
-| `POST` | `/api/rs485/batch` | `{"frames":["m00-A\n","m01-B\n",…],"step_ms":15}` | **(v3.0)** Send many frames in one request (each normalized like `/send`); optional `step_ms` (0–30) paces the cascade device-side. Lets a host draw a whole animated page in one HTTP call instead of one request per module. Capped at 512 frames / 8 s of pacing |
+| `POST` | `/api/rs485/batch` | `{"frames":["m00-A\n","m01-B\n",…],"step_ms":15}` | **(v3.0)** Send many frames in one request (each normalized like `/send`); optional `step_ms` (0–30) paces the cascade device-side. Lets a host draw a whole animated page in one HTTP call instead of one request per module. Capped at 512 frames. **(v3.4)** Paced frames are now *queued* and sent by the bus task, so the call returns at once — `200` means **accepted**, not yet on the wire (see [Batch pacing](#batch-pacing-v34)) |
+
+#### Batch pacing (v3.4)
+
+`step_ms` staggers a cascade so the wall animates rather than snapping over at once.
+Through v3.2 the handler produced that stagger by **sleeping between frames** — and
+it ran on the web task. Because the gateway's HTTP server handles **one connection at
+a time**, a paced batch froze the *entire* web UI for the length of the cascade (up to
+the old 8 s cap) while further connections piled up in the TCP accept queue.
+
+From v3.4 the handler doesn't sleep. It stamps each frame with a **due time**, hands it
+to the RS-485 task — which already wakes every 5 ms — and returns. The cascade looks
+the same on the wall; the web server stays responsive throughout. Two consequences for
+callers:
+
+- **`200` means *accepted*, not *transmitted*.** The frames are queued; `sent` counts
+  frames accepted. Nothing in the response tells you the cascade has finished.
+- **The 8 s total-pacing cap is gone**, replaced by a queue depth: **127 paced frames
+  in flight**. A frame is sent *immediately* rather than paced when `step_ms` is `0`,
+  when the frame is longer than 48 bytes, or when that queue is full — so a cascade of
+  more than 127 paced frames loses its stagger past that point (the frames still all
+  arrive; they just stop being spaced out). A whole-page redraw is one frame per module,
+  so this only bites on walls above 127 modules or on multi-step animations.
 
 ### Module Control
 
@@ -549,11 +596,11 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/quiet` | `{"on":true}` | Enable/disable quiet time (flaps stop moving for display updates; reels resync when disabled) |
 | `GET` | `/api/quiet/schedule` | — | Returns `{enabled,start,end,days}` — the daily quiet-time schedule (`days` is a bitmask, bit0=Sun … bit6=Sat) |
 | `POST` | `/api/quiet/schedule` | `{"enabled":true,"start":"22:00","end":"07:00","days":127}` | Set the schedule. When enabled, quiet time toggles automatically as local time crosses the window (overnight windows supported) |
-| `GET` | `/api/companion` | — | Returns `{url,status}` — the registered [companion app](#companion-app)'s URL and its last reported running status |
-| `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather"}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. The URL is persisted; the status is runtime-only |
+| `GET` | `/api/companion` | — | Returns `{url,status,tabs,gwTabs}` — the registered [companion app](#companion-app)'s URL, its last reported running status, the tabs it advertised, and **(v3.4)** `gwTabs`, this gateway's own tabs |
+| `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather","tabs":[{"id":"apps","label":"Apps"}]}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. **(v3.4)** may also advertise `tabs` — the deep links its own UI offers; the reply always carries `gwTabs`. The URL is persisted (debounced); status and tabs are runtime-only |
 | `GET` | `/api/companion/settings` | — | **(v3.1)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
 | `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.1)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.2.0"` |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.4.0"` |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
@@ -669,7 +716,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
    only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `firmware.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.2.0**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.4.0**).
 
 > **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
 > pick the right one:

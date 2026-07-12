@@ -31,6 +31,11 @@ char gWallChars[256] = {0};
 // v3.0: last status the companion app reported, and when (millis). Runtime-only.
 char gCompanionStatus[80] = "";
 volatile unsigned long gCompanionSeenMs = 0;
+// v3.4: the tabs the companion advertised (JSON array). Runtime-only: it re-sends
+// them on every heartbeat, so there is nothing worth spending a flash write on.
+char gCompanionTabs[COMPANION_TABS_MAX] = "";
+volatile bool          gCompanionUrlDirty   = false;   // URL changed, not yet in flash
+volatile unsigned long gCompanionUrlDirtyMs = 0;       // millis() of the LAST change
 // Set when display tracking changes (in rs485Send); the network task publishes
 // the HA display-state topic (rate-limited) so HA reflects what's shown without
 // spamming. rs485Send sets it; the network task (tasks.cpp) reads and clears it.
@@ -74,6 +79,12 @@ volatile int          mqttQHead     = 0;
 volatile int          mqttQTail     = 0;
 SemaphoreHandle_t     mqttQMutex    = NULL;
 StaticSemaphore_t     mqttQMutexBuf;
+// Scheduled outbound frame ring (paces /api/rs485/batch off taskWeb -- see rs485.h).
+TxQItem*              txQueue       = NULL;
+volatile int          txQHead       = 0;
+volatile int          txQTail       = 0;
+SemaphoreHandle_t     txQMutex      = NULL;
+StaticSemaphore_t     txQMutexBuf;
 // Module registry (~14 KB). Lives in PSRAM -- accessed only under sfMutex from
 // normal tasks (never an ISR, never DMA, and not during flash writes), and the
 // 9600-baud bus is far from a hot loop, so PSRAM latency is negligible while it

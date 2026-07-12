@@ -44,6 +44,48 @@ void psramAllocInit() {
   msgRing   = (RS485Msg*) psramAlloc("monitor ring", sizeof(RS485Msg) * MSG_RING_SIZE);
   mqttQueue = (MqttQItem*) psramAlloc("MQTT queue",   sizeof(MqttQItem) * MQTT_Q_SIZE);
   sfModules = (SFModule*) psramAlloc("module registry", sizeof(SFModule) * MAX_MODULES);
+  txQueue   = (TxQItem*)  psramAlloc("scheduled TX",  sizeof(TxQItem)   * TXQ_SIZE);
+}
+
+// Enqueue one frame for paced delivery at dueMs. SPSC ring: taskWeb is the only producer,
+// taskRS485 the only consumer, guarded by txQMutex (never held across the actual rs485Send,
+// which takes txMutex -- txMutex is never nested under txQMutex).
+bool rs485SendScheduled(const uint8_t* data, size_t len, uint32_t dueMs) {
+  if (!txQueue || !txQMutex) return false;
+  if (len == 0 || len > TXQ_FRAME_MAX) return false;   // too long -> caller sends inline
+  bool ok = false;
+  if (xSemaphoreTake(txQMutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+  int next = (txQHead + 1) % TXQ_SIZE;
+  if (next != txQTail) {                                 // room (one slot kept empty)
+    txQueue[txQHead].dueMs = dueMs;
+    txQueue[txQHead].len   = (uint16_t)len;
+    memcpy(txQueue[txQHead].data, data, len);
+    txQHead = next;
+    ok = true;
+  }
+  xSemaphoreGive(txQMutex);
+  return ok;                                             // false (full) -> caller inlines
+}
+
+// Drain every frame whose due time has arrived, oldest first. Due times within a batch are
+// monotonic, so checking the tail is enough. The frame is copied out UNDER the lock and sent
+// AFTER releasing it: rs485Send takes txMutex, and holding txQMutex across it would stall the
+// producer (taskWeb) for the whole send.
+void rs485PollScheduled(uint32_t now) {
+  if (!txQueue || !txQMutex) return;
+  for (;;) {
+    uint8_t buf[TXQ_FRAME_MAX];
+    size_t  len = 0;
+    if (xSemaphoreTake(txQMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+    if (txQTail != txQHead && (int32_t)(now - txQueue[txQTail].dueMs) >= 0) {
+      len = txQueue[txQTail].len;
+      memcpy(buf, txQueue[txQTail].data, len);
+      txQTail = (txQTail + 1) % TXQ_SIZE;
+    }
+    xSemaphoreGive(txQMutex);
+    if (!len) return;                                    // nothing due
+    rs485Send(buf, len, false);
+  }
 }
 
 void ringPush(const RS485Msg& m) {

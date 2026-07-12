@@ -102,7 +102,7 @@
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.2.1"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.4.0"         // gateway firmware version (UI + boot log)
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -153,6 +153,11 @@
 #define MODULE_POSTPROV_VER_MS  4000UL    // delay after a provisioning ack before the first version query. A freshly-provisioned module writes its new ID to EEPROM and then runs a staggered startup (~150ms x new-ID), so it can be unresponsive for several seconds; wait well past that before the first query.
 #define MODULE_VER_RETRY_MS     2500UL    // gap between post-provision version-query retries
 #define MODULE_VER_MAX_TRIES    6         // give up after this many version-query attempts (covers ~4s + 5x2.5s ~= 16s)
+// Longer than a companion heartbeat (~30 s) ON PURPOSE. Each change RESTARTS this
+// clock, so two companions flipping the URL between them never hold still long enough
+// to be written -- which is the point. A single, real change persists after two quiet
+// minutes.
+#define COMPANION_SAVE_DEBOUNCE_MS 120000UL   // companion URL: persist once it settles
 #define MODULE_SAVE_DEBOUNCE_MS 5000UL    // coalesce NVS writes
 
 /* ---- Module registry sizing ----
@@ -175,7 +180,7 @@
 #define MODULES_FILE     "/modules.dat"
 #define MODULES_MAGIC    0x53464732UL   // "SFG2" (bumped: PersistedModule gained 'acked')
 
-/* ---- Companion settings blob (FFat) -- v3.2 --------------------------------
+/* ---- Companion settings blob (FFat) -- v3.1 --------------------------------
  * The companion app can park its settings here so its container stays stateless.
  * The gateway is a dumb blob store: the body is gzip(minified JSON) whose schema
  * the companion owns, stored verbatim and handed back byte-for-byte. Written via
@@ -185,6 +190,23 @@
 #define COMPANION_FILE       "/compset.gz"
 #define COMPANION_TMP        "/compset.tmp"
 #define COMPANION_MAX_BYTES  (64UL * 1024UL)
+
+/* ---- Companion tab advertisement -- v3.4 -----------------------------------
+ * At registration the companion may advertise the tabs (deep links) its own UI
+ * offers, so the dashboard links exactly the tabs that companion really has
+ * instead of a list hard-coded here; the gateway advertises its own tabs back in
+ * the same exchange. Both sides fall back to their built-in list when the peer
+ * says nothing, so old<->new in either direction keeps working. The stored form
+ * is the re-serialised JSON array: bounded by the caps below, and a companion
+ * that overruns them simply doesn't get its list advertised (the dashboard then
+ * shows its built-in one). */
+// Bytes of stored JSON. Realistic tabs ({"id":"playlists","label":"Playlists"} is
+// ~38 B) reach the count cap below first; only max-length ids/labels hit this one,
+// where it binds at 5 tabs. Either way the list is dropped whole, never truncated.
+#define COMPANION_TABS_MAX     384
+#define COMPANION_TABS_MAX_N   10    // max tabs accepted from a companion
+#define COMPANION_TAB_ID_MAX   24    // max chars of one tab's id (the URL hash)
+#define COMPANION_TAB_LBL_MAX  24    // max chars of one tab's label
 
 /* ==========================================================================*/
 #define DBG(...) do { if (gSerialDebug) printf(__VA_ARGS__); } while(0)
@@ -196,7 +218,24 @@ extern volatile bool gSerialDebug;
 extern volatile bool gMaintenanceMode;
 extern volatile bool gQuietTime;
 extern char gCompanionStatus[80];          // v3.0: companion running-status
-extern volatile unsigned long gCompanionSeenMs;  // millis() of last companion post
+extern volatile unsigned long gCompanionSeenMs;
+// v3.4: the tab list the companion advertised at registration, held as the JSON
+// array we re-serialised from its POST (so it is valid JSON by construction and
+// can be splice into a response with serialized()). Runtime-only, like the status:
+// a companion re-advertises on every heartbeat. Empty = it never told us (an older
+// companion), and the dashboard falls back to its built-in list of companion tabs.
+extern char gCompanionTabs[COMPANION_TABS_MAX];
+// The companion URL is persisted on a DEBOUNCE, not on every change. Two companions
+// pointed at the same gateway will each re-register their own URL on their heartbeat,
+// so cfg.companionUrl flips back and forth -- and saving on every change turned that
+// into an NVS write every ~30 s, forever. Observed in the wild. The URL is applied to
+// RAM immediately (the UI and the companion tabs are live at once); only the flash
+// write waits for the value to hold still. A contested URL therefore never reaches
+// flash at all, which is the right answer: nothing durable should be written for a
+// value two clients are still arguing over. A companion re-registers within a
+// heartbeat of any reboot, so nothing is lost by not persisting it.
+extern volatile bool          gCompanionUrlDirty;
+extern volatile unsigned long gCompanionUrlDirtyMs;  // millis() of last companion post
 extern volatile bool gDisplayDirty;
 extern volatile bool gOtaInProgress;
 // Last flap byte transmitted to each module id (= grid cell, row-major). Lets the

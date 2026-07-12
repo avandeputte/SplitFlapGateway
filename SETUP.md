@@ -258,7 +258,7 @@ To watch boot logs and the periodic `[WDG]` diagnostics (115200 baud):
 You should see something like:
 
 ```
-[Boot] Split-Flap Gateway v3.2.0
+[Boot] Split-Flap Gateway v3.4.0
 [Boot] reset=... heap=... psram=8388608 flash=16384KB sdk=...
 [WDG] up=30s heap=... mqtt=1 mods=11 ...
 ```

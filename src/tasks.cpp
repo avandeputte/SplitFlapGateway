@@ -147,6 +147,10 @@ void taskRS485(void* pv) {
       }
     }
 
+    // Send any scheduled batch frames now due -- /api/rs485/batch's cascade pacing,
+    // moved off taskWeb so the HTTP server never blocks on delay() (see rs485.h).
+    rs485PollScheduled(millis());
+
     wdgRS485Ms = millis();
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -326,6 +330,14 @@ void taskNetwork(void* pv) {
     }
 
     // Persist the module registry if it changed (debounced to limit NVS wear).
+    // Persist the companion URL only once it has stopped moving. See the note on
+    // gCompanionUrlDirty in common.h: an unconditional save turned two co-resident
+    // companions into an NVS write every heartbeat, forever.
+    if (gCompanionUrlDirty && millis() - gCompanionUrlDirtyMs > COMPANION_SAVE_DEBOUNCE_MS) {
+      gCompanionUrlDirty = false;
+      saveConfig();
+      DBG("[CFG] companion URL settled -- persisted: %s\n", cfg.companionUrl);
+    }
     if (sfModulesDirty) {
       if (sfModulesDirtyMs == 0) sfModulesDirtyMs = millis();
       if (millis() - sfModulesDirtyMs > MODULE_SAVE_DEBOUNCE_MS) {

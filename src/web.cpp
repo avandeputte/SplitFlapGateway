@@ -81,6 +81,7 @@ const char FAVICON_SVG[] =
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' role='img' aria-label='Split-Flap Gateway'><defs><linearGradient id='sfTop' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='#3c424c'/><stop offset='1' stop-color='#2d323b'/></linearGradient><linearGradient id='sfBot' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='#272b32'/><stop offset='1' stop-color='#181b20'/></linearGradient><clipPath id='sfTile'><rect x='7' y='7' width='50' height='50' rx='10'/></clipPath></defs><rect x='7' y='8.5' width='50' height='50' rx='10' fill='#000' opacity='0.35'/><g clip-path='url(#sfTile)'><rect x='7' y='7' width='50' height='25' fill='url(#sfTop)'/><rect x='7' y='32' width='50' height='25' fill='url(#sfBot)'/><text x='32' y='46' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='40' fill='#f3eee3'>S</text><rect x='7' y='30.9' width='50' height='2.2' fill='#0c0d10'/><rect x='7' y='33.1' width='50' height='0.8' fill='#565c68' opacity='0.7'/></g><rect x='4.5' y='29.5' width='4' height='5' rx='1.6' fill='#0c0d10'/><rect x='55.5' y='29.5' width='4' height='5' rx='1.6' fill='#0c0d10'/><rect x='7' y='7' width='50' height='50' rx='10' fill='none' stroke='#0a0b0d' stroke-width='1'/></svg>";
 // GET /favicon.svg
 static void handleFavicon() {
+  server.sendHeader("Cache-Control", "max-age=604800");   // static per firmware build
   server.send(200, "image/svg+xml", FAVICON_SVG);
 }
 
@@ -91,6 +92,7 @@ const char LOGO_SVG[] =
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 447.6 44' role='img' aria-label='Split-Flap Gateway'><defs><linearGradient id='sfTop' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='#3c424c'/><stop offset='1' stop-color='#2d323b'/></linearGradient><linearGradient id='sfBot' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='#272b32'/><stop offset='1' stop-color='#181b20'/></linearGradient></defs><rect x='3' y='2' width='250' height='40' rx='6' fill='#000' opacity='0.30'/><clipPath id='clip1'><rect x='3' y='0' width='250' height='40' rx='6'/></clipPath><g clip-path='url(#clip1)'><rect x='3' y='0' width='250' height='20' fill='url(#sfTop)'/><rect x='3' y='20' width='250' height='20' fill='url(#sfBot)'/><rect x='27.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='28.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='52.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='53.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='77.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='78.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='102.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='103.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='127.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='128.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='152.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='153.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='177.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='178.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='202.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='203.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='227.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='228.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><text x='15.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>S</text><text x='40.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>P</text><text x='65.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>L</text><text x='90.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>I</text><text x='115.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>T</text><text x='140.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>-</text><text x='165.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>F</text><text x='190.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>L</text><text x='215.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>A</text><text x='240.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>P</text><rect x='3' y='18.9' width='250' height='2.2' fill='#0c0d10'/><rect x='3' y='21.1' width='250' height='0.8' fill='#565c68' opacity='0.7'/></g><rect x='1.2' y='17.5' width='3.6' height='5' rx='1.4' fill='#0c0d10'/><rect x='251.2' y='17.5' width='3.6' height='5' rx='1.4' fill='#0c0d10'/><rect x='3' y='0' width='250' height='40' rx='6' fill='none' stroke='#0a0b0d' stroke-width='0.8'/><rect x='269' y='2' width='175' height='40' rx='6' fill='#000' opacity='0.30'/><clipPath id='clip2'><rect x='269' y='0' width='175' height='40' rx='6'/></clipPath><g clip-path='url(#clip2)'><rect x='269' y='0' width='175' height='20' fill='url(#sfTop)'/><rect x='269' y='20' width='175' height='20' fill='url(#sfBot)'/><rect x='293.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='294.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='318.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='319.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='343.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='344.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='368.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='369.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='393.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='394.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><rect x='418.4' y='0' width='1.2' height='40' fill='#0c0d10'/><rect x='419.6' y='0' width='0.5' height='40' fill='#454b56' opacity='0.45'/><text x='281.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>G</text><text x='306.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>A</text><text x='331.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>T</text><text x='356.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>E</text><text x='381.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>W</text><text x='406.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>A</text><text x='431.5' y='27.7' text-anchor='middle' font-family='Arial, Helvetica, sans-serif' font-weight='700' font-size='22' fill='#f3eee3'>Y</text><rect x='269' y='18.9' width='175' height='2.2' fill='#0c0d10'/><rect x='269' y='21.1' width='175' height='0.8' fill='#565c68' opacity='0.7'/></g><rect x='267.2' y='17.5' width='3.6' height='5' rx='1.4' fill='#0c0d10'/><rect x='442.2' y='17.5' width='3.6' height='5' rx='1.4' fill='#0c0d10'/><rect x='269' y='0' width='175' height='40' rx='6' fill='none' stroke='#0a0b0d' stroke-width='0.8'/></svg>";
 // GET /logo.svg
 static void handleLogo() {
+  server.sendHeader("Cache-Control", "max-age=604800");   // static per firmware build
   server.send(200, "image/svg+xml", LOGO_SVG);
 }
 
@@ -108,12 +110,20 @@ static void streamPage(const char* p, size_t n) {
 // GET /
 static void handleRoot() {
   wdgWebMs = millis();                 // streaming response can take a while
-  // Cap per-write blocking so a stalled browser cannot wedge taskWeb.
-  server.client().setTimeout(3000);    // 3s per socket operation
-  // The page is embedded in the firmware, so it changes with every FW update.
-  // Without this, browsers cache the old HTML/JS and keep serving stale UI after
-  // a flash -- tell them never to cache it so a reload always gets the new page.
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  // Cap per-write blocking so a stalled browser cannot wedge taskWeb. This must be
+  // setConnectionTimeout(): NetworkClient keeps its own `_timeout` (which is what seeds
+  // SO_SNDTIMEO) and does NOT override Stream::setTimeout(), so the old setTimeout(3000)
+  // set the *read* timeout and capped nothing at all -- the comment above was a lie.
+  server.client().setConnectionTimeout(3000);   // 3s per socket write
+  // The page is baked into the firmware, so its bytes change only when the firmware
+  // is rebuilt -- and every rebuild changes __TIME__. Serve it with that as an ETag
+  // and honour If-None-Match: navigating away and back then costs a tiny 304 instead
+  // of re-downloading the whole ~53 KB page, while a reflash still busts the cache and
+  // delivers the new UI. (The old no-store forced a full re-download on every visit.)
+  static const char* PAGE_ETAG = "\"" __DATE__ "-" __TIME__ "\"";
+  server.sendHeader("ETag", PAGE_ETAG);
+  server.sendHeader("Cache-Control", "no-cache");   // revalidate, but cheaply (304)
+  if (server.header("If-None-Match") == PAGE_ETAG) { server.send(304, "text/html", ""); return; }
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   // Stream the static page (web_ui.h), substituting the single {FWVER} token
@@ -181,7 +191,7 @@ static void handleApiSendBatch() {
   { char cd[48]; snprintf(cd, sizeof(cd), "batch %u frames, step=%dms",
       (unsigned)frames.size(), step); ringPushCommand('R', cd); }
   int sent = 0;
-  unsigned long budget = 0;          // total artificial delay (ms), capped
+  uint32_t due = millis();           // frame i is due at now + i*step
   for (JsonVariant v : frames) {
     if (sent >= 512) break;          // bound the batch
     const char* f = v.as<const char*>();
@@ -189,10 +199,16 @@ static void handleApiSendBatch() {
     uint8_t outBuf[TX_MAX_BYTES];
     size_t outLen = min(strlen(f), (size_t)TX_MAX_BYTES);
     memcpy(outBuf, f, outLen);
-    rs485Send(outBuf, outLen, false);
+    // Pace by SCHEDULING, never by delay(): this handler runs on taskWeb, and blocking it
+    // freezes the one-connection HTTP server (and piles up concurrent sockets). taskRS485
+    // sends each frame when due. step==0, an over-long frame, or a full queue -> send now.
+    if (step > 0 && rs485SendScheduled(outBuf, outLen, due)) {
+      due += (uint32_t)step;
+    } else {
+      rs485Send(outBuf, outLen, false);
+    }
     sent++;
-    wdgWebMs = millis();             // feed the web watchdog during a long batch
-    if (step > 0 && budget < 8000UL) { delay(step); budget += (unsigned long)step; }
+    wdgWebMs = millis();             // this loop is now fast, but stay watchdog-safe
   }
   char resp[48];
   snprintf(resp, sizeof(resp), "{\"ok\":true,\"sent\":%d}", sent);
@@ -208,6 +224,11 @@ static void handleApiSendBatch() {
 // blocking) sendContent network write, which could otherwise stall taskRS485.
 static void handleApiModules() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  // setConnectionTimeout(), NOT setTimeout(): NetworkClient declares its own `_timeout`
+  // (which is what seeds SO_SNDTIMEO) and does NOT override Stream::setTimeout(), so
+  // setTimeout() sets the *read* timeout and caps nothing. See the note in the send
+  // loop below: on a large wall the sum of these writes is what trips the watchdog.
+  server.client().setConnectionTimeout(1500);
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
   server.sendContent("[");
@@ -231,7 +252,20 @@ static void handleApiModules() {
   }
   xSemaphoreGive(sfMutex);
 
-  int emitted = 0;
+  // Coalesce modules into MSS-sized chunks instead of one socket write per module.
+  //
+  // This was one sendContent() per module, and on a large wall that is a watchdog
+  // reboot waiting to happen: each write can block for SO_SNDTIMEO (3 s, the
+  // NetworkClient default) if the browser stalls or half-closes, and NOTHING in the
+  // loop fed wdgWebMs. 41 modules x 3 s = 123 s, past loop()'s 120 s web-stall
+  // threshold -> "STALL: Web=0" -> reboot. Below ~40 modules the sum stays under the
+  // threshold, which is the only reason this never fired on a small bus.
+  //
+  // Three things fix it: bound each write (setConnectionTimeout below), feed the
+  // watchdog per flush, and stop early if the peer has gone away.
+  char   batch[1400];   // ~1436-byte lwIP MSS: one chunk maps to one TCP segment
+  size_t bl      = 0;
+  int    emitted = 0;
   for (int k = 0; k < count; k++) {
     int idx = order[k];
     // Snapshot this entry under the lock, then release before formatting/sending.
@@ -246,7 +280,7 @@ static void handleApiModules() {
     char flapBuf[6] = {0};
     if (m.flapChar) flapToJsonUtf8(&m.flapChar, 1, flapBuf, sizeof(flapBuf));
     char obj[288];
-    snprintf(obj, sizeof(obj),
+    int on = snprintf(obj, sizeof(obj),
       "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"acked\":%s,\"flapIndex\":%d,"
       "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"lastSeen\":%lu,\"lastSeenEpoch\":%lu,"
       "\"dupSuspect\":%s}",
@@ -254,9 +288,22 @@ static void handleApiModules() {
       m.acked ? "true" : "false",
       m.flapIndex, flapBuf, m.fwVersion, m.lastSeen, m.lastSeenEpoch,
       m.dupSuspect ? "true" : "false");
-    server.sendContent(obj);
+    if (on < 0) on = 0;
+    if (on > (int)sizeof(obj) - 1) on = (int)sizeof(obj) - 1;   // snprintf truncated
+
+    if (bl + (size_t)on >= sizeof(batch)) {   // flush before it overflows
+      batch[bl] = 0;                          // sendContent() strlen()s its argument
+      server.sendContent(batch);
+      bl = 0;
+      wdgWebMs = millis();                    // the SUM of the writes is what trips it
+      // A client that vanished mid-response cannot be finished; every remaining write
+      // would just burn its full send timeout. Stop rather than hold taskWeb hostage.
+      if (!server.client().connected()) return;
+    }
+    memcpy(batch + bl, obj, (size_t)on); bl += (size_t)on;
     emitted++;
   }
+  if (bl) { batch[bl] = 0; server.sendContent(batch); wdgWebMs = millis(); }
   server.sendContent("]");
   server.sendContent("");   // terminate the chunked response
 }
@@ -862,6 +909,12 @@ static void handleApiConfigMqtt() {
   server.send(200, "application/json", "{\"ok\":true}");
   delay(100);
   mqtt.disconnect();
+  // PubSubClient caches the broker it was last told to dial. mqttInit() is the only
+  // other caller and runs once at boot, so without this the new broker is saved and
+  // logged but never actually dialled: the reconnect keeps using the boot-time target
+  // (or none at all, if none was configured then) and fails forever with rc=-2.
+  if (strlen(cfg.mqttHost)) mqtt.setServer(cfg.mqttHost, cfg.mqttPort);
+  mqttFailCount = 0;   // a fresh broker gets a fresh strike budget
 }
 
 // POST /api/config/rs485
@@ -1580,10 +1633,54 @@ static void handleApiQuietSchedule() {
   server.send(200, "application/json", buf);
 }
 
+/* The dashboard's own tabs, as deep links (the hash the nav's router accepts --
+   NOT the pane id: "calibration", not "calib"). Advertised to the companion at
+   registration so its nav can link exactly the tabs this firmware has, instead of
+   a list hard-coded over there that goes stale whenever this one changes. Keep in
+   step with the <nav> in web_ui.h and the M map beside it. -- v3.4 */
+static const char* const GW_TAB_ID[]  = {"modules", "display", "provision", "calibration",
+                                         "monitor", "settings", "status"};
+static const char* const GW_TAB_LBL[] = {"Modules", "Display", "Provision", "Calibration",
+                                         "Monitor", "Settings", "Status"};
+static const size_t GW_TAB_N = sizeof(GW_TAB_ID) / sizeof(GW_TAB_ID[0]);
+
+// Store the tab list a companion advertised, re-serialised into gCompanionTabs.
+// Anything malformed, oversized, or over the caps leaves the buffer EMPTY rather
+// than half-filled: the dashboard then falls back to its built-in companion tabs,
+// which is the same behaviour as an older companion that advertises nothing.
+static void storeCompanionTabs(JsonArrayConst tabs) {
+  gCompanionTabs[0] = '\0';
+  if (tabs.isNull() || tabs.size() == 0 || tabs.size() > COMPANION_TABS_MAX_N) return;
+
+  JsonDocument out;
+  JsonArray arr = out.to<JsonArray>();
+  for (JsonObjectConst t : tabs) {
+    const char* id  = t["id"].is<const char*>()    ? t["id"].as<const char*>()    : nullptr;
+    const char* lbl = t["label"].is<const char*>() ? t["label"].as<const char*>() : nullptr;
+    if (!id || !lbl || !id[0] || !lbl[0]) return;
+    if (strlen(id) > COMPANION_TAB_ID_MAX || strlen(lbl) > COMPANION_TAB_LBL_MAX) return;
+    // The id lands in a URL hash and the label in the nav, so keep both to plain
+    // printable ASCII -- no quotes, no control characters, nothing to escape.
+    for (const char* p = id; *p; p++)
+      if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return;
+    for (const char* p = lbl; *p; p++)
+      if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7e || *p == '"' || *p == '\\') return;
+    JsonObject e = arr.add<JsonObject>();
+    e["id"]    = id;
+    e["label"] = lbl;
+  }
+  if (measureJson(out) >= sizeof(gCompanionTabs)) return;   // would not fit: advertise nothing
+  serializeJson(out, gCompanionTabs, sizeof(gCompanionTabs));
+}
+
 // GET/POST /api/companion  -- the companion app registers its URL here (v3.0)
 // and heartbeats its running status. The URL is persisted (only rewritten to
 // NVS when it changes, to avoid flash wear from heartbeats); the status is
 // runtime-only. An empty url deregisters.
+//
+// v3.4: the POST may carry `tabs` -- the deep links the companion's own UI has --
+// and the response always carries `gwTabs`, this firmware's. Either side may say
+// nothing (an older peer), in which case the other falls back to its built-in list.
 static void handleApiCompanion() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (server.method() == HTTP_POST) {
@@ -1594,14 +1691,26 @@ static void handleApiCompanion() {
     }
     if (doc["url"].is<const char*>()) {
       const char* url = doc["url"].as<const char*>();
-      if (strcmp(url, cfg.companionUrl) != 0) {      // persist only on change
+      if (strcmp(url, cfg.companionUrl) != 0) {
+        // Apply to RAM now -- the companion tabs must light up immediately -- but do
+        // NOT saveConfig() here. Two companions registering against one gateway flip
+        // this value on every heartbeat, and an unconditional save made that an NVS
+        // write every ~30 s for as long as both were up. taskNetwork persists it once
+        // the value has held still (COMPANION_SAVE_DEBOUNCE_MS); a contested URL never
+        // reaches flash, which is what we want.
         strlcpy(cfg.companionUrl, url, sizeof(cfg.companionUrl));
-        saveConfig();
+        gCompanionUrlDirty   = true;
+        gCompanionUrlDirtyMs = millis();   // restart the clock on EVERY change
         DBG("[CFG] Companion URL set to %s\n", cfg.companionUrl);
       }
-      if (url[0] == '\0') { gCompanionStatus[0] = '\0'; gCompanionSeenMs = 0; }  // deregister
-      else gCompanionSeenMs = millis();
+      if (url[0] == '\0') {                                                      // deregister
+        gCompanionStatus[0] = '\0'; gCompanionTabs[0] = '\0'; gCompanionSeenMs = 0;
+      } else gCompanionSeenMs = millis();
     }
+    // A companion that advertises its tabs re-sends them on every heartbeat, so
+    // this is a plain overwrite. One that never mentions `tabs` leaves whatever we
+    // hold alone -- a heartbeat carrying only a status must not wipe the list.
+    if (doc["tabs"].is<JsonArrayConst>()) storeCompanionTabs(doc["tabs"].as<JsonArrayConst>());
     if (doc["status"].is<const char*>()) {
       // Copy + sanitise so the string is always JSON-safe when echoed back.
       const char* st = doc["status"].as<const char*>();
@@ -1619,7 +1728,22 @@ static void handleApiCompanion() {
   JsonDocument out;
   out["url"]    = cfg.companionUrl;
   out["status"] = gCompanionStatus;
-  char buf[256];
+  // The companion's tabs, for the dashboard's nav. Already valid JSON (we wrote
+  // it with serializeJson), so splice it in verbatim rather than re-parsing it.
+  // Empty array = this companion never advertised any; the dashboard then uses
+  // its built-in list.
+  out["tabs"]   = serialized(gCompanionTabs[0] ? gCompanionTabs : "[]");
+  // ...and ours, for the companion's nav.
+  JsonArray gw = out["gwTabs"].to<JsonArray>();
+  for (size_t i = 0; i < GW_TAB_N; i++) {
+    JsonObject e = gw.add<JsonObject>();
+    e["id"]    = GW_TAB_ID[i];
+    e["label"] = GW_TAB_LBL[i];
+  }
+  // Sized for the worst case: a full-size companion list (384) + our gwTabs (~300)
+  // + the URL (128) + the status (80) + keys. A String would heap-allocate on every
+  // heartbeat, and the dashboard polls this endpoint every 4 s.
+  char buf[COMPANION_TABS_MAX + 768];
   serializeJson(out, buf, sizeof(buf));
   server.send(200, "application/json", buf);
 }
@@ -1725,7 +1849,8 @@ static void handleApiCompanionSettingsGet() {
   if (n == 0) { f.close(); sendJsonError(404, "No settings stored"); return; }
 
   wdgWebMs = millis();
-  server.client().setTimeout(3000);        // cap per-write blocking on a stalled client
+  server.client().setConnectionTimeout(3000);   // cap per-write blocking (see handleRoot:
+                                               // setTimeout() here was a no-op)
   server.setContentLength(n);
   // Deliberately NOT "Content-Encoding: gzip": these bytes are the payload, not a
   // transfer encoding of it. Declaring the encoding would make HTTP clients gunzip
@@ -1741,6 +1866,8 @@ static void handleApiCompanionSettingsGet() {
 }
 
 void webInit() {
+  static const char* COLLECT_HDRS[] = { "If-None-Match" };
+  server.collectHeaders(COLLECT_HDRS, 1);   // so handleRoot can honour conditional GETs
   server.on("/",                     HTTP_GET,     handleRoot);
   server.on("/favicon.svg",          HTTP_GET,     handleFavicon);
   server.on("/logo.svg",             HTTP_GET,     handleLogo);

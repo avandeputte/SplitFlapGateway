@@ -18,6 +18,7 @@ void setup() {
   timeMutex  = xSemaphoreCreateMutexStatic(&timeMutexBuf);
   mqttQMutex = xSemaphoreCreateMutexStatic(&mqttQMutexBuf);
   txMutex    = xSemaphoreCreateMutexStatic(&txMutexBuf);
+  txQMutex   = xSemaphoreCreateMutexStatic(&txQMutexBuf);
   psramAllocInit();   // allocate large buffers (ring + MQTT queue + registry) in PSRAM
 
   // Debug output via native USB CDC (USB CDC On Boot: Enabled).
