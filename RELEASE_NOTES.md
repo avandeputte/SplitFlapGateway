@@ -1,5 +1,12 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.2.1 — 2026-07-12
+
+The dashboard now uses **Home Assistant's design language** — the same look the
+companion app ships — light and dark following your browser/OS. UI-only: no API, MQTT,
+or module-behaviour changes. (The companion also injects this look when proxying an
+older gateway, so mixed versions still match.)
+
 ## v3.2 — 2026-07-10
 
 Adds a **Home All** button to the web UI. Drop-in upgrade from v3.1 — no API,
