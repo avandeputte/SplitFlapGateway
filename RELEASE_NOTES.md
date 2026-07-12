@@ -1,5 +1,12 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.4.1 — 2026-07-12
+
+Theme fix: the module cards, status tiles and bus-monitor rows still used the old palette.
+They hardcode their colours instead of reading the theme tokens, so re-pointing the tokens
+never reached them; they now follow the Home Assistant palette like the rest of the
+dashboard. The flap wall keeps its own darks — it depicts the physical modules.
+
 ## v3.4 — 2026-07-12
 
 Gives the dashboard the **companion's look**, folds **backup & restore** into the
