@@ -1,9 +1,21 @@
 # Split-Flap Gateway
 
-**Firmware version: 3.4**
+**Firmware version: 3.5**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
+
+> [!TIP]
+> **New in 3.5**
+> - **The dashboard speaks your language** — 13 languages plus English, chosen
+>   automatically from your **browser** (the same way the light/dark theme is), with an
+>   override in Settings and a `?lang=` URL parameter so the companion can request one.
+>   All of them ship in the one firmware image. See [Language](#language).
+> - **Re-skin fixes** — the Home Assistant theme left several controls behind, and in the
+>   **light** theme some were *invisible*: every secondary button (Refresh, Identify All,
+>   Home All, Re-read EEPROM) rendered white-on-near-white, and the destructive-action
+>   buttons and bus-monitor text were unreadable. All fixed, and every element now clears
+>   WCAG AA in both themes. **If you are on v3.4, this is the reason to update.**
 
 > [!TIP]
 > **New in 3.4**
@@ -67,6 +79,7 @@
 - [Serial Debug Output](#serial-debug-output)
 - [First Boot](#first-boot)
 - [Web UI](#web-ui)
+  - [Language](#language)
 - [Companion App](#companion-app)
   - [Companion Settings Storage](#companion-settings-storage)
 - [Split-Flap Protocol](#split-flap-protocol)
@@ -178,7 +191,7 @@ PlatformIO **Monitor** / `pio device monitor`, or any serial terminal).
 
 **Always-on messages:**
 ```
-[Boot] Split-Flap Gateway v3.4.0
+[Boot] Split-Flap Gateway v3.5.0
 [Boot] reset=PANIC heap=261540 psram=8388608 flash=16384KB sdk=v5.1.4
 [MOD] Loaded 11 modules from FATFS (0 pruned as stale)
 [WiFi] Connected IP=192.168.1.105
@@ -265,8 +278,58 @@ preference automatically; there is no theme setting to configure.
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly, or **Home All** to home every module at once (broadcasts `m*h`). For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap (in the module's own character order, with colour flaps as swatches) and its current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through every flap one at a time. The map, the Wizard, and the whole-board walk all honour a module's **custom flap set** (character order and flap count) on firmware v31+, falling back to the default 64-flap reel on older modules. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
-| **Settings** | WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update, and **backup & restore** — download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
+| **Settings** | **Language** (defaults to *Auto*, which follows your browser — see [Language](#language)), WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update, and **backup & restore** — download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
 | **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
+
+### Language
+
+The dashboard is available in **English plus 13 other languages**, and picks one the same
+way it already picks light or dark: **it follows your browser**. There is nothing to
+configure.
+
+The choice is made in this order, first match wins:
+
+1. **`?lang=<code>` in the URL** — `http://splitflap-gw.local/?lang=fr`. This wins over
+   everything and is deliberately **not saved**, so the [companion](#companion-app) can
+   request a language for an embedded view without changing what *you* see.
+2. **Settings ▸ Language** — an explicit override. Stored in your browser, so it is
+   per-device; the gateway keeps no language state at all.
+3. **Your browser** (`Auto`, the default). `en-GB` and `en-AU` browsers get British and
+   Australian spelling automatically.
+4. **English**, if none of the above match.
+
+**The languages** are the ones whose text the split-flap modules could actually display —
+the Windows-1252 (Western European) repertoire — so the dashboard and the wall speak the
+same set:
+
+| | |
+|---|---|
+| English | US *(built in)*, UK, Australia |
+| Romance | French, Spanish, Italian, Portuguese (Portugal), Portuguese (Brazil) |
+| Germanic | German, Dutch |
+| Nordic | Danish, Swedish, Norwegian, Finnish |
+
+**All of them ship in the one firmware image** — there is no per-language build, and
+switching language never means reflashing. That is affordable because only the *words* are
+duplicated, not the page: the dashboard is 109 KB of HTML/CSS/JS but only ~11 KB of it is
+English *text*, and a dictionary (which carries the English key alongside each translation)
+compresses to about **9 KB** — so all 13 languages together cost roughly **115 KB of flash**,
+under 7% of the free space. The browser downloads only the one dictionary it needs
+(`GET /lang/<code>`, gzipped), and English downloads nothing at all — it is the text already
+in the page.
+
+That also makes translations **safely partial**: any string a translator left alone falls
+back to English on its own, so a missing word never breaks a screen. (It is why the British
+dictionary is 7 entries — only 7 strings actually differ.)
+
+The **bus monitor is deliberately never translated**: it shows RS-485 frames and their
+decode, which is protocol, not prose.
+
+> **Adding or fixing a language.** Edit `ui/strings/<code>.json` — the keys are the English
+> strings themselves. Then `python3 tools/build_ui.py` regenerates `src/web_ui.h`.
+> `tools/i18n_check.py` validates every dictionary (unknown keys, dropped product name,
+> non-Windows-1252 characters) and `node tools/i18n_test.js` covers the language-matching
+> rules.
 
 ---
 
@@ -600,7 +663,7 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather","tabs":[{"id":"apps","label":"Apps"}]}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. **(v3.4)** may also advertise `tabs` — the deep links its own UI offers; the reply always carries `gwTabs`. The URL is persisted (debounced); status and tabs are runtime-only |
 | `GET` | `/api/companion/settings` | — | **(v3.1)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
 | `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.1)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.4.0"` |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.5.0"` |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
@@ -716,7 +779,7 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
    only file to upload over OTA.**
 3. Open the gateway web UI → **Settings** → click **Open Firmware Updater →**
 4. Select `firmware.bin` and click **Upload Firmware**
-5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.4.0**).
+5. The gateway reboots automatically on success. Confirm the new build by checking the version badge in the header (e.g. **v3.5.0**).
 
 > **Which file?** PlatformIO emits several files in `.pio/build/esp32s3_devmodule/` —
 > pick the right one:

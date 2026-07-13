@@ -62,61 +62,82 @@ def c_bytes(name: str, blob: bytes) -> str:
     return f"static const uint8_t {name}[] PROGMEM = {{\n" + "\n".join(rows) + "\n};\n"
 
 
-def load_dicts() -> list[tuple[str, str, bytes]]:
-    """Return [(code, native_name, gzipped_json)] for every non-English dictionary."""
-    out = []
+# The product name is a name, not a word: it is never translated. A dictionary entry
+# that drops it is a translation bug, so the entry is discarded (falling back to the
+# English text) rather than shipped.
+BRAND = re.compile(r'split[\s-]?flap', re.I)
+
+
+def load_dicts() -> tuple[list[tuple[str, str, bytes]], list[str]]:
+    """Return ([(code, native_name, gzipped_json)], warnings) for the non-English dicts."""
+    out, warn = [], []
     if not (UI / "strings").is_dir():
-        return out
+        return out, warn
+    en = json.loads((UI / "strings" / "en.json").read_text(encoding="utf-8")) \
+        if (UI / "strings" / "en.json").exists() else {}
     for f in sorted((UI / "strings").glob("*.json")):
         code = f.stem
         d = json.loads(f.read_text(encoding="utf-8"))
         name = d.pop("$name", code)          # native language name, for the picker
         if code == BASE_LANG:
             continue
-        # Drop entries that are untranslated (value == key): the runtime already
-        # falls back to English, so shipping them is pure flash for no effect.
-        d = {k: v for k, v in d.items() if v and v != k}
-        if not d:
+        clean = {}
+        for k, v in d.items():
+            if not v or v == k:
+                continue                     # untranslated -> the runtime falls back anyway
+            if k not in en:
+                warn.append(f"{code}: stale key not in en.json: {k[:40]!r}")
+                continue
+            if BRAND.search(k) and not BRAND.search(v):
+                warn.append(f"{code}: product name dropped in: {k[:40]!r}")
+                continue                     # keep the English, which still has the name
+            clean[k] = v
+        if not clean:
             continue
-        raw = json.dumps(d, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        raw = json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         gz = gzip.compress(raw, 9, mtime=0)   # mtime=0 -> byte-stable output
         out.append((code, name, gz))
-    return out
+    return out, warn
 
 
-def build() -> str:
+def build() -> tuple[str, list]:
     page = (UI / "index.html").read_text(encoding="utf-8")
     if ')====="' in page:
         sys.exit("ERROR: ui/index.html contains the raw-string terminator )=====\"")
 
-    dicts = load_dicts()
-    parts = [HEADER, page, ')====="', ";\n"]
+    dicts, warn = load_dicts()
 
-    if dicts:
-        parts.append("\n")
-        for code, _name, gz in dicts:
-            parts.append(c_bytes(f"LANG_{code.replace('-', '_').upper()}", gz))
-        parts.append("\nstruct UiLang { const char* code; const char* name;"
-                     " const uint8_t* gz; size_t len; };\n")
-        parts.append("static const UiLang UI_LANGS[] = {\n")
-        for code, name, gz in dicts:
-            sym = f"LANG_{code.replace('-', '_').upper()}"
-            parts.append(f'  {{ "{code}", "{name}", {sym}, sizeof({sym}) }},\n')
-        parts.append("};\n")
-        parts.append(f"static const size_t UI_LANG_COUNT = {len(dicts)};\n")
-    else:
-        # No dictionaries yet: still declare the table so web.cpp compiles.
-        parts.append("\nstruct UiLang { const char* code; const char* name;"
-                     " const uint8_t* gz; size_t len; };\n")
-        parts.append("static const UiLang UI_LANGS[] = {};\n")
-        parts.append("static const size_t UI_LANG_COUNT = 0;\n")
+    # The page needs the language list at parse time (to resolve the browser's
+    # preference and fill the Settings picker) without a round-trip, so it is
+    # baked in here. "en" leads: it is the base, and has no dictionary to fetch.
+    langs = [{"code": BASE_LANG, "name": "English"}] + \
+            [{"code": c, "name": n} for c, n, _ in dicts]
+    token = "/*{LANGS}*/"
+    if token not in page:
+        sys.exit(f"ERROR: ui/index.html is missing the {token} token")
+    page = page.replace(
+        token + '[{"code":"en","name":"English"}]',
+        json.dumps(langs, ensure_ascii=False, separators=(",", ":")), 1)
 
+    parts = [HEADER, page, ')====="', ";\n\n"]
+    for code, _name, gz in dicts:
+        parts.append(c_bytes(f"LANG_{code.replace('-', '_').upper()}", gz))
+    parts.append("\nstruct UiLang { const char* code; const char* name;"
+                 " const uint8_t* gz; size_t len; };\n")
+    parts.append("static const UiLang UI_LANGS[] = {\n")
+    for code, name, gz in dicts:
+        sym = f"LANG_{code.replace('-', '_').upper()}"
+        parts.append(f'  {{ "{code}", "{name}", {sym}, sizeof({sym}) }},\n')
+    parts.append("};\n")
+    parts.append(f"static const size_t UI_LANG_COUNT = {len(dicts)};\n")
     parts.append(FOOTER)
-    return "".join(parts)
+    return "".join(parts), warn
 
 
 def main() -> None:
-    text = build()
+    text, warn = build()
+    for w in warn:
+        print(f"WARN  {w}")
     if "--check" in sys.argv:
         cur = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
         if cur != text:
@@ -125,7 +146,7 @@ def main() -> None:
         return
 
     OUT.write_text(text, encoding="utf-8")
-    dicts = load_dicts()
+    dicts, _ = load_dicts()
     page_n = len((UI / "index.html").read_bytes())
     gz_n = sum(len(g) for _, _, g in dicts)
     print(f"page        {page_n:>8,} B")

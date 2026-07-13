@@ -1,5 +1,88 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.5 — 2026-07-13
+
+Makes the dashboard **multi-lingual** — 13 languages plus English, picked automatically
+from the browser — and **fixes the v3.4 re-skin**, which had left several controls
+literally invisible in the light theme.
+
+> **If you are on v3.4, update.** In the light theme (the default) every secondary button
+> — **Refresh**, **Identify All**, **Home All**, **Re-read EEPROM** — renders white text on
+> a near-white background (1.3:1 contrast). The destructive-action buttons and the bus
+> monitor's frame text are unreadable too. It looks perfect in dark mode, which is why it
+> shipped.
+
+### New
+
+- **The dashboard speaks your language.** English plus **British and Australian English,
+  French, German, Spanish, Italian, Portuguese (Portugal and Brazil), Dutch, Danish,
+  Swedish, Norwegian and Finnish** — the languages whose text the flap modules could
+  actually display (the Windows-1252 repertoire), so the dashboard and the wall speak the
+  same set.
+
+  The language is chosen the same way light/dark already is: **it follows your browser**,
+  with nothing to configure. In order: `?lang=fr` in the URL (which lets the companion
+  request a language for an embedded view *without* changing your own setting, so it is
+  deliberately not saved) → the Settings override → `navigator.languages` → English.
+  The gateway stores **no language state at all** — no config field, no NVS write, no API.
+
+  **Every language ships in the one firmware image**; there is no per-language build and
+  switching never means reflashing. That is affordable because only the *words* are
+  duplicated, not the page: the dashboard is 109 KB of HTML/CSS/JS but only ~11 KB of it is
+  English *text*. A dictionary carries the English key alongside each translation, so it
+  compresses to about **9 KB** — all 13 languages together cost roughly **115 KB of flash**,
+  under 7% of what was free. The browser fetches just the one dictionary it needs
+  (`GET /lang/<code>`, gzipped) and **English fetches nothing** — it is the text already in
+  the page, which is also the per-key fallback. So a translation can be *partial*, and a
+  missing string simply stays English instead of breaking a screen.
+
+  The **bus monitor is never translated** — it shows RS-485 frames and their decode, which
+  is protocol, not prose (and its decode labels are padded to keep the columns aligned).
+
+### Fixes
+
+- **The Home Assistant re-skin left half the UI behind — and some of it was invisible.**
+  The re-skin re-points the palette tokens in `:root`, which only reaches components that
+  *read* a token. Everything that hardcoded the old dark palette stayed dark on the new
+  light page, and one token change had a nasty knock-on effect:
+
+  `--acc` went from a solid navy to 12% black, but buttons inherit `color:#fff` from the
+  base rule — so **every button that overrode only its background kept white text**. In the
+  light theme that is white-on-`#e0e0e0`: **1.3:1, invisible**. It hit the secondary buttons
+  (Refresh, Identify All, Home All, Re-read EEPROM), the nudge buttons, Tune's GOTO and the
+  wizard's Back. The destructive-action buttons were `#212121` on `#1a0d0d` — **1.2:1**.
+
+  | | before (light) | after |
+  |---|---|---|
+  | Secondary buttons | 1.3:1 — invisible | **12.2:1** |
+  | Destructive buttons | 1.2:1 — invisible | **15.4:1** |
+  | Bus-monitor frame text | 1.2:1 — invisible | **15.4:1** |
+  | Amber status text | 2.0:1 | **4.9:1** |
+  | Green status text | 3.3:1 | **5.1:1** |
+
+  Also themed: the **bus monitor** (its log panel now follows the theme, and its
+  RX/TX/REST/MQTT channel colours — chosen for a black panel, and 1.7–3.6:1 on white — got
+  per-theme shades), the calibration module picker, character map, edit box, note banner,
+  EEPROM map, wizard progress bar and the maintenance banner. `.wall` and `.flap` stay dark
+  on purpose: they draw the flap wall.
+
+  Semantic colours were doing double duty as *fills* (buttons/banners, which carry their own
+  text colour and were fine) and as *text*, where the fill shades collapse on a white page.
+  Text usages now take their own tokens. **Every fixed element clears WCAG AA (≥4.5:1) in
+  both themes**, verified by computing contrast rather than eyeballing.
+
+- **Mojibake in the OTA help text** — a mangled em-dash was rendering as `?`.
+
+### Under the hood
+
+- **`src/web_ui.h` is now generated.** The dashboard is built from `ui/index.html` by
+  `tools/build_ui.py`, which also embeds the language dictionaries. **Edit `ui/index.html`,
+  not `src/web_ui.h`** — the latter is regenerated and your edits would be overwritten.
+  `tools/i18n_check.py` validates the dictionaries and `node tools/i18n_test.js` covers the
+  language-matching rules.
+
+---
+
 ## v3.4 — 2026-07-12
 
 Gives the dashboard the **companion's look**, folds **backup & restore** into the

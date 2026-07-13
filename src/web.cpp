@@ -107,6 +107,36 @@ static void streamPage(const char* p, size_t n) {
   }
 }
 
+// GET /lang/<code>  -- one UI translation dictionary (v3.5)
+//
+// The dashboard's English is the text already in PAGE_HTML, so English costs nothing
+// and needs no request. Every other language is a gzipped JSON dict generated into
+// web_ui.h by tools/build_ui.py, and the browser fetches only the one it needs.
+//
+// Content-Encoding: gzip is correct HERE (and wrong for /api/companion/settings): these
+// bytes are a *transfer encoding* of JSON that the browser transparently inflates before
+// the page's fetch().json() ever sees it. The companion blob is the opposite -- there the
+// gzip IS the payload, which is why that endpoint must not claim the header.
+//
+// One route is registered per language in webInit(), so an unknown code simply 404s.
+static void handleLang(size_t idx) {
+  const UiLang& L = UI_LANGS[idx];
+  wdgWebMs = millis();
+  server.client().setConnectionTimeout(3000);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  // Dictionaries live in the firmware image, so they change only on reflash -- the same
+  // ETag as the page busts them at exactly the right moment.
+  static const char* LANG_ETAG = "\"" __DATE__ "-" __TIME__ "\"";
+  server.sendHeader("ETag", LANG_ETAG);
+  server.sendHeader("Cache-Control", "no-cache");
+  if (server.header("If-None-Match") == LANG_ETAG) { server.send(304, "application/json", ""); return; }
+  server.sendHeader("Content-Encoding", "gzip");
+  server.setContentLength(L.len);
+  server.send(200, "application/json", "");
+  server.sendContent_P((PGM_P)L.gz, L.len);
+  wdgWebMs = millis();
+}
+
 // GET /
 static void handleRoot() {
   wdgWebMs = millis();                 // streaming response can take a while
@@ -1871,6 +1901,13 @@ void webInit() {
   server.on("/",                     HTTP_GET,     handleRoot);
   server.on("/favicon.svg",          HTTP_GET,     handleFavicon);
   server.on("/logo.svg",             HTTP_GET,     handleLogo);
+  // v3.5: one route per UI language, "/lang/<code>". Registering them individually
+  // (rather than parsing a path parameter) keeps the URI matcher plain and makes an
+  // unknown code fall through to the normal 404. English is never registered -- it is
+  // the text already in the page.
+  for (size_t i = 0; i < UI_LANG_COUNT; i++) {
+    server.on((String("/lang/") + UI_LANGS[i].code).c_str(), HTTP_GET, [i]() { handleLang(i); });
+  }
   server.on("/ota",                  HTTP_GET,     handleOTAPage);
   server.on("/api/ota/upload",       HTTP_POST,    sendOTAUploadResult, handleOTAUpload);
   server.on("/api/rs485/messages",   HTTP_GET,     handleApiMessages);

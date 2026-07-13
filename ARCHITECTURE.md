@@ -137,6 +137,67 @@ The general lesson, worth applying to any new handler: if it can sleep, wait on 
 module, or scale its send count with the size of the registry, it belongs on another
 task or in a chunked loop that feeds the watchdog.
 
+## Multi-language UI (v3.5)
+
+The dashboard ships every language in **one firmware image**. That is only affordable
+because the translatable text is a small slice of the page: 109 KB of HTML+CSS+JS, but
+only ~10 KB of it is English *words* (~310 strings). Duplicating the **page** per
+language would cost ~109 KB each; duplicating the **text** costs ~1.5 KB gzipped each.
+So there is one page, plus one gzipped dictionary per language in flash, and the browser
+fetches only the one it needs (`GET /lang/<code>`).
+
+**English is the page.** It is not a dictionary — it is the text already in the markup.
+That makes the default path free (no fetch, no JS dependency), makes English the natural
+per-key fallback, and means a failed fetch degrades to English rather than to a broken
+page. A dictionary may therefore be *partial*: the en-GB dictionary is 7 entries, because
+only 7 strings differ.
+
+**The key is the English text**, not an invented id. That is safe here only because the
+UI has no homographs -- every string that repeats, or appears under two different tags,
+means the same thing in both places. It buys a lot: the markup needs **no `data-i18n`
+tagging at all**, so 200+ HTML strings are translated without touching the page.
+
+Two runtime mechanisms, because neither alone is sufficient:
+
+- **A DOM walk + `MutationObserver`** translates *text nodes*. The observer is the part
+  that matters: most of this UI's content (module cards, the flap map, the wizard) is
+  built by JS *after* load, and a one-shot walk would miss all of it.
+- **`t("...")`** translates messages the JS *composes* -- `"Error: " + e`. A DOM walk only
+  ever sees the finished string ("Error: Bad JSON"), which is not a key, so these have to
+  be wrapped at the source. `t()` looks up the *trimmed* key and re-attaches the edge
+  whitespace, so `t("Error: ")` works and translators never have to preserve a trailing
+  space.
+
+Re-running the walk is harmless: a translated node is no longer a key, so it is a no-op.
+
+**Wrapping is context-aware, and that is not fussiness.** Only literals inside a
+`.textContent` assignment, `confirm()` or `alert()` are wrapped -- because JS strings that
+*look* like prose are routinely code. `'nav a'` is a `querySelector`; `'HOME         '` is
+a bus-monitor decode label whose padding keeps the log's monospace columns aligned. A
+naive "wrap every prose-looking literal" pass would have translated both and broken the
+page. For the same reason the runtime **skips `#log` entirely**: the monitor renders
+protocol, not chrome.
+
+Language, highest priority first:
+
+1. **`?lang=fr`** -- lets the companion request a language for an embedded view *without*
+   touching the user's own preference, so it is deliberately **not** persisted.
+2. **The Settings override** (`localStorage`).
+3. **`navigator.languages`** -- the "Auto" default. This is why the gateway stores **no
+   language state at all**: no config field, no NVS write, no API. It mirrors what the UI
+   already does with the light/dark theme, which follows the OS with no setting.
+4. **English.**
+
+The one subtlety worth protecting (there is a test for it): an `en-US` browser must
+resolve to the **base** English, not to `en-GB` merely because that is the only other
+`"en"` on the list. Resolution is therefore exact-match, then base-language, then any
+variant -- with `en` itself on the list as the base. See `tools/i18n_test.js`.
+
+`Content-Encoding: gzip` **is** correct on `/lang/<code>`, and is exactly what must
+*not* be sent for the companion settings blob: here the gzip is a transfer encoding of
+JSON that the browser inflates before `fetch().json()` sees it; there, the gzip *is* the
+payload.
+
 ## Companion URL: why it is persisted on a debounce (v3.4)
 
 `cfg.companionUrl` is the one config value written by a *machine* rather than a person,

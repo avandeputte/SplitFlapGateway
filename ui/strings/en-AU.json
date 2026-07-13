@@ -1,0 +1,10 @@
+{
+ "$name": "English (Australia)",
+ "BLANK (home). Press Re-home, then nudge until the blank flap is centered. Nudges save instantly.": "BLANK (home). Press Re-home, then nudge until the blank flap is centred. Nudges save instantly.",
+ "Home is centered -- start wizard": "Home is centred -- start wizard",
+ "Homed. Is the blank flap centered?": "Homed. Is the blank flap centred?",
+ "Look at the module. If it is centered, confirm. If not, nudge until it is.": "Look at the module. If it is centred, confirm. If not, nudge until it is.",
+ "Re-homed. Check the blank flap is centered.": "Re-homed. Check the blank flap is centred.",
+ "This is the home offset. If the blank flap is off-center, every character will be too. Confirm it now if you haven't.": "This is the home offset. If the blank flap is off-centre, every character will be too. Confirm it now if you haven't.",
+ "been confirmed? When homed, the blank (black) flap should sit centered in the window.": "been confirmed? When homed, the blank (black) flap should sit centred in the window."
+}
