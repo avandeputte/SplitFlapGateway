@@ -158,7 +158,7 @@ void mqttPublishStateTopics() {
 void haPublishDiscovery(bool enable) {
   if (!mqtt.connected()) return;
   char node[24];
-  snprintf(node, sizeof(node), "sfgw_%08X", (uint32_t)ESP.getEfuseMac());
+  snprintf(node, sizeof(node), "sfgw_%08X", boardId32());
   const char* pfx = cfg.mqttPrefix;
   char topic[160];
   char pl[MQTT_BUF_SIZE];
@@ -439,7 +439,7 @@ void mqttInit() {
 void mqttConnect() {
   if (!strlen(cfg.mqttHost)) return;
   char clientId[32];
-  snprintf(clientId, sizeof(clientId), "splitflap-%08X", (uint32_t)ESP.getEfuseMac());
+  snprintf(clientId, sizeof(clientId), "splitflap-%08X", boardId32());
   printf("[MQTT] Connecting to %s:%d...\n", cfg.mqttHost, cfg.mqttPort);
   // Last Will & Testament: the broker publishes "offline" to <prefix>/availability
   // (retained) if we drop without a clean disconnect. HA uses this to mark every

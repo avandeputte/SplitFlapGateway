@@ -1,5 +1,30 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.6.1 — 2026-07-13
+
+**Every gateway now has its own MQTT identity.** Two of them on one broker used to knock
+each other offline, forever.
+
+### Fixed
+
+- **The MQTT client id and the Home Assistant device id were the same on every board.** Both
+  were derived from `ESP.getEfuseMac()`'s *low* bytes — but that value is byte-reversed, so
+  its low bytes are the Espressif OUI (`48:27:e2`), which is identical on every ESP32 ever
+  made. Two gateways both connected as `splitflap-20E22748`, and **an MQTT broker evicts the
+  client already holding a duplicate id**, so the pair disconnected each other in a loop. In
+  Home Assistant they collapsed into a single device.
+
+  The id now comes from the MAC bytes that actually differ between boards.
+
+  > **If you use the Home Assistant integration, the device id changes** (`sfgw_20E22748` →
+  > `sfgw_E2xxxxxx`). Home Assistant will discover a *new* device — delete the old one. The
+  > integration is opt-in and off by default, so this only affects you if you enabled it.
+
+  Found the moment a second gateway was put on the same network. It ships in Matrix Portal
+  Gateway v1.2.1 too, where it was verified on hardware.
+
+---
+
 ## v3.6 — 2026-07-13
 
 **Quiet Time now blanks the wall.**
