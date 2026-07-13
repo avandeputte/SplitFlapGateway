@@ -43,7 +43,7 @@ and **Last Seen** are table headings.
 | `Auto (browser)` | — | RUNTIME MESSAGE (shown after an action, in go()) |
 | `Auto-Home` | — | (built at runtime) |
 | `Auto-scroll` | — | (built at runtime) |
-| `Automatically enable Quiet Time on a daily schedule. During the window the gateway stops moving flaps for normal display updates and resyncs when it ends. Times are in your browser's local time zone.` | Settings tab | HELP TEXT (a full sentence) |
+| `Automatically enable Quiet Time on a daily schedule. When the window opens the gateway blanks the display and stops moving flaps for normal updates. The display is restored when the window ends. Times are in your browser's local time zone.` | Settings tab | HELP TEXT (a full sentence) |
 | `Azores (UTC-1/0)` | Settings tab | DROPDOWN OPTION |
 | `BLANK (home). Press Re-home, then nudge until the blank flap is centered. Nudges save instantly.` | Calibration tab (tune a module's flap positions) | TEXT |
 | `Back` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
@@ -271,6 +271,7 @@ and **Last Seen** are table headings.
 | `Provisioned` | — | (built at runtime) |
 | `Provisioning sent` | — | RUNTIME MESSAGE (shown after an action, in doProvision()) |
 | `Pub: .../rx   .../tx   .../status   .../flap/adv   .../flap/ack` | — | (built at runtime) |
+| `QUIET TIME - the display is blanked and flaps will not move. It is restored when Quiet Time ends (calibration still works)` | — | TEXT |
 | `Queued -- runs after the Hall test.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `Quiet Time Schedule` | Settings tab | HEADING (card title -- a noun phrase) |
 | `RS-485 Bus` | Status tab (diagnostics) | HEADING |

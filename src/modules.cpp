@@ -666,13 +666,49 @@ void sfSendText(int startAddr, const char* text, bool blankUnused) {
   (void)blankUnused; // extensible for future use
 }
 
-// Set Quiet Time on/off. On the falling edge (on -> off) the reels are resynced
-// to the last display each module was asked to show while quiet, so the physical
-// display catches up to the most recent request. Safe to call from any task; the
-// resync sends through rs485Send, which now transmits normally (quiet is off).
+// Set Quiet Time on/off.
+//
+// RISING edge (off -> on): the wall is BLANKED. Each module's current display is
+// snapshotted into its pending slot, then one broadcast home drives every reel to
+// its blank flap -- the same operation as the Home All button. The snapshot is what
+// makes the blanking safe to undo: the falling edge below already replays pending
+// requests, so the wall comes back exactly as it was unless the host asked for
+// something newer while quiet.
+//
+// ORDER MATTERS. The home must go out BEFORE gQuietTime is raised: rs485Send
+// suppresses display motion ('-', '+' and 'h') while quiet is on, so blanking after
+// the flag would suppress the very frame that does the blanking.
+//
+// FALLING edge (on -> off): the reels are resynced to the last display each module
+// was asked to show while quiet -- or, if nothing was asked, to what it was showing
+// when quiet began, which is what restores the wall.
+//
+// Safe to call from any task. rs485Send is never called while sfMutex is held:
+// sfTrackFromFrame re-takes that mutex and would self-deadlock (see globals.cpp).
 void sfSetQuietTime(bool on) {
   bool was = gQuietTime;
-  gQuietTime = on;
+
+  if (!was && on) {
+    // Remember what the wall is showing, so turning quiet off can put it back.
+    if (xSemaphoreTake(sfMutex, portMAX_DELAY) == pdTRUE) {
+      for (int i = 0; i < sfModuleCount; i++) {
+        SFModule& m = sfModules[i];
+        if (!m.provisioned) continue;
+        if (m.flapChar) {                     // showing a character
+          m.pendChar = m.flapChar; m.pendIndex = -1; m.hasPend = true;
+        } else if (m.flapIndex > 0) {         // showing a flap by index (0 IS blank)
+          m.pendChar = 0; m.pendIndex = m.flapIndex; m.hasPend = true;
+        }
+        // Otherwise it is already blank, or was never written: nothing to restore.
+      }
+      xSemaphoreGive(sfMutex);
+    }
+    sfHome(-1);          // unlocked, and quiet is still off -- so this is not suppressed
+    printf("[QUIET] on -- wall blanked (home all)\n");
+  }
+
+  gQuietTime = on;       // only now: the blanking frame above had to get out first
+
   if (was && !on) {
     // Snapshot pending requests under the lock, clear them, then send unlocked
     // (rs485Send must not be called while holding sfMutex).

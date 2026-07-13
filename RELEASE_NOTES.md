@@ -1,5 +1,31 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.6 — 2026-07-13
+
+**Quiet Time now blanks the wall.**
+
+### Changed
+
+- **Turning Quiet Time on empties the display.** Every reel is homed to its blank flap as
+  quiet time begins — the same operation as the **Home All** button — so the wall goes dark
+  and silent for the night instead of freezing mid-message.
+
+- **Turning it off puts the wall back.** What each module was showing is snapshotted before
+  the blanking, so the existing end-of-quiet resync restores it. If the host asked for
+  something newer while quiet, that wins instead — the newest request is what you get.
+
+  This applies to the schedule and to the manual switch alike, wherever quiet is set from:
+  the dashboard, REST, MQTT or Home Assistant.
+
+### Fixed
+
+- **The Quiet Time banner could never be translated.** The string extractor rejects any text
+  containing a semicolon (a filter meant to screen out CSS and JS), and the banner had one —
+  so it was the single piece of UI prose with no catalog entry, silently stuck in English in
+  all 13 languages. Its replacement has no semicolon, and is translated.
+
+---
+
 ## v3.5 — 2026-07-13
 
 Makes the dashboard **multi-lingual** — 13 languages plus English, picked automatically

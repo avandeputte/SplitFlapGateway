@@ -1137,14 +1137,21 @@ paths:
       tags: [Status]
       summary: Enable or disable quiet time
       description: |
-        When enabled, the gateway still accepts and acknowledges every command,
-        but does not transmit normal display-motion frames (show character, show
-        index, home), so the flaps stay still. Deliberate calibration moves
-        (calibrate, goto, nudge) are still allowed. Display tracking is left
-        unchanged. When disabled, the reels resync to the display each module was
-        last asked to show while quiet. Always resets to off on reboot (not
-        persisted). Also settable over MQTT (`<prefix>/quiet/set`) and from Home
-        Assistant.
+        **Enabling blanks the display.** Every reel is homed to its blank flap as quiet
+        time is entered -- the same operation as Home All -- so the wall goes empty for
+        the duration.
+
+        While enabled, the gateway still accepts and acknowledges every command, but does
+        not transmit normal display-motion frames (show character, show index, home), so
+        the flaps then stay still. Deliberate calibration moves (calibrate, goto, nudge)
+        are still allowed. Display tracking is left unchanged.
+
+        **Disabling restores the display.** The reels resync to whatever each module was
+        last asked to show while quiet -- or, if nothing was asked, to what it was showing
+        when quiet time began.
+
+        Always resets to off on reboot (not persisted). Also settable over MQTT
+        (`<prefix>/quiet/set`) and from Home Assistant.
       requestBody:
         required: true
         content:
