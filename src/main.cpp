@@ -133,11 +133,22 @@ void loop() {
            (WiFi.status()==WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
            (int)mqtt.connected(), sfModuleCount);
 
+    // NEVER reboot the board while a web-OTA upload is in flight -- neither for a stall nor for
+    // low heap. A firmware upload DELIBERATELY drives internal heap to the floor: a 1.45 MB image
+    // streams in faster than flash can absorb it, so WiFi/lwIP receive buffers pile up and
+    // min-free-heap has been seen at a few hundred bytes near the end. It also parks taskWeb
+    // inside handleClient() for the whole transfer. Either reboot below would then reset the
+    // board MID-FLASH, onto the old image -- exactly the "web OTA reaches ~98%, crashes, and comes
+    // back on the previous firmware" symptom. If heap genuinely runs out, Update.write() fails and
+    // handleOTAUpload aborts cleanly; a watchdog reboot only guarantees the failure. The upload
+    // finishes in tens of seconds and, on success, reboots itself.
+    const bool otaBusy = gOtaInProgress;
+
     // Boot grace period: skip stall detection for the first 60s. The first
     // boot after flashing formats the FATFS partition (a long blocking flash
     // operation), and WiFi/MQTT bring-up can briefly skew task scheduling.
     // Rebooting during this window would be a false positive.
-    if (now < 60000UL) {
+    if (now < 60000UL || otaBusy) {
       // still arm the low-heap emergency check below, but skip stall logic
     } else {
       // Detect stalled tasks. A heartbeat in the future (wdg > now) can only
@@ -157,8 +168,9 @@ void loop() {
         ESP.restart();
       }
     }
-    // Emergency reboot if heap falls critically low (< 20KB)
-    if (ESP.getFreeHeap() < 20000) {
+    // Emergency reboot if heap falls critically low (< 20KB) -- but NOT during an OTA upload,
+    // which drives heap this low ON PURPOSE (see above). Rebooting here would abort the flash.
+    if (!otaBusy && ESP.getFreeHeap() < 20000) {
       printf("[WDG] CRITICAL: heap=%u -- rebooting\n", ESP.getFreeHeap());
       delay(200);
       ESP.restart();
