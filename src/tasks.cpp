@@ -385,7 +385,12 @@ void taskNetwork(void* pv) {
     // Persist the companion URL only once it has stopped moving. See the note on
     // gCompanionUrlDirty in common.h: an unconditional save turned two co-resident
     // companions into an NVS write every heartbeat, forever.
-    if (gCompanionUrlDirty && millis() - gCompanionUrlDirtyMs > COMPANION_SAVE_DEBOUNCE_MS) {
+    //
+    // NOT during an OTA, for the same reason as the registry save below: saveConfig() is a
+    // blocking NVS flash write, and stalling the flash while a firmware image streams in starves
+    // the TCP receive path. The debounce means this can wait for the post-upload reboot.
+    if (gCompanionUrlDirty && !gOtaInProgress &&
+        millis() - gCompanionUrlDirtyMs > COMPANION_SAVE_DEBOUNCE_MS) {
       gCompanionUrlDirty = false;
       saveConfig();
       DBG("[CFG] companion URL settled -- persisted: %s\n", cfg.companionUrl);

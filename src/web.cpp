@@ -1066,7 +1066,18 @@ static void handleApiCapabilities() {
       flapToJsonUtf8(reel[i], strlen(reel[i]), esc, sizeof(esc), 0);
       capPut(esc); }
     capPut("\",\"modules\":\"");
-    { char ranges[128];
+    { // capRangeList compresses runs, so it needs share[] in ASCENDING id order -- but sfModules
+      // (and so ids[]/share[]) is in registration order, which after churn or a staggered boot
+      // can be scattered. Sort first, or the "ranges" come out wrong. Insertion sort: k is small.
+      for (int a = 1; a < k; a++) {
+        uint8_t v = share[a]; int b = a - 1;
+        while (b >= 0 && share[b] > v) { share[b + 1] = share[b]; b--; }
+        share[b + 1] = v;
+      }
+      // Sized for the worst case so it can never truncate and silently drop ids: even an all-
+      // singletons group is at most MAX_MODULES entries of "255," (4 bytes). A 128-byte buffer
+      // dropped real ids once a group's compressed list passed ~127 bytes.
+      static char ranges[MAX_MODULES * 4 + 1];
       capRangeList(share, k, ranges, sizeof(ranges));
       capPut(ranges); }
     capPut("\"}");

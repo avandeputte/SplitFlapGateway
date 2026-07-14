@@ -377,6 +377,13 @@ void sfSendChar(int addr, char c) {
   uint8_t b = (uint8_t)c;
   if (b >= 'a' && b <= 'z' && !strchr("roygbpw", (char)b))   // uppercase ASCII only,
     b = (uint8_t)(b - 'a' + 'A');                            // but keep colour codes
+  // The classic reel addresses its double-quote flap by the byte 'q' (splitflap-os's alias --
+  // the reel has no lowercase, so it borrowed that byte). GET /api/capabilities reports that
+  // flap as the character it shows, '"', so a client that asks for '"' must reach it. Map it
+  // here, AFTER the fold above -- do it before and the a-z fold would turn 'q' back into 'Q'.
+  // Without this, a '"' was sent as byte 0x22, which no module's reel contains, so it silently
+  // did nothing while capabilities advertised it.
+  if (b == '"') b = 'q';
   if (!isFlapByte(b)) return;                                 // not a valid flap glyph
   char buf[24];
   if (addr < 0)
@@ -494,6 +501,14 @@ void sfInvalidateFlapSet(int addr) {
 // stays aligned; an omitted count leaves that field empty (unchanged), and an
 // omitted char set leaves the trailing field empty (unchanged).
 void sfSetFlapConfigBySN(const char* sn, int count, const char* chars) {
+  // Bound the serial BEFORE it touches the buffer. snprintf() returns the length it WANTED to
+  // write, so the "n += snprintf(buf + n, sizeof(buf) - n, ...)" idiom below is only safe while
+  // n stays inside buf: once a caller-supplied sn pushes n past sizeof(buf), buf + n points off
+  // the end and sizeof(buf) - n underflows to a huge size_t, and the next snprintf writes out of
+  // bounds on the stack. sn arrives unvalidated from POST /api/flap/flapconfig and the MQTT
+  // flapconfig topic, so this is a remotely reachable overflow. A real serial is <=20 alnum
+  // chars (sfValidSN); anything longer or malformed matches no module anyway, so drop it.
+  if (!sfValidSN(sn)) return;
   bool hasCount = (count >= 1 && count <= SF_MAX_FLAPS);
   bool hasChars = (chars && chars[0]);
   if (!hasCount && !hasChars) return;
