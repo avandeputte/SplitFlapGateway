@@ -1,5 +1,72 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.8.0 — 2026-07-14
+
+Everything since **v3.4**, summarised. One client can now drive any wall: a new
+`GET /api/capabilities` tells it exactly what a wall can show, and a new
+`POST /api/display/cells` sets a whole row through the same contract the **Matrix Portal
+Gateway** answers — so the companion drives the physical wall and the LED-matrix emulation
+identically. Plus quiet-time blanking, a per-board MQTT identity, safer web OTA, and a
+security fix.
+
+> **Upgrading from v3.4:** two things to know. If you use the **Home Assistant** integration,
+> the device id changes (see below) — delete the old device. And modules re-report their flap
+> set to the gateway over the first couple of minutes after boot (the persistence format was
+> bumped); nothing you need to do.
+
+### Added
+
+- **`GET /api/capabilities`** — one call that answers *what characters can this wall show?*
+  On a real wall the answer is not one set: every module owns its reel, and firmware v31 lets
+  each be told a different one, so the response reports `union` (any module can show it),
+  `common` (**every** module can — these genuinely differ on a mixed wall), and `sets`: each
+  distinct reel once, with the module ids that carry it (`"0-44,50"`). Colour flaps are listed
+  by name; modules too old to report a reel appear under `assumed`, ones not yet known under
+  `unknown`. **The Matrix Portal Gateway answers the same URL identically**, so a client never
+  has to know which kind of wall it is driving.
+
+  To answer it, the gateway now learns each module's flap set from the v31+ `A` reply and
+  **persists** it — asking a 45-module wall costs ~90 s of bus time at 9600 baud, so it is
+  cached, filled by a slow background trickle, and re-read only when an `N` command changes a
+  reel.
+
+- **`POST /api/display/cells`** — set a run of modules in one call: `{ch | color | blank | skip}`
+  per cell, named colours, and `step_ms` cascade pacing. The **same JSON contract** the Matrix
+  gateway answers. It is *lenient* — a cell this wall cannot show is skipped, not a 400 that
+  discards the row (the response reports `sent` vs `skipped`); only structural errors 400.
+
+### Changed
+
+- **The dashboard speaks 13 languages** plus English, chosen from the browser with a Settings
+  override and a `?lang=` parameter, all in one firmware image.
+- **Quiet Time now blanks the wall.** Entering quiet homes every reel (the *Home All*
+  operation); leaving it restores what each module was showing, or the newest request made
+  while quiet. Applies to the schedule, the manual switch, REST, MQTT and Home Assistant alike.
+- **The Home Assistant re-skin is complete** — every control clears WCAG AA in both light and
+  dark themes, and the module cards, status tiles and bus monitor read the palette tokens too.
+
+### Fixed
+
+- **[Security] A remotely-reachable stack buffer overflow is closed.** The by-serial
+  flap-config path (`POST /api/flap/flapconfig` with an `sn`, and the MQTT flapconfig topic)
+  built its RS-485 frame from an **unvalidated** serial into a fixed stack buffer, so a long
+  serial overran it and corrupted the stack. The serial is now validated before it is used.
+- **Every gateway now has its own MQTT identity.** The client id and Home Assistant device id
+  were derived from a MAC field that is identical on every ESP32, so two boards on one broker
+  evicted each other in a loop. They now use the bytes that actually differ. **The HA device id
+  changes as a result — delete the old device.**
+- **Web OTA no longer reboots the board mid-flash.** A low-heap watchdog fired during the
+  upload — which drives heap low on purpose — and reset onto the old image. The watchdog now
+  stands down for the duration of an upload. *(Browser OTA on this 16 MB board remains
+  heap-tight near the end of a large image; ArduinoOTA/espota is the reliable path.)*
+- **Smaller fixes:** the companion-URL save no longer contends with a firmware upload for the
+  flash; `/api/capabilities` returns in ~0.03 s (its response is buffered and its scratch lives
+  in PSRAM) and its module-id range list can no longer truncate or mis-order; and the
+  double-quote flap is reachable by character (`"` maps to the reel's `q`, which is what
+  `/api/capabilities` advertises).
+
+---
+
 ## v3.6.1 — 2026-07-13
 
 **Every gateway now has its own MQTT identity.** Two of them on one broker used to knock

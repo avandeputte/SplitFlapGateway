@@ -1,9 +1,23 @@
 # Split-Flap Gateway
 
-**Firmware version: 3.5**
+**Firmware version: 3.8.0**
 
 > [!NOTE]
 > **New to this project?** Read the [blog post](BLOG.md) for the full story — why it exists, how it works, and how it fits into the split-flap display ecosystem. Calibrating a module? See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)**.
+
+> [!TIP]
+> **New in 3.8** (everything since 3.4 — see [RELEASE_NOTES.md](RELEASE_NOTES.md) for the full list)
+> - **`GET /api/capabilities`** — one call that tells a client exactly what characters the wall
+>   can show (`union`, the wall-wide `common` set, and each distinct reel with the module ids that
+>   carry it). The Matrix Portal gateway answers the same URL identically, so a client never has
+>   to know which kind of wall it is driving. See [New in 3.7](#new-in-37).
+> - **`POST /api/display/cells`** — set a whole row in one call (`{ch|color|blank|skip}` per cell,
+>   named colours, cascade pacing), the same contract the Matrix gateway answers, so the companion
+>   drives both walls through one endpoint. See [New in 3.8](#new-in-38).
+> - **Quiet Time now blanks the wall**, and **every gateway has its own MQTT identity** (two on one
+>   broker used to knock each other offline).
+> - **Safer web OTA and a security fix** — the watchdog no longer reboots the board mid-flash, and
+>   a remotely-reachable buffer overflow in the by-serial flap-config command is closed.
 
 > [!TIP]
 > **New in 3.5**
@@ -114,6 +128,31 @@
   `q` and colour translations) compiles the firmware's own `src/capset.h`, so the test exercises
   the shipped code rather than a copy of it. It covers the case that cannot be reproduced without
   physically rebuilding the wall: modules with different reels.
+
+## New in 3.8
+
+- **`POST /api/display/cells`** — set a run of modules in one call, the **same JSON contract the
+  Matrix Portal gateway answers**, so a client (the companion) can drive both walls through one
+  display endpoint instead of this wall's batch/char path and the Matrix's cells path. It is the
+  "show this" companion to `GET /api/capabilities` ("what can you show").
+
+  ```json
+  { "start": 0, "step_ms": 15,
+    "cells": [ {"ch":"H"}, {"ch":"I"}, {"color":"red"}, {"blank":true}, {"skip":true} ] }
+  ```
+
+  Each cell is exactly one of `ch` (a character), `color` (a named flag: red orange yellow green
+  blue purple white), `blank` (home the module), or `skip` (leave it alone). `step_ms` (0–30)
+  paces the cascade, scheduled on the RS-485 task rather than blocking the web server.
+
+  It is **lenient**, and that is the one real difference from the Matrix's strict form: this wall's
+  modules each carry their own reel and can differ, so a cell that cannot be shown (a glyph absent
+  from the reel, an unknown colour name) is **skipped** rather than failing the whole row — the
+  response reports `sent` vs `skipped`. Only structural errors (bad JSON, missing `cells`) return
+  400. A client that needs certainty consults `/api/capabilities` first.
+
+  Sent **by character** (`m<id>-<char>`), not by index like the Matrix: index *N* names a different
+  glyph on a module with a different reel, whereas the byte lets each module map it against its own.
 
 ## Table of Contents
 
@@ -630,6 +669,7 @@ callers:
 | `POST` | `/api/flap/char` | `{"id":5,"char":"A"}` | Show character (`id:-1` = all) |
 | `POST` | `/api/flap/index` | `{"id":5,"index":1}` | Show flap by index 0–63 |
 | `POST` | `/api/flap/text` | `{"text":"HELLO","start":0}` | Send text across sequential modules |
+| `POST` | `/api/display/cells` | `{"start":0,"step_ms":15,"cells":[{"ch":"H"},{"color":"red"},{"blank":true},{"skip":true}]}` | **(v3.8)** Set a run of modules in one call, the same contract the Matrix Portal gateway answers. Each cell is one of `ch`/`color`/`blank`/`skip`; `step_ms` (0–30) paces the cascade. **Lenient** — a cell that cannot be shown is skipped, and the response is `{ok,cells,sent,skipped}`; only structural errors 400. See [New in 3.8](#new-in-38) |
 | `POST` | `/api/flap/home` | `{"id":5}` | Home module (`id:-1` = all) |
 | `POST` | `/api/flap/version` | `{"id":5}` | Query version — waits up to 500ms, returns `{ok,id,ver,sn,stale,lastSeen}` |
 | `POST` | `/api/flap/dump` | `{"id":5}` | Fetch EEPROM fresh — waits up to 500ms (1s if SN fallback needed), returns `{ok,id,sn,dump}` |
@@ -696,6 +736,7 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
 | `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap, maintenance and quiet flags |
+| `GET` | `/api/capabilities` | — | **(v3.7)** What the wall can show: `union` (any module), `common` (every module), per-reel `sets` with the module ids that carry each, the colour flaps present by name, and `assumed`/`unknown` module lists. Answered identically by the Matrix Portal gateway. See [New in 3.7](#new-in-37) |
 | `GET` | `/api/maintenance` | — | Returns `{ok,on}` — current maintenance-mode state |
 | `POST` | `/api/mqtt/test` | `{"host":"...","port":1883,"user":"...","pass":"..."}` (all optional, defaults to saved config) | Test broker reachability + credentials without touching the live connection |
 | `POST` | `/api/maintenance` | `{"on":true}` | Enable/disable maintenance mode (ignores external MQTT commands) |
@@ -707,7 +748,7 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather","tabs":[{"id":"apps","label":"Apps"}]}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. **(v3.4)** may also advertise `tabs` — the deep links its own UI offers; the reply always carries `gwTabs`. The URL is persisted (debounced); status and tabs are runtime-only |
 | `GET` | `/api/companion/settings` | — | **(v3.1)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
 | `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.1)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.5.0"` |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.8.0"` |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
