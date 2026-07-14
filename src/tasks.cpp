@@ -163,7 +163,10 @@ void taskRS485(void* pv) {
     {
       unsigned long nowMs = millis();
       static unsigned long lastFlapQ = 0;
-      if (nowMs - lastFlapQ >= FLAPSET_QUERY_MS) {
+      // Not while an image is streaming. An 'A' reply is ~200 bytes that get parsed, ring-pushed
+      // and MQTT-queued; none of that may compete with the upload for heap. The wall is not going
+      // anywhere, and the fill resumes after the reboot.
+      if (!gOtaInProgress && nowMs - lastFlapQ >= FLAPSET_QUERY_MS) {
         int askId = -1;
         if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           for (int i = 0; i < sfModuleCount; i++) {
@@ -387,7 +390,10 @@ void taskNetwork(void* pv) {
       saveConfig();
       DBG("[CFG] companion URL settled -- persisted: %s\n", cfg.companionUrl);
     }
-    if (sfModulesDirty) {
+    // NOT during an OTA. sfModulesSave() writes FATFS -- the same SPI flash the image is being
+    // written to -- and a registry save that lands mid-upload stalls the flash long enough to
+    // starve the TCP receive path. The save is debounced anyway; it can wait for the reboot.
+    if (sfModulesDirty && !gOtaInProgress) {
       if (sfModulesDirtyMs == 0) sfModulesDirtyMs = millis();
       if (millis() - sfModulesDirtyMs > MODULE_SAVE_DEBOUNCE_MS) {
         sfModulesSave();

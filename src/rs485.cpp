@@ -16,13 +16,12 @@ static size_t sfKnownCommandLen(const uint8_t* data, size_t len);
 static uint32_t buildSerialConfig();
 static void sfQuietCapturePending(const uint8_t* data, size_t len);
 static void sfTrackFromFrame(const uint8_t* data, size_t len);
-static void* psramAlloc(const char* name, size_t bytes);
 
 // Allocate the monitor ring (PSRAM preferred). Call once from setup() before
 // any task that pushes to the ring is started.
 // Allocate a large buffer in PSRAM (preferred) or internal RAM (fallback),
 // zeroed. Logs where it landed. Returns NULL only if both allocations fail.
-static void* psramAlloc(const char* name, size_t bytes) {
+void* psramAlloc(const char* name, size_t bytes) {
   void* p = NULL;
   if (psramFound()) p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
   if (p) {

@@ -35,6 +35,10 @@ extern volatile unsigned long txCount;
 extern volatile unsigned long sfParseRejects;
 
 void psramAllocInit();
+// A large buffer in PSRAM (internal RAM as a fallback), zeroed. Internal RAM is what the
+// WiFi/TCP stack lives on during a web-OTA upload -- anything big that is not on a hot path
+// belongs here instead.
+void* psramAlloc(const char* name, size_t bytes);
 void ringPush(const RS485Msg& m);
 void ringPushCommand(char origin, const char* desc);  // log an inbound REST/MQTT command ('C' row)
 String ringDrain();
