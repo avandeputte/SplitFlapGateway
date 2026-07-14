@@ -147,6 +147,55 @@ void taskRS485(void* pv) {
       }
     }
 
+    // The flap-set fill. GET /api/capabilities answers "what can this wall show?", and to do
+    // that the gateway needs each module's reel. A module only volunteers it in the v31+ tail
+    // of an 'A' reply, and an 'A' reply is ~200 bytes: at 9600 baud, asking 45 modules costs
+    // about NINETY SECONDS of bus. So this is a TRICKLE, not a sweep -- ONE module per
+    // FLAPSET_QUERY_MS, and only ever a module whose set is not known.
+    //
+    // On a settled wall it does nothing at all: a set once learned is persisted (see
+    // sfModulesLoad), so this runs only after a module is new to the registry, after an 'N'
+    // deliberately changed a reel, or after the registry was cleared. Which is the whole reason
+    // the set is persisted rather than re-read at boot.
+    //
+    // A module that will not answer is asked FLAPSET_MAX_TRIES times and then left alone -- it
+    // reports as "unknown" in capabilities, which is the truth, rather than being asked forever.
+    {
+      unsigned long nowMs = millis();
+      static unsigned long lastFlapQ = 0;
+      if (nowMs - lastFlapQ >= FLAPSET_QUERY_MS) {
+        int askId = -1;
+        if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          for (int i = 0; i < sfModuleCount; i++) {
+            SFModule& m = sfModules[i];
+            if (!m.provisioned)                     continue;
+            if (m.flapCount > 0 && m.flapChars[0])  continue;   // known
+            if (!m.flapDueMs || nowMs < m.flapDueMs) continue;  // not due
+            // Older than v31: it cannot answer, and asking is bus time spent to learn nothing.
+            // sfFlapSetOf() reports it as "assumed" instead. An UNREAD version (fwVersion "")
+            // is not "old" -- leave it due, and the deferred version query will fill it in.
+            if (m.fwVersion[0] && atoi(m.fwVersion) > 0 && atoi(m.fwVersion) < FLAPSET_FW_MIN) {
+              m.flapDueMs = 0;
+              continue;
+            }
+            if (m.flapTries >= FLAPSET_MAX_TRIES) { m.flapDueMs = 0; continue; }   // gave up
+            m.flapTries++;
+            m.flapDueMs = nowMs + FLAPSET_RETRY_MS;   // re-arm; a reply clears it (sfParseResponse)
+            askId = m.id;
+            break;                                    // ONE per interval. It is a trickle.
+          }
+          xSemaphoreGive(sfMutex);
+        }
+        if (askId >= 0) {
+          lastFlapQ = nowMs;
+          DBG("[MOD] flap-set query -> module %d\n", askId);
+          char f[16];
+          snprintf(f, sizeof(f), "m%dA\n", askId);   // the combined reply; its tail is the set
+          rs485SendStr(f);                            // unlocked: rs485Send re-takes sfMutex
+        }
+      }
+    }
+
     // Send any scheduled batch frames now due -- /api/rs485/batch's cascade pacing,
     // moved off taskWeb so the HTTP server never blocks on delay() (see rs485.h).
     rs485PollScheduled(millis());

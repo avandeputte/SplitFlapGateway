@@ -71,6 +71,50 @@
 
 ---
 
+
+## New in 3.7
+
+- **`GET /api/capabilities`** — one call that answers *what characters can this wall show?* The
+  Matrix Portal gateway answers the same URL with the same shape, so a client never has to know
+  which kind of wall it is talking to.
+
+  On a real wall the answer is not one set. Every module owns its reel, and since module firmware
+  v31 each can be told a *different* one (`N`), so the response reports both:
+
+  | field | question it answers |
+  |---|---|
+  | `union` | can this wall show a `Z` **anywhere**? |
+  | `common` | can I lay this text across **arbitrary** cells? |
+
+  These genuinely differ. If module 1 carries `A-Z` and module 2 carries `0-9`, the union is
+  `A-Z0-9` but the common set is *empty* — the wall cannot show `HI42` wherever it likes, and
+  only `common` says so. `sets` then lists each **distinct** reel once with the ids that carry it
+  (`"0-44,50"`), so a uniform wall is a few hundred bytes however large it is.
+
+  Two translations are applied, matching exactly what the gateway does when it resolves a frame:
+  the seven colour flaps `r o y g b p w` are reported by name under `colors` and kept *out* of the
+  character sets, and `q` — which the classic reel borrows for the double-quote flap — is reported
+  as `"`. A client that read those as letters would believe a classic reel can show a lowercase
+  `w`.
+
+- **The registry now remembers each module's flap set**, read from the v31+ tail of an `A` reply
+  and **persisted**. That is not an optimisation: an `A` reply is ~200 bytes, so asking a
+  45-module wall costs about **ninety seconds of bus time** at 9600 baud. Paying that on every
+  reboot — or flooding the bus with a wall-wide `m*A` at boot — would be absurd. Unknown sets are
+  filled by a slow background trickle (one module every 2 s), a set is re-read only when an `N`
+  deliberately changes it, and the file magic is bumped to `SFG3`.
+
+  Modules older than v31 cannot report a set. Their reel is *assumed* to be the firmware's
+  built-in default and their ids are listed under `charset.assumed`, so the guess is visible
+  rather than folded in silently — a gateway that hid it would be lying at exactly the moment
+  someone had reflashed a module with a custom reel. Modules whose set is genuinely not known yet
+  are listed under `unknown` and excluded from both character sets.
+
+- **`tools/capset_test.cpp`** — the set arithmetic (union, intersection, range compression, the
+  `q` and colour translations) compiles the firmware's own `src/capset.h`, so the test exercises
+  the shipped code rather than a copy of it. It covers the case that cannot be reproduced without
+  physically rebuilding the wall: modules with different reels.
+
 ## Table of Contents
 
 - [Hardware](#hardware)

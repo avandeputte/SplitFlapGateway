@@ -1030,6 +1030,90 @@ paths:
 
   # ── Status / Config ──────────────────────────────────────────────
 
+  /api/capabilities:
+    get:
+      tags: [Status]
+      summary: What this wall can actually show
+      description: |
+        One call, made once when a client connects, that answers "what characters can this
+        display show?" without the client having to know which gateway it is talking to. The
+        Split-Flap Gateway and the Matrix Portal Gateway answer this URL with the SAME shape.
+
+        `charset.union` is every character SOME module can show ("can this wall show a Z
+        anywhere?"). `charset.common` is every character EVERY module can show ("can I lay this
+        text across arbitrary cells?"). On a real wall these can differ: if module 1 carries A-Z
+        and module 2 carries 0-9, the union is A-Z0-9 and the common set is EMPTY -- the wall
+        cannot show "HI42" wherever it likes, and only `common` says so. `uniform` is true when
+        every module carries the same reel, which is always the case on the Matrix Portal (one
+        drawn reel, rendered per cell).
+
+        `sets` reports each DISTINCT reel once, with the ids that carry it ("0-44,50"), rather
+        than one entry per module -- so a uniform wall is a few hundred bytes however large it
+        is. The `chars` of a set is the reel VERBATIM, in flap-index order, because a client
+        addressing a flap by index needs the positions rather than the alphabet.
+
+        TWO TRANSLATIONS apply to the character sets, matching what the gateway does when it
+        resolves a frame: the seven colour flaps (r o y g b p w) are reported under `colors` by
+        name and kept OUT of the character sets, and 'q' -- which the classic reel borrows for
+        the double-quote flap -- is reported as '"'.
+
+        On the Split-Flap Gateway a module only reports its reel from firmware v31. `assumed`
+        lists modules too old to report one, whose reel is taken to be the firmware's built-in
+        default; `unknown` lists modules whose reel is genuinely not known yet (the background
+        fill has not reached them, or they are off the bus) and which are excluded from both
+        character sets. Both are empty on the Matrix Portal.
+      responses:
+        "200":
+          description: Wall capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product:  { type: string, example: "Split-Flap Gateway" }
+                  fw:       { type: string, example: "3.7.0" }
+                  api:      { type: string, example: "3.1.0" }
+                  grid:
+                    type: object
+                    properties:
+                      rows: { type: integer, example: 3 }
+                      cols: { type: integer, example: 15 }
+                  modules:  { type: integer, description: "Provisioned modules on the wall", example: 45 }
+                  maxFlaps: { type: integer, description: "Flaps a module can carry (64 real, 237 drawn)", example: 64 }
+                  colors:
+                    type: array
+                    description: "The colour flaps the wall actually has, by name. A custom reel with no colour codes reports none."
+                    items: { type: string }
+                    example: ["red","orange","yellow","green","blue","purple","white"]
+                  charset:
+                    type: object
+                    properties:
+                      union:   { type: string, description: "Every character SOME module can show" }
+                      common:  { type: string, description: "Every character EVERY module can show" }
+                      uniform: { type: boolean, description: "true when every module carries the same reel" }
+                      assumed:
+                        type: array
+                        description: "Module ids whose reel is the firmware default, assumed rather than reported (fw < 31)"
+                        items: { type: integer }
+                      unknown:
+                        type: array
+                        description: "Module ids whose reel is not known; excluded from union and common"
+                        items: { type: integer }
+                  sets:
+                    type: array
+                    description: "Each distinct reel once, with the ids that carry it"
+                    items:
+                      type: object
+                      properties:
+                        flaps:   { type: integer, example: 64 }
+                        source:  { type: string, enum: [reported, assumed, builtin] }
+                        chars:   { type: string, description: "The reel verbatim, in flap-index order" }
+                        modules: { type: string, description: "Compressed id list", example: "0-44,50" }
+                  features:
+                    type: array
+                    items: { type: string }
+                    example: ["colors","index","batch","quiet","maintenance","ha","ota","flapconfig"]
+
   /api/status:
     get:
       tags: [Status]

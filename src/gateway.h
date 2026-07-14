@@ -26,6 +26,7 @@
 #include "rtc.h"
 #include "rs485.h"
 #include "modules.h"
+#include "capset.h"
 #include "mqtt.h"
 #include "ota.h"
 #include "web.h"

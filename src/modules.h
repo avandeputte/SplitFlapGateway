@@ -48,6 +48,20 @@ struct SFModule {
   uint8_t       dupRejectCount;  // corrupt version/all rejects in the current window
   unsigned long dupRejectTs;     // millis() of the most recent corrupt reject (0 = none)
   bool          dupSuspect;      // latched: likely duplicate ID on the bus
+  // The module's own reel -- what it can actually show. Read from the v31+ tail of an 'A'
+  // reply, cached here and PERSISTED, because asking the whole wall costs ~90 s of bus time
+  // (see the flap-set note in common.h). GET /api/capabilities is built from these.
+  //   flapCount == -99  the set is NOT KNOWN. Either the module has never been asked, or it is
+  //                     older than v31 and cannot answer -- capabilities tells those apart by
+  //                     fwVersion, and reports the old ones as "assumed" rather than guessing
+  //                     silently.
+  int16_t       flapCount;                    // active flaps (1..64), -99 = not known
+  char          flapChars[SF_MAX_FLAPS + 1];  // the ordered set, "" = not known
+  // Background fill: the gateway asks ONE unknown module at a time, slowly, so the trickle
+  // never competes with the display for the bus. Runtime only -- a set once learned is
+  // persisted, so this does nothing at all on a settled wall.
+  unsigned long flapDueMs;   // millis() to (re)ask this module (0 = not scheduled)
+  uint8_t       flapTries;   // attempts so far; give up at FLAPSET_MAX_TRIES
 };
 
 // ------------------------------------------------------------------
@@ -71,6 +85,10 @@ struct PersistedModule {
   bool          acked;          // provisioning-confirmed (never legacy)
   char          fwVersion[8];
   unsigned long lastSeenEpoch;
+  // The module's reel. Persisted for one reason: re-reading it costs ~90 s of bus time across a
+  // 45-module wall, and it changes only when someone deliberately changes it ('N').
+  int16_t       flapCount;                    // -99 = not known
+  char          flapChars[SF_MAX_FLAPS + 1];  // "" = not known
 };
 
 struct ModulesFileHeader {
@@ -140,6 +158,13 @@ extern bool sfFsReady;
 
 SFModule* sfFindById(uint8_t id);
 void sfFsInit();
+// The flap set a module is BELIEVED to have, and how sure the gateway is of it.
+enum FlapSetSource { FLAPSET_REPORTED, FLAPSET_ASSUMED, FLAPSET_UNKNOWN };
+// Fills `out` (SF_MAX_FLAPS+1 bytes) with the module's set and says where it came from.
+// Call with sfMutex HELD.
+FlapSetSource sfFlapSetOf(const SFModule& m, char* out);
+// Forget a module's cached set (-1 = all) and re-read it. Only an 'N' invalidates one.
+void sfInvalidateFlapSet(int addr);
 void sfModulesSave();
 void sfModulesLoad();
 void sfModulesClear();

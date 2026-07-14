@@ -130,7 +130,14 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.6.1"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.7.0"         // gateway firmware version (UI + boot log)
+// What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
+// a client can tell a real split-flap wall from the Matrix Portal emulation of one without
+// sniffing the firmware version -- they answer the same URLs with the same shape, and the
+// differences that matter (a fixed reel per module vs one shared reel; colours as flaps vs
+// colours as names) are exactly what capabilities describes.
+#define PRODUCT_NAME         "Split-Flap Gateway"
+#define API_VERSION          "3.1.0"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -205,8 +212,37 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 #define DUP_ID_REJECT_THRESHOLD 3         // this many within the window -> flag a possible duplicate ID
 
 /* ---- Persisted module-registry file (FFat) ---- */
+
+/* ---- The flap set: what each module can actually show ----
+   A module owns its own reel, and since firmware v31 it can be TOLD a different one ('N'), so
+   two modules on the same bus need not agree. GET /api/capabilities answers "what can this wall
+   show?", and to answer it the gateway has to know each module's set.
+
+   It learns one from an 'A' reply, whose v31+ tail carries :<flapCount>:<flapChars>. That reply
+   is ~200 bytes; at 9600 baud, asking 45 modules costs about NINETY SECONDS of bus time. So it
+   is asked once, cached in the registry, and PERSISTED -- paying that on every reboot would be
+   absurd, and a wall-wide m*A at boot would flood the bus for a minute and a half. Unknown sets
+   are filled by a slow background trickle (one module per FLAPSET_QUERY_MS), and a set is
+   re-read only when something invalidates it: an 'N' that changes it, or a module the gateway
+   has never asked. */
+#define FLAPSET_QUERY_MS      2000UL   // at most one 'A' flap-set query per this interval
+#define FLAPSET_RETRY_MS     20000UL   // a module that didn't answer: wait this long, try again
+#define FLAPSET_MAX_TRIES         3    // then give up; it reports as "unknown", not as a lie
+#define FLAPSET_FW_MIN           31    // the firmware that first reports its set at all
+
+// The reel a module firmware is BUILT with (FLAP_CHARS in SplitFlapUniversalFirmware). A module
+// older than v31 cannot tell the gateway its set, and this is what it almost certainly has --
+// but "almost certainly" is not "reported", so /api/capabilities lists those modules under
+// "assumed" rather than folding the guess in silently.
+//
+// 'q' is not the letter q. The classic reel has no lowercase, so the char map borrowed that byte
+// for the DOUBLE-QUOTE flap -- and r/o/y/g/b/p/w are the seven COLOUR flaps, not letters. Both
+// are protocol, not repertoire, which is why capabilities reports '"' and a colour list rather
+// than 'q' and seven stray consonants.
+#define FLAPSET_DEFAULT " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw"
+#define FLAP_COLOUR_CODES  "roygbpw"
 #define MODULES_FILE     "/modules.dat"
-#define MODULES_MAGIC    0x53464732UL   // "SFG2" (bumped: PersistedModule gained 'acked')
+#define MODULES_MAGIC    0x53464733UL   // "SFG3" (bumped: PersistedModule gained the flap set)
 
 /* ---- Companion settings blob (FFat) -- v3.1 --------------------------------
  * The companion app can park its settings here so its container stays stateless.

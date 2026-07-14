@@ -73,6 +73,14 @@ static SFModule* sfUpsert(uint8_t id, const char* sn) {
     m->id = id;
     m->flapIndex = -1;
     m->flapChar  = 0;
+    // Its reel is not known yet, and memset would have said "0 flaps" -- which is a lie a
+    // capabilities response would repeat. -99 means NOT KNOWN, and schedules the background
+    // fill to go and ask. (A module loaded from FATFS overwrites both: its set is already
+    // known, and asking again would spend ~2 s of bus time to learn what we wrote down.)
+    m->flapCount = -99;
+    m->flapChars[0] = 0;
+    m->flapDueMs = millis() + FLAPSET_QUERY_MS;
+    m->flapTries = 0;
     isNew = true;
   }
   if (sn && sn[0]) strlcpy(m->serialNum, sn, sizeof(m->serialNum));
@@ -107,6 +115,35 @@ void sfFsInit() {
 }
 
 // Save the current registry to the FATFS file.
+// What reel does this module have, and how do we know?
+//
+//   REPORTED  it told us, in the v31+ tail of an 'A' reply. This is the only answer that is
+//             evidence rather than inference.
+//   ASSUMED   it is older than v31 and CANNOT tell us. It almost certainly has the reel its
+//             firmware was built with (FLAPSET_DEFAULT), and saying so is far more useful than
+//             saying nothing -- but "almost certainly" is not "reported", so /api/capabilities
+//             lists these modules by id under "assumed" and lets the caller decide how much to
+//             trust the guess. A gateway that folded the guess in silently would be lying at
+//             exactly the moment someone had reflashed a module with a custom reel.
+//   UNKNOWN   v31+, but it has not answered yet (the background fill has not reached it, or it
+//             is off the bus). Not a guess and not a fact: excluded from the union entirely.
+//
+// Call with sfMutex HELD. `out` must have room for SF_MAX_FLAPS + 1.
+FlapSetSource sfFlapSetOf(const SFModule& m, char* out) {
+  if (m.flapCount > 0 && m.flapChars[0]) {
+    strlcpy(out, m.flapChars, SF_MAX_FLAPS + 1);
+    return FLAPSET_REPORTED;
+  }
+  // No set, and old enough to be unable to give one. atoi("") is 0, so an UNREAD version is not
+  // mistaken for an ancient one -- that module is unknown, not assumed.
+  if (m.fwVersion[0] && atoi(m.fwVersion) > 0 && atoi(m.fwVersion) < FLAPSET_FW_MIN) {
+    strlcpy(out, FLAPSET_DEFAULT, SF_MAX_FLAPS + 1);
+    return FLAPSET_ASSUMED;
+  }
+  out[0] = 0;
+  return FLAPSET_UNKNOWN;
+}
+
 void sfModulesSave() {
   if (!sfFsReady) return;
   // Build a compact array of durable records under sfMutex.
@@ -121,6 +158,8 @@ void sfModulesSave() {
     recs[n].acked         = m.acked;
     strlcpy(recs[n].fwVersion, m.fwVersion, sizeof(recs[n].fwVersion));
     recs[n].lastSeenEpoch = m.lastSeenEpoch;
+    recs[n].flapCount     = m.flapCount;
+    strlcpy(recs[n].flapChars, m.flapChars, sizeof(recs[n].flapChars));
     n++;
   }
   if (sfMutex) xSemaphoreGive(sfMutex);
@@ -194,6 +233,8 @@ void sfModulesLoad() {
     m->provisioned   = recs[i].provisioned;
     m->acked         = recs[i].acked;
     strlcpy(m->fwVersion, recs[i].fwVersion, sizeof(m->fwVersion));
+    m->flapCount = recs[i].flapCount;                                  // ~90 s of bus time,
+    strlcpy(m->flapChars, recs[i].flapChars, sizeof(m->flapChars));    // not re-read at boot
     m->lastSeenEpoch = recs[i].lastSeenEpoch;
     m->flapIndex     = -1;
     m->flapChar      = 0;
@@ -424,6 +465,28 @@ void sfSetFlapConfig(int addr, int count, const char* chars) {
   if (hasChars) n += snprintf(buf + n, sizeof(buf) - n, ":%s", chars);
   snprintf(buf + n, sizeof(buf) - n, "\n");
   rs485SendStr(buf);
+  sfInvalidateFlapSet(addr);     // 'N' silently changes the reel: what we cached is now a lie
+}
+
+// The cached flap set of `addr` (-1 = the whole wall) is stale: drop it and let the background
+// fill re-read it. Called whenever something changes a reel out from under the cache -- which
+// is only ever an 'N'. The module does not acknowledge an 'N', so there is nothing to wait for;
+// forgetting is the only honest thing to do, and the fill will have the truth back within a few
+// seconds. NEVER call with sfMutex held (it takes it).
+void sfInvalidateFlapSet(int addr) {
+  if (!sfModules || !sfMutex) return;
+  if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  unsigned long due = millis() + FLAPSET_QUERY_MS;
+  for (int i = 0; i < sfModuleCount; i++) {
+    SFModule& m = sfModules[i];
+    if (addr >= 0 && m.id != (uint8_t)addr) continue;
+    m.flapCount    = -99;
+    m.flapChars[0] = 0;
+    m.flapTries    = 0;
+    m.flapDueMs    = due;
+    sfModulesDirty = true;
+  }
+  xSemaphoreGive(sfMutex);
 }
 
 // Configure the flap set by serial number (mXN<sn>:<count>:<chars>). The two
@@ -441,6 +504,14 @@ void sfSetFlapConfigBySN(const char* sn, int count, const char* chars) {
   if (hasChars) n += snprintf(buf + n, sizeof(buf) - n, "%s", chars);
   snprintf(buf + n, sizeof(buf) - n, "\n");
   rs485SendStr(buf);
+  // Same invalidation as the by-id form, but the id is not in hand: resolve it through the
+  // serial the registry already keys on.
+  if (sfModules && sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    SFModule* m = sfFindBySN(sn);
+    int id = m ? (int)m->id : -1;
+    xSemaphoreGive(sfMutex);
+    if (id >= 0) sfInvalidateFlapSet(id);
+  }
 }
 
 // Provisioning variants (address mX by serial number)
@@ -1103,6 +1174,27 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       gDump.flapCount  = aFlapCount;   // v31+ flap-config tail (-99 if not present)
       strlcpy((char*)gDump.flapChars, aFlapChars, sizeof(gDump.flapChars));
       gDump.ts = millis();
+    }
+
+    // The flap set goes to the REGISTRY too, and it does so whoever asked. gDump above is a
+    // capture for the one client waiting on this dump; the registry is the gateway's own
+    // memory of what this module can show, and /api/capabilities is built from it. Storing it
+    // here means any 'A' reply -- a dump the UI asked for, the background fill, an Identify --
+    // teaches the gateway the set, and it is then persisted and never asked for again.
+    if (aFlapCount > 0 && aFlapChars[0]) {
+      if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+      SFModule* fm = sfFindById(id);
+      if (fm) {
+        if (fm->flapCount != aFlapCount || strcmp(fm->flapChars, aFlapChars) != 0) {
+          fm->flapCount = (int16_t)aFlapCount;
+          strlcpy(fm->flapChars, aFlapChars, sizeof(fm->flapChars));
+          sfModulesDirty = true;                   // worth a flash write: it never changes
+          DBG("[MOD] module %d flap set: %d flaps '%s'\n", id, aFlapCount, aFlapChars);
+        }
+        fm->flapDueMs = 0;                         // answered: stop asking
+        fm->flapTries = 0;
+      }
+      if (sfMutex) xSemaphoreGive(sfMutex);
     }
     DBG("[SF] Module %d ALL fw:%s reportedId:%d sn:%s ho:%s ts:%s\n",
         id, fwCopy, reportedId, f[2] ? f[2] : "", f[3] ? f[3] : "", f[4] ? f[4] : "");

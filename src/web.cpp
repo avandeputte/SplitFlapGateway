@@ -51,6 +51,7 @@ static void handleApiCompanionSettingsRaw();
 static void handleApiRestoreBySN();
 static void handleApiSend();
 static void handleApiSendBatch();
+static void handleApiCapabilities();
 static void handleApiStatus();
 static void handleApiText();
 static void handleApiTotalSteps();
@@ -837,6 +838,183 @@ static void handleApiHomeBySN() {
   DBG("[API] home by SN %s\n", sn);
   sfHomeBySN(sn);
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+/* ----------------------------------------------------------
+   GET /api/capabilities -- what this wall can actually show
+   ----------------------------------------------------------
+   One call, made once when a client connects, that answers "what characters can this display
+   show?" without the client having to know what kind of gateway it is talking to. The Matrix
+   Portal gateway answers the same question at the same URL with the same shape; there the wall
+   is drawn and every cell shares one reel, so its answer is always uniform. Here the wall is
+   real: every module owns its reel, firmware v31 lets each be told a DIFFERENT one, and so the
+   honest answer can be several sets at once.
+
+     union    every character SOME module can show. "Can this wall show a Z anywhere?"
+     common   every character EVERY module can show. "Can I lay this text across arbitrary
+              cells?" -- and on a mixed wall these genuinely differ. If module 1 has A-Z and
+              module 2 has 0-9, the union is A-Z0-9 and the common set is EMPTY: the wall
+              cannot show "HI42" wherever it likes, and only `common` says so.
+     sets     each DISTINCT reel once, with the ids that use it. A uniform wall is one entry
+              and one range -- a few hundred bytes however big the wall -- and a mixed wall
+              costs one entry per genuinely different reel, which is the information rather
+              than a repetition of it.
+
+   TWO TRANSLATIONS, because the wire is not the repertoire.
+     * r o y g b p w are the seven COLOUR flaps, not letters. They are reported under "colors",
+       by name, and kept out of the character union -- a client that read them as letters would
+       believe a classic reel can show a lowercase w.
+     * 'q' is not the letter q. The classic reel has no lowercase, so its char map borrowed that
+       byte for the DOUBLE-QUOTE flap. It is reported as '"', which is what the flap shows.
+   Both translations are exactly what sfSendChar() does when it resolves a frame, so what this
+   endpoint promises is what the wall will actually do.                                        */
+static const char* const CAP_COLOUR_NAMES[7] = {
+  "red", "orange", "yellow", "green", "blue", "purple", "white"   // in FLAP_COLOUR_CODES order
+};
+
+// Stream a byte map as a JSON string, in reel order (ASCII, then the high bytes).
+static void capSendMap(const bool* map) {
+  for (int b = 0x20; b < 256; b++) {
+    if (!map[b]) continue;
+    char utf8[8] = "";
+    char one[12];
+    if (b == '"' || b == '\\') { snprintf(one, sizeof(one), "\\%c", b); }
+    else {
+      size_t n = flapByteToUtf8((uint8_t)b, utf8);
+      utf8[n] = 0;
+      snprintf(one, sizeof(one), "%s", utf8);
+    }
+    server.sendContent(one);
+  }
+}
+
+static void handleApiCapabilities() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.client().setConnectionTimeout(1500);
+
+  // Snapshot the wall under the lock -- one reel per module, plus where it came from -- and do
+  // every byte of the work below OUTSIDE it. taskRS485 must not wait on a socket write.
+  static char          reel[MAX_MODULES][SF_MAX_FLAPS + 1];
+  static uint8_t       ids[MAX_MODULES];
+  static FlapSetSource src[MAX_MODULES];
+  int n = 0;
+  if (sfMutex && xSemaphoreTake(sfMutex, portMAX_DELAY) == pdTRUE) {
+    for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {
+      const SFModule& m = sfModules[i];
+      if (!m.provisioned) continue;
+      ids[n] = m.id;
+      src[n] = sfFlapSetOf(m, reel[n]);
+      n++;
+    }
+    xSemaphoreGive(sfMutex);
+  }
+
+  bool uni[256] = {false}, com[256] = {false};
+  bool anyKnown = false, uniform = true;
+  const char* firstReel = NULL;
+  for (int i = 0; i < n; i++) {
+    if (src[i] == FLAPSET_UNKNOWN) { uniform = false; continue; }   // no reel: nothing to fold
+    capFoldReel(reel[i], uni, com, !anyKnown);
+    if (!anyKnown) firstReel = reel[i];
+    else if (strcmp(firstReel, reel[i]) != 0) uniform = false;
+    anyKnown = true;
+  }
+  if (!anyKnown) { memset(com, 0, sizeof(com)); uniform = false; }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  char head[256];
+  snprintf(head, sizeof(head),
+           "{\"product\":\"%s\",\"fw\":\"%s\",\"api\":\"%s\","
+           "\"grid\":{\"rows\":%d,\"cols\":%d},\"modules\":%d,\"maxFlaps\":%d,",
+           PRODUCT_NAME, FW_VERSION, API_VERSION, cfg.gridRows, cfg.gridCols, n, SF_MAX_FLAPS);
+  server.sendContent(head);
+
+  // The colour flaps the wall actually HAS. A custom 40-flap reel with no colour codes in it
+  // reports none, and that is not a technicality -- asking such a module for red would hang the
+  // display on a flap that does not exist.
+  server.sendContent("\"colors\":[");
+  { bool firstC = true;
+    for (int c = 0; FLAP_COLOUR_CODES[c]; c++) {
+      bool have = false;
+      for (int i = 0; i < n && !have; i++)
+        if (src[i] != FLAPSET_UNKNOWN && strchr(reel[i], FLAP_COLOUR_CODES[c])) have = true;
+      if (!have) continue;
+      char one[16];
+      snprintf(one, sizeof(one), "%s\"%s\"", firstC ? "" : ",", CAP_COLOUR_NAMES[c]);
+      server.sendContent(one);
+      firstC = false;
+    } }
+  server.sendContent("],");
+
+  char mid[48];
+  snprintf(mid, sizeof(mid), "\"charset\":{\"uniform\":%s,\"union\":\"", uniform ? "true" : "false");
+  server.sendContent(mid);
+  capSendMap(uni);
+  server.sendContent("\",\"common\":\"");
+  capSendMap(com);
+  server.sendContent("\",\"assumed\":[");
+  { bool f1 = true;
+    for (int i = 0; i < n; i++) {
+      if (src[i] != FLAPSET_ASSUMED) continue;
+      char one[8]; snprintf(one, sizeof(one), "%s%u", f1 ? "" : ",", (unsigned)ids[i]);
+      server.sendContent(one); f1 = false;
+    } }
+  server.sendContent("],\"unknown\":[");
+  { bool f2 = true;
+    for (int i = 0; i < n; i++) {
+      if (src[i] != FLAPSET_UNKNOWN) continue;
+      char one[8]; snprintf(one, sizeof(one), "%s%u", f2 ? "" : ",", (unsigned)ids[i]);
+      server.sendContent(one); f2 = false;
+    } }
+  server.sendContent("]},\"sets\":[");
+
+  // Each DISTINCT reel once, with the ids that carry it as a compact range list ("0-44,50").
+  // This is what keeps the response small: 45 modules with one reel between them is one entry,
+  // not 45 copies of the same 64 characters.
+  wdgWebMs = millis();
+  static bool    done[MAX_MODULES];
+  static uint8_t share[MAX_MODULES];        // the ids carrying the reel being emitted
+  memset(done, 0, sizeof(done));
+  bool firstSet = true;
+  for (int i = 0; i < n; i++) {
+    if (done[i] || src[i] == FLAPSET_UNKNOWN) continue;
+
+    // Everyone with this exact reel, in id order (the snapshot is already in id order).
+    int k = 0;
+    for (int j = i; j < n; j++) {
+      if (done[j] || src[j] == FLAPSET_UNKNOWN) continue;
+      if (strcmp(reel[j], reel[i]) != 0)          continue;
+      done[j] = true;
+      share[k++] = ids[j];
+    }
+
+    char one[SF_MAX_FLAPS + 96];
+    snprintf(one, sizeof(one), "%s{\"flaps\":%d,\"source\":\"%s\",\"chars\":\"",
+             firstSet ? "" : ",", (int)strlen(reel[i]),
+             src[i] == FLAPSET_REPORTED ? "reported" : "assumed");
+    server.sendContent(one);
+    // The reel VERBATIM -- the byte order a module addresses by INDEX, colour codes and all.
+    // The union above is a repertoire; this is the reel itself, because a client setting a flap
+    // by index needs the positions, not the alphabet.
+    { char esc[SF_MAX_FLAPS * 3 + 1];
+      flapToJsonUtf8(reel[i], strlen(reel[i]), esc, sizeof(esc), 0);
+      server.sendContent(esc); }
+    server.sendContent("\",\"modules\":\"");
+    { char ranges[128];
+      capRangeList(share, k, ranges, sizeof(ranges));
+      server.sendContent(ranges); }
+    server.sendContent("\"}");
+    firstSet = false;
+    wdgWebMs = millis();
+  }
+  server.sendContent("],");
+
+  // What the wall can DO, not just show, so a client reads this instead of sniffing the
+  // firmware version and guessing.
+  server.sendContent("\"features\":[\"colors\",\"index\",\"batch\",\"quiet\",\"maintenance\","
+                     "\"ha\",\"ota\",\"flapconfig\"]}");
+  server.sendContent("");
 }
 
 // GET /api/status
@@ -1971,6 +2149,8 @@ void webInit() {
   server.on("/api/flap/restorebysn",     HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/flapconfig",      HTTP_POST,    handleApiFlapConfig);
   server.on("/api/flap/flapconfig",      HTTP_OPTIONS, handleOptions);
+  server.on("/api/capabilities",     HTTP_GET,     handleApiCapabilities);
+  server.on("/api/capabilities",     HTTP_OPTIONS, handleOptions);
   server.on("/api/status",           HTTP_GET,     handleApiStatus);
   server.on("/api/mqtt/test",        HTTP_POST,    handleApiMqttTest);
   server.on("/api/mqtt/test",        HTTP_OPTIONS, handleOptions);
