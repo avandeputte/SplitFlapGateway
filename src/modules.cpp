@@ -373,18 +373,25 @@ void sfTrackChar(int addr, char c) {
 // through verbatim -- uppercasing them would turn a colour request into a letter.
 // Bytes that aren't a valid flap glyph (controls, undefined slots, the 0x00/0xFF
 // firmware sentinels) are dropped.
+// Resolve a Windows-1252 byte to the flap byte that actually goes on the wire, or 0 if it is
+// not a displayable glyph. Two rules, and they are the reel's, not this function's:
+//   * ASCII lowercase folds to uppercase (the classic reel is printed in capitals) -- EXCEPT
+//     the seven colour codes r/o/y/g/b/p/w, which the protocol conveys as lowercase letters, so
+//     folding them would turn a colour request into a letter.
+//   * '"' maps to 'q', the reel's double-quote alias (the reel has no lowercase, so it borrowed
+//     that byte). GET /api/capabilities advertises the flap as '"', so a caller asking for '"'
+//     must reach it; without the map a '"' went out as byte 0x22, which no reel contains.
+// Shared by sfSendChar and POST /api/display/cells so the two can never disagree about what a
+// byte means (the audit's q-vs-'"' finding was exactly such a disagreement).
+uint8_t sfResolveFlapByte(uint8_t b) {
+  if (b >= 'a' && b <= 'z' && !strchr("roygbpw", (char)b)) b = (uint8_t)(b - 'a' + 'A');
+  if (b == '"') b = 'q';                                     // after the fold, or 'q'->'Q' undoes it
+  return isFlapByte(b) ? b : 0;
+}
+
 void sfSendChar(int addr, char c) {
-  uint8_t b = (uint8_t)c;
-  if (b >= 'a' && b <= 'z' && !strchr("roygbpw", (char)b))   // uppercase ASCII only,
-    b = (uint8_t)(b - 'a' + 'A');                            // but keep colour codes
-  // The classic reel addresses its double-quote flap by the byte 'q' (splitflap-os's alias --
-  // the reel has no lowercase, so it borrowed that byte). GET /api/capabilities reports that
-  // flap as the character it shows, '"', so a client that asks for '"' must reach it. Map it
-  // here, AFTER the fold above -- do it before and the a-z fold would turn 'q' back into 'Q'.
-  // Without this, a '"' was sent as byte 0x22, which no module's reel contains, so it silently
-  // did nothing while capabilities advertised it.
-  if (b == '"') b = 'q';
-  if (!isFlapByte(b)) return;                                 // not a valid flap glyph
+  uint8_t b = sfResolveFlapByte((uint8_t)c);
+  if (!b) return;                                            // not a valid flap glyph
   char buf[24];
   if (addr < 0)
     snprintf(buf, sizeof(buf), "m*-%c\n", b);

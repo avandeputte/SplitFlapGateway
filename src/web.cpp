@@ -24,6 +24,7 @@ static void handleApiDiag();
 static void handleApiDiagMech();
 static void handleApiDiagStatus();
 static void handleApiDisplayState();
+static void handleApiDisplayCells();
 static void handleApiDump();
 static void handleApiDumpBySN();
 static void handleApiErase();
@@ -1092,6 +1093,100 @@ static void handleApiCapabilities() {
          "\"ha\",\"ota\",\"flapconfig\"]}");
   capFlush();                 // the body -- everything above is still sitting in capBuf
   server.sendContent("");     // the terminating chunk
+}
+
+/* POST /api/display/cells -- set a row of cells in ONE call, the same contract the Matrix
+ * Portal gateway answers, so a client (the companion) can drive both walls through a single
+ * display endpoint instead of this wall's batch/char path and the Matrix's cells path. It is
+ * the "show this" half whose "what can you show" half is GET /api/capabilities.
+ *
+ * Body: { "start": 0, "step_ms": 15, "cells": [ {ch|color|blank|skip}, ... ] }
+ *   start     first module id the cells land on (default 0). id = start + position.
+ *   step_ms   0..30, paces the cascade -- SCHEDULED on taskRS485, never a delay() here (a
+ *             blocking wait would freeze the one-connection HTTP server; see the batch API).
+ *   cells     one per module, left to right, each exactly one of:
+ *               {"ch":"A"}        a character. Lowercase folds to uppercase, '"' reaches the
+ *                                 reel's double-quote flap, accents pass through; the MODULE
+ *                                 resolves the byte against its own reel.
+ *               {"color":"red"}   a colour flap, NAMED: red orange yellow green blue purple white
+ *               {"blank":true}    home the module
+ *               {"skip":true}     leave the module alone
+ *
+ * LENIENT, and that is the one real difference from the Matrix's strict form. This wall's
+ * modules each carry their OWN 64-flap reel and can differ, so "can this be shown" is per
+ * module and may not even be known yet -- a cell that cannot be shown is SKIPPED, not a 400
+ * that discards the whole row. The response reports sent vs skipped so a caller that wants
+ * precision can consult /api/capabilities first. Structural errors (bad JSON, no cells) still
+ * 400.
+ *
+ * Sent BY CHARACTER (m<id>-<char>), not by index like the Matrix: index N names a different
+ * glyph on a module with a different reel, whereas the byte lets each module map it against its
+ * own reel. Same JSON in, hardware-appropriate frame out.
+ */
+static void handleApiDisplayCells() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendJsonError(400, "Bad JSON"); return;
+  }
+  JsonArray cells = doc["cells"].as<JsonArray>();
+  if (cells.isNull()) { sendJsonError(400, "'cells' array required"); return; }
+  int start = doc["start"] | 0;
+  if (start < 0 || start > 254) { sendJsonError(400, "'start' must be 0..254"); return; }
+  int step = doc["step_ms"] | 0;
+  if (step < 0)  step = 0;
+  if (step > 30) step = 30;
+
+  { char cd[48]; snprintf(cd, sizeof(cd), "cells from id %d, step=%dms", start, step);
+    ringPushCommand('R', cd); }
+
+  int n = 0, sent = 0, skipped = 0;
+  uint32_t due = millis();
+  for (JsonObjectConst c : cells) {
+    int id = start + n;
+    if (id > 254) break;            // ran off the addressable range; stop counting here
+    n++;
+
+    char frame[24];
+    int  flen = 0;
+
+    if (c["skip"].is<bool>() && c["skip"].as<bool>()) {
+      skipped++; continue;                                   // leave the module as it is
+    } else if (c["blank"].is<bool>() && c["blank"].as<bool>()) {
+      flen = snprintf(frame, sizeof(frame), "m%dh\n", id);   // home
+    } else if (c["color"].is<const char*>()) {
+      const char* name = c["color"].as<const char*>();
+      int ci = -1;
+      for (int k = 0; k < 7; k++)
+        if (name && strcasecmp(name, CAP_COLOUR_NAMES[k]) == 0) { ci = k; break; }
+      if (ci < 0) { skipped++; continue; }                   // unknown colour name: lenient skip
+      flen = snprintf(frame, sizeof(frame), "m%d-%c\n", id, FLAP_COLOUR_CODES[ci]);
+    } else if (c["ch"].is<const char*>()) {
+      const char* ch = c["ch"].as<const char*>();
+      char enc[8];
+      utf8ToFlap(ch ? ch : "", enc, sizeof(enc));            // UTF-8 -> CP1252 byte(s)
+      uint8_t b = enc[0] ? sfResolveFlapByte((uint8_t)enc[0]) : 0;
+      if (!b) { skipped++; continue; }                       // no showable glyph: lenient skip
+      flen = snprintf(frame, sizeof(frame), "m%d-%c\n", id, b);
+    } else {
+      skipped++; continue;                                   // malformed cell: lenient skip
+    }
+
+    // Pace by SCHEDULING (like the batch API). step==0 or a full queue -> send now.
+    if (step > 0 && rs485SendScheduled((const uint8_t*)frame, (size_t)flen, due)) {
+      due += (uint32_t)step;
+    } else {
+      rs485Send((const uint8_t*)frame, (size_t)flen, false);
+    }
+    sent++;
+    wdgWebMs = millis();
+  }
+
+  char resp[80];
+  snprintf(resp, sizeof(resp),
+           "{\"ok\":true,\"cells\":%d,\"sent\":%d,\"skipped\":%d}", n, sent, skipped);
+  server.send(200, "application/json", resp);
 }
 
 // GET /api/status
@@ -2172,6 +2267,8 @@ void webInit() {
   server.on("/api/rs485/batch",      HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/modules",     HTTP_GET,     handleApiModules);
   server.on("/api/display/state",    HTTP_GET,     handleApiDisplayState);
+  server.on("/api/display/cells",    HTTP_POST,    handleApiDisplayCells);
+  server.on("/api/display/cells",    HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/identify",    HTTP_POST,    handleApiIdentify);
   server.on("/api/flap/identify",    HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/char",        HTTP_POST,    handleApiChar);

@@ -294,6 +294,70 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
+  /api/display/cells:
+    post:
+      tags: [Modules]
+      summary: Set a row of cells in one call (companion display path)
+      description: |
+        Sets a run of modules in a single request, using the SAME JSON contract as the Matrix
+        Portal gateway's `/api/display/cells`, so a client can drive either wall through one
+        endpoint. It is the "show this" companion to GET /api/capabilities ("what can you show").
+
+        Each cell is exactly one of `ch` (a character), `color` (a named colour flag), `blank`
+        (home the module), or `skip` (leave it alone). Cell `i` addresses module `start + i`.
+        `step_ms` (0..30) paces the cascade; it is scheduled on the RS-485 task, never a blocking
+        delay.
+
+        LENIENT: this wall's modules each carry their own reel and may differ, so a cell that
+        cannot be shown (a glyph absent from the reel, an unknown colour name, a malformed cell)
+        is SKIPPED rather than failing the whole row. The response reports `sent` vs `skipped`;
+        a client that needs certainty should consult /api/capabilities first. Only structural
+        errors (bad JSON, missing `cells`) return 400.
+
+        Sent by CHARACTER (`m<id>-<char>`), so each module resolves the byte against its own
+        reel; lowercase folds to uppercase and `"` reaches the double-quote flap.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cells]
+              properties:
+                start:   { type: integer, description: "First module id (default 0)", example: 0 }
+                step_ms: { type: integer, description: "Cascade pacing, 0..30 ms", example: 15 }
+                cells:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      ch:    { type: string,  description: "A character to show" }
+                      color: { type: string,  enum: [red, orange, yellow, green, blue, purple, white] }
+                      blank: { type: boolean, description: "Home the module" }
+                      skip:  { type: boolean, description: "Leave the module unchanged" }
+            example:
+              start: 0
+              step_ms: 15
+              cells:
+                - { ch: "H" }
+                - { ch: "I" }
+                - { color: "red" }
+                - { blank: true }
+      responses:
+        "200":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean }
+                  cells:   { type: integer, description: "Cells processed" }
+                  sent:    { type: integer, description: "Frames transmitted" }
+                  skipped: { type: integer, description: "Cells that could not be shown" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
   /api/flap/home:
     post:
       tags: [Modules]

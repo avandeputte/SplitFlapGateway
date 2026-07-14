@@ -171,6 +171,9 @@ void sfModulesClear();
 void sfModulesPruneStale();
 void sfTrackChar(int addr, char c);
 void sfSendChar(int addr, char c);
+// The wire byte for a CP1252 byte (uppercase fold except colour codes; '"' -> 'q'), or 0 if it
+// is not a displayable flap glyph. Shared by sfSendChar and POST /api/display/cells.
+uint8_t sfResolveFlapByte(uint8_t b);
 void sfSendIndex(int addr, int idx);
 void sfHomeOffset(int addr, int steps);
 void sfSetTotalSteps(int addr, int steps);
