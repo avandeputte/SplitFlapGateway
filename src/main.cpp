@@ -1,4 +1,5 @@
 #include "gateway.h"
+#include <esp_ota_ops.h>   // esp_ota_get_running_partition(): which slot are we actually running?
 
 // After this many crash/watchdog reboots in a row, the boot logic reformats FATFS -- a corrupt
 // filesystem is the one thing that can crash a flash write and boot-loop the board. See setup().
@@ -35,6 +36,11 @@ void setup() {
   { unsigned long t = millis(); while (!Serial && millis() - t < 3000) delay(10); }
   delay(200);
   printf("\n[Boot] Split-Flap Gateway v%s\n", FW_VERSION);
+  // Which app slot is actually running, and when it was built. A serial reflash writes ota_0 and
+  // resets otadata, but an OTA leaves the selector on the other slot -- so this is the first thing
+  // to check when a board seems to be running firmware you did not just flash.
+  { const esp_partition_t* rp = esp_ota_get_running_partition();
+    printf("[Boot] running slot=%s, built %s %s\n", rp ? rp->label : "?", __DATE__, __TIME__); }
   // Reset reason + chip/heap snapshot -- the first thing to check after an
   // unexpected reboot. PANIC/INT_WDT/TASK_WDT point at firmware faults;
   // BROWNOUT points at power. Pair this with the last [WDG] line before the gap.

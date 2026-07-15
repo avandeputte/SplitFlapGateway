@@ -2365,5 +2365,21 @@ void webInit() {
   server.on("/api/config/settings",  HTTP_POST,    handleApiConfigSettings);
   server.on("/api/config/settings",  HTTP_OPTIONS, handleOptions);
   server.begin();
-  printf("[Web] HTTP server started\n");
+  printf("[Web] HTTP server %s (port 80)\n",
+         server.listening() ? "started" : "FAILED to bind -- taskWeb will retry");
+}
+
+// server.begin() is called exactly once, at boot, and its result was never checked; a silent bind
+// failure there refuses every request for the whole uptime because nothing re-calls begin(). This
+// is that retry. listening() is the ground truth (NetworkServer::_listening), so on a healthy
+// server this is a no-op -- it re-establishes the listener only when it is genuinely down, which
+// also recovers the case where begin() ran (at setup) before the network stack was ready. Called
+// every 20s from taskWeb. Returns true when the listener is live.
+bool webEnsureListening() {
+  if (server.listening()) return true;
+  printf("[Web] port 80 listener is down -- re-establishing\n");
+  server.begin();
+  const bool up = server.listening();
+  printf("[Web] listener %s\n", up ? "restored" : "still down (will retry)");
+  return up;
 }

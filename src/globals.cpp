@@ -149,5 +149,5 @@ PubSubClient mqtt(mqttWifiClient);  // mqttInit() configures timeouts on this
 unsigned long lastStatusMs = 0;
 unsigned long          lastDispPubMs   = 0;
 unsigned long mqttRetryMs  = 0;
-WebServer server(80);
+HealWebServer server(80);
 unsigned long staDownSince = 0;   // millis() the station last dropped (0 = up/never)

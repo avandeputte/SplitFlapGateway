@@ -298,6 +298,14 @@ void taskWeb(void* pv) {
     }
 
     wdgWebMs = millis();      // touch AFTER handling
+
+    // Self-heal a silently-dead port-80 listener (see webEnsureListening): a ground-truth
+    // listening() check every 20s, acted on only when the listener is genuinely down.
+    static unsigned long lastListenCheck = 0;
+    if (millis() - lastListenCheck >= 20000UL) {
+      lastListenCheck = millis();
+      webEnsureListening();
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
