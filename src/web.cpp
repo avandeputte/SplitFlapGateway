@@ -1096,6 +1096,13 @@ static void handleApiCapabilities() {
   }
   capPut("],");
 
+  // How the wall MOVES. "mechanical" with the worst-case settle time: a module's full
+  // revolution takes up to ~4 s, and a frame can send any flap anywhere. A client uses this
+  // to decide what update rates are honest (a ticking seconds field is not) — and it is a
+  // fact about MOTION, stated directly, so nobody has to infer it from which endpoints exist.
+  // The Matrix Portal gateway answers the same key with kind "drawn" and its flip duration.
+  capPut("\"motion\":{\"kind\":\"mechanical\",\"settleMs\":4000},");
+
   // What the wall can DO, not just show, so a client reads this instead of sniffing the
   // firmware version and guessing.
   capPut("\"features\":[\"colors\",\"index\",\"batch\",\"quiet\",\"maintenance\","
