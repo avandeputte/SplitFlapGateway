@@ -92,7 +92,14 @@ static SFModule* sfUpsert(uint8_t id, const char* sn) {
   return m;
 }
 // Mount the FATFS partition. Format on first use if needed.
-void sfFsInit() {
+void sfFsInit(bool forceFormat) {
+  // Panic-recovery (see main.cpp): when the supervisor has seen too many crash reboots in a row,
+  // the FATFS is probably what keeps crashing the boot, so wipe it before mounting. FFat.format()
+  // must run while UNMOUNTED, so it goes first -- before any begin().
+  if (forceFormat) {
+    printf("[RECOVERY] reformatting FATFS -- discarding possibly-corrupt state\n");
+    FFat.format();
+  }
   // Try to mount WITHOUT auto-format first (fast path on every normal boot).
   if (FFat.begin(false)) {
     sfFsReady = true;

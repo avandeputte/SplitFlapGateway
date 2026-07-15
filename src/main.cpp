@@ -1,5 +1,12 @@
 #include "gateway.h"
 
+// After this many crash/watchdog reboots in a row, the boot logic reformats FATFS -- a corrupt
+// filesystem is the one thing that can crash a flash write and boot-loop the board. See setup().
+#define PANIC_REFORMAT_THRESHOLD 3
+// Consecutive crash/watchdog reboots, kept in RTC memory: it survives a reboot but is garbage on
+// a cold power-up. Written in setup(), cleared in loop() once the board has run healthy for 60s.
+RTC_NOINIT_ATTR static uint32_t sfPanicBoots;
+
 
 
 // main.cpp -- boot sequence and supervisor.
@@ -31,6 +38,7 @@ void setup() {
   // Reset reason + chip/heap snapshot -- the first thing to check after an
   // unexpected reboot. PANIC/INT_WDT/TASK_WDT point at firmware faults;
   // BROWNOUT points at power. Pair this with the last [WDG] line before the gap.
+  bool fatfsRecover = false;   // set by the panic-recovery check inside the block below
   {
     esp_reset_reason_t rr = esp_reset_reason();
     const char* rs = "OTHER";
@@ -48,6 +56,24 @@ void setup() {
     printf("[Boot] reset=%s heap=%u psram=%u flash=%uKB sdk=%s\n",
            rs, ESP.getFreeHeap(), ESP.getPsramSize(),
            ESP.getFlashChipSize()/1024, ESP.getSdkVersion());
+
+    // Panic-recovery safeguard. sfPanicBoots lives in RTC memory: it survives a reboot -- even a
+    // crash reboot -- and is only garbage on a cold power-up, which POWERON zeroes below. A
+    // corrupted FATFS can crash a flash write and boot-loop the board (which is exactly what
+    // happened once). After PANIC_REFORMAT_THRESHOLD crash/watchdog reboots IN A ROW -- each
+    // before the board runs healthy for 60s, at which point loop() clears the count -- reformat
+    // FATFS on this boot to break the loop: one self-healing reboot instead of a brick.
+    const bool crashReset = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
+                             rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT);
+    if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) sfPanicBoots = 0;   // cold boot: init RTC
+    else if (crashReset)                                  sfPanicBoots++;
+    else                                                  sfPanicBoots = 0;   // clean SW reset/OTA
+    if (sfPanicBoots >= PANIC_REFORMAT_THRESHOLD) {
+      printf("[RECOVERY] %u crash reboots in a row -- reformatting FATFS to break the loop\n",
+             (unsigned)sfPanicBoots);
+      sfPanicBoots = 0;
+      fatfsRecover = true;
+    }
   }
 
   // 2. Load config and init module registry
@@ -64,7 +90,7 @@ void setup() {
   // Restore sticky module list from the FATFS file (prunes entries older
   // than 6h). Mount the filesystem first; done after rtcRead() so
   // rtcEpochNow() can evaluate staleness.
-  sfFsInit();
+  sfFsInit(fatfsRecover);
   sfModulesLoad();
 
   // 4. RS485
@@ -106,6 +132,11 @@ void setup() {
 void loop() {
   static unsigned long lastWdgCheck = 0;
   unsigned long now = millis();
+  // Panic-recovery: once we have run healthy for a minute, this boot plainly was not a crash
+  // loop, so clear the RTC crash counter -- only RAPID consecutive crashes (each before 60s)
+  // accumulate toward the FATFS reformat in setup().
+  static bool panicCounterCleared = false;
+  if (!panicCounterCleared && now > 60000UL) { sfPanicBoots = 0; panicCounterCleared = true; }
   if (now - lastWdgCheck >= 30000UL) {
     lastWdgCheck = now;
     // Rich periodic telemetry for troubleshooting. Heap + min-ever heap +

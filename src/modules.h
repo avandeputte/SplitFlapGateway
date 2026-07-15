@@ -157,7 +157,7 @@ extern volatile unsigned long sfModulesDirtyMs;
 extern bool sfFsReady;
 
 SFModule* sfFindById(uint8_t id);
-void sfFsInit();
+void sfFsInit(bool forceFormat = false);
 // The flap set a module is BELIEVED to have, and how sure the gateway is of it.
 enum FlapSetSource { FLAPSET_REPORTED, FLAPSET_ASSUMED, FLAPSET_UNKNOWN };
 // Fills `out` (SF_MAX_FLAPS+1 bytes) with the module's set and says where it came from.
