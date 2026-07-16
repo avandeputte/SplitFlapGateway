@@ -14,8 +14,13 @@ static void otaRestoreWifi();
 // OTA update support
 // ---------------------------------------------------------------------------
 void otaInit() {
-  // Hostname shown in Arduino IDE port list
-  ArduinoOTA.setHostname("splitflap-gw");
+  // The hostname carries the board id: two gateways on one LAN both called
+  // "splitflap-gw" fight over the mDNS name exactly the way they fought over
+  // the MQTT client id (see boardId24() in common.h — this is the same fix).
+  // splitflap-gw-<6 hex digits>, unique per board, printed at boot below.
+  static char hostname[24];
+  snprintf(hostname, sizeof(hostname), "splitflap-gw-%06x", (unsigned)boardId24());
+  ArduinoOTA.setHostname(hostname);
 
   // Optional password protection
   if (strlen(cfg.otaPassword) > 0) {
@@ -49,9 +54,9 @@ void otaInit() {
 
   ArduinoOTA.begin();
   // ArduinoOTA.begin() started the mDNS responder with our hostname; also
-  // advertise the web UI so browsers can reach http://splitflap-gw.local
+  // advertise the web UI so browsers can reach http://<hostname>.local
   MDNS.addService("http", "tcp", 80);
-  printf("[OTA] Ready (hostname: splitflap-gw, web UI at http://splitflap-gw.local)\n");
+  printf("[OTA] Ready (hostname: %s, web UI at http://%s.local)\n", hostname, hostname);
 }
 
 // OTA runs in its own task so ArduinoOTA.handle() is called frequently
