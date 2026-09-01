@@ -29,6 +29,9 @@ void cfgSetDefaults() {
   strlcpy(cfg.quietEnd,   "07:00", sizeof(cfg.quietEnd));
   cfg.quietDays = 0x7F;  // all days
   cfg.quietTzOffsetMin = 0;   // captured from the browser on Save Schedule
+  // v3.12 defaults
+  cfg.restoreOnBoot   = false;
+  cfg.restoreDelaySec = RESTORE_DEFAULT_DELAY_S;
 }
 // Migrate settings from old NVS namespace "rs485gw" to "splitflap".
 // Runs once after firmware update; no-op on subsequent boots.
@@ -62,6 +65,10 @@ void loadConfig() {
   strlcpy(cfg.quietEnd,   prefs.getString("qsEnd",   "07:00").c_str(), sizeof(cfg.quietEnd));
   cfg.quietDays = prefs.getUChar("qsDays", 0x7F);
   cfg.quietTzOffsetMin = prefs.getShort("qsTzOff", 0);
+  // v3.12
+  cfg.restoreOnBoot   = prefs.getBool("rbEn", false);
+  cfg.restoreDelaySec = prefs.getUShort("rbDelay", RESTORE_DEFAULT_DELAY_S);
+  if (cfg.restoreDelaySec > RESTORE_MAX_DELAY_S) cfg.restoreDelaySec = RESTORE_MAX_DELAY_S;
   strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
   setenv("TZ", gPosixTZ, 1);
   tzset();
@@ -95,5 +102,8 @@ void saveConfig() {
   prefs.putString("qsEnd",     cfg.quietEnd);
   prefs.putUChar ("qsDays",    cfg.quietDays);
   prefs.putShort ("qsTzOff",   cfg.quietTzOffsetMin);
+  // v3.12
+  prefs.putBool  ("rbEn",      cfg.restoreOnBoot);
+  prefs.putUShort("rbDelay",   cfg.restoreDelaySec);
   prefs.end();
 }

@@ -36,6 +36,9 @@ struct GwConfig {
   int16_t       quietTzOffsetMin;  // minutes EAST of UTC for the schedule (browser-supplied);
                                    // local = UTC + this. Independent of the gateway posixTZ so the
                                    // user just enters their own local time. See quietScheduleTick.
+  // ---- v3.12 ----
+  bool          restoreOnBoot;     // replay the stored calibration backup on every boot (restore.h)
+  uint16_t      restoreDelaySec;   // seconds after boot before that replay starts
 };
 
 // ---- owned globals (defined in globals.cpp) ----

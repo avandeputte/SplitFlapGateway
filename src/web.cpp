@@ -50,6 +50,12 @@ static void handleApiCompanionSettingsGet();
 static void handleApiCompanionSettingsPut();
 static void handleApiCompanionSettingsRaw();
 static void handleApiRestoreBySN();
+static void handleApiRestoreGet();
+static void handleApiRestoreRun();
+static void handleApiRestoreCancel();
+static void handleApiRestoreBackupPut();
+static void handleApiRestoreBackupRaw();
+static void handleApiRestoreBackupDelete();
 static void handleApiSend();
 static void handleApiSendBatch();
 static void handleApiCapabilities();
@@ -63,7 +69,6 @@ static void handleLogo();
 static void handleOptions();
 static void handleRoot();
 static void sendJsonError(int code, const char* msg);
-static const char* sfValidateCharSet(const char* charSet, char* out, size_t outLen);
 
 /* ----------------------------------------------------------
    Web server
@@ -73,6 +78,21 @@ static void sendJsonError(int code, const char* msg) {
   snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", msg);
   server.send(code, "application/json", buf);
 }
+
+// Restore-on-boot lock (v3.12): while a stored backup is being replayed, every route that
+// would touch the bus answers 503 instead of running. webInit() applies it by wrapping
+// each such handler in BUSGATED(); read-only routes, settings, status and the page itself
+// are left alone so the dashboard keeps working and the run can be watched or cancelled.
+static bool restoreGate() {
+  if (!restoreBusy()) return false;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  char buf[96];
+  snprintf(buf, sizeof(buf), "{\"error\":\"restore in progress\",\"restore\":\"%s\"}",
+           restoreStateName());
+  server.send(503, "application/json", buf);
+  return true;
+}
+#define BUSGATED(fn) ([]() { if (restoreGate()) return; fn(); })
 
 // -- GET /  (main dashboard)
 // Browser tab icon (favicon): a split-flap tile -- two flaps, the signature
@@ -1220,14 +1240,16 @@ static void handleApiStatus() {
   unsigned stkRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
   // v3.0: seconds since the companion last checked in (-1 = never / deregistered)
   long compAge = gCompanionSeenMs ? (long)((millis() - gCompanionSeenMs) / 1000UL) : -1;
-  char out[720];
+  char rst[112];                       // v3.12: {"state","done","total","startsIn"}
+  restoreStatusJson(rst, sizeof(rst), false);
+  char out[900];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
     "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
-    "\"companion\":{\"status\":\"%s\",\"age\":%ld}}",
+    "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -1240,7 +1262,7 @@ static void handleApiStatus() {
     ntpSynced?"true":"false",
     gMaintenanceMode?"true":"false",
     gQuietTime?"true":"false",
-    gCompanionStatus, compAge);
+    gCompanionStatus, compAge, rst);
   server.send(200, "application/json", out);
 }
 
@@ -1265,7 +1287,9 @@ static void handleApiConfigGet() {
   doc["serialDebug"]   = cfg.serialDebug;
   doc["haEnabled"]     = cfg.haEnabled;
   doc["otaPasswordSet"] = (strlen(cfg.otaPassword) > 0);
-  char out[768];   // headroom for "version" + JSON-escaped SSID/TZ strings
+  doc["restoreOnBoot"]  = cfg.restoreOnBoot;      // v3.12
+  doc["restoreDelay"]   = cfg.restoreDelaySec;
+  char out[840];   // headroom for "version" + JSON-escaped SSID/TZ strings
   serializeJson(doc, out, sizeof(out));
   server.send(200, "application/json", out);
 }
@@ -1388,6 +1412,22 @@ static void handleApiConfigSettings() {
     server.send(200, "application/json", "{\"ok\":true}");
     return;
   }
+  // Restore-on-boot (v3.12): the enable flag and the post-boot delay, alone or together.
+  // Takes effect at the next boot (or a manual POST /api/restore/run).
+  if (doc["restoreOnBoot"].is<bool>() || doc["restoreDelay"].is<int>()) {
+    if (doc["restoreOnBoot"].is<bool>()) cfg.restoreOnBoot = doc["restoreOnBoot"].as<bool>();
+    if (doc["restoreDelay"].is<int>()) {
+      int d = doc["restoreDelay"].as<int>();
+      if (d < 0) d = 0;
+      if (d > RESTORE_MAX_DELAY_S) d = RESTORE_MAX_DELAY_S;
+      cfg.restoreDelaySec = (uint16_t)d;
+    }
+    saveConfig();
+    printf("[CFG] Restore on boot %s, delay %us\n",
+           cfg.restoreOnBoot ? "enabled" : "disabled", (unsigned)cfg.restoreDelaySec);
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
   if (doc["posixTZ"].is<const char*>()) {
     strlcpy(cfg.posixTZ, doc["posixTZ"] | "UTC0", sizeof(cfg.posixTZ));
     strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
@@ -1429,7 +1469,7 @@ static void handleApiConfigSettings() {
 static void handleOptions() {
   server.sendHeader("Access-Control-Allow-Origin",  "*");
   // PUT is used by /api/companion/settings (v3.1); the rest of the API is GET/POST.
-  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
   server.send(204);
 }
@@ -1623,48 +1663,87 @@ static void handleApiRestoreBySN() {
     const char* err = sfValidateCharSet(charSet, chars, sizeof(chars));
     if (err) { sendJsonError(400, err); return; }
   }
-  // Build mXW<sn>:<ho>:<ts>:<map>[:<flapCount>[:<chars>]]\n. The map can be large;
-  // snprintf into a bounded static buffer (off taskWeb's stack) and reject
-  // anything that would overflow a single frame -- a truncated restore command
-  // would corrupt the module's EEPROM, so it's safer to refuse than to send a
-  // partial map. The firmware's mXW tail parser matches this layout: a count-only
-  // tail is ":<count>", a chars-only tail "::<chars>", and both ":<count>:<chars>".
-  // Assemble into a single string, then frame it. Each piece checks that the
-  // running length stays strictly inside the buffer (snprintf returns the length
-  // it WOULD have written, which can exceed the buffer), so an overflow is caught
-  // and the restore is refused rather than truncated.
-  static char cmd[TX_MAX_BYTES + 1];
-  char tail[8 + SF_MAX_FLAPS + 2] = "";   // ":<count>:<chars>" worst case
-  if (hasCount || hasChars) {
-    int t = snprintf(tail, sizeof(tail), ":");
-    if (hasCount) t += snprintf(tail + t, sizeof(tail) - t, "%d", flapCount);
-    if (hasChars) t += snprintf(tail + t, sizeof(tail) - t, ":%s", chars);
+  // The map does NOT go inside the mXW frame (v3.12): a module writes each entry to
+  // EEPROM as it parses it and cannot keep up with a long frame at line speed -- entries
+  // vanish and the module goes deaf for seconds (see RESTORE_MXW_SETTLE_MS, common.h). So,
+  // exactly like the boot restore: the mXW carries offset, steps and flap set (and clears
+  // the map), and each entry follows as its own short m<id>w<i>:<p> frame, paced. The
+  // pacing is done by SCHEDULING on the RS-485 task (the batch endpoint's queue), never by
+  // sleeping here: this handler runs on the one-connection web server. That needs the
+  // module's CURRENT id -- the optional "id" in the body, else the registry's for that
+  // serial. Only when neither is known does the map go inline, the old way.
+  int wId = doc["id"] | -1;
+  if (wId < 0 || wId > 254) {
+    uint8_t cur = 255;
+    wId = (sfLookupBySN(sn, &cur, NULL, 0) && cur != 255) ? (int)cur : -1;
   }
-  int n = snprintf(cmd, sizeof(cmd), "mXW%s:%d:%d:%s%s\n", sn, homeOffset, totalSteps, map, tail);
-  if (n < 0 || (size_t)n >= sizeof(cmd)) {
+  int entries = 0;
+  for (const char* p = map; *p; ) {           // count "i=p" pairs; the frame is built below
+    char* end = NULL;
+    long idx = strtol(p, &end, 10);
+    if (end == p || *end != '=') break;
+    const char* v = end + 1;
+    strtol(v, &end, 10);
+    if (end == v) break;
+    if (idx >= 0 && idx < SF_MAX_FLAPS) entries++;
+    if (*end == ',') p = end + 1; else break;
+  }
+  bool perEntry = (wId >= 0 && entries > 0);
+  if (perEntry) {                              // room for every entry in the queue?
+    int used = 0;
+    if (txQMutex && xSemaphoreTake(txQMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      used = (txQHead - txQTail + TXQ_SIZE) % TXQ_SIZE;
+      xSemaphoreGive(txQMutex);
+    } else used = TXQ_SIZE;
+    if (!txQueue || (TXQ_SIZE - 1 - used) < entries) {
+      perEntry = false;
+      printf("[API] restore by SN %s: TX queue full -- map sent inline\n", sn);
+    }
+  }
+  // Assemble the frame in a bounded static buffer (off taskWeb's stack). The shared
+  // builder refuses anything that would not fit in one frame -- a truncated restore
+  // command would corrupt the module's EEPROM, so it is safer to refuse than to send
+  // a partial map.
+  static char cmd[TX_MAX_BYTES + 1];
+  if (!sfBuildRestoreFrame(sn, homeOffset, totalSteps, perEntry ? "" : map,
+                           hasCount ? flapCount : 0, hasChars ? chars : NULL,
+                           cmd, sizeof(cmd))) {
     sendJsonError(400, "restore payload too large for one frame"); return;
   }
-  DBG("[API] restore by SN %s\n", sn);
+  DBG("[API] restore by SN %s (%d entries, %s)\n", sn, entries, perEntry ? "per-entry" : "inline");
   rs485SendStr(cmd);
-  server.send(200, "application/json", "{\"ok\":true}");
-}
 
-// Validate and transcode a flap character set. `charSet` is UTF-8 (as received
-// over JSON); it is converted to the single-byte flap encoding (Windows-1252)
-// the bus protocol and module firmware use -- so euro signs and accented letters
-// each become one flap byte (see charset.h). On success the encoded bytes are
-// written to `out` (NUL-terminated) and NULL is returned; otherwise a
-// human-readable error message is returned.
-static const char* sfValidateCharSet(const char* charSet, char* out, size_t outLen) {
-  char tmp[SF_MAX_FLAPS * 4 + 4];          // hold the transcode before length-check
-  bool allMapped = true;
-  size_t n = utf8ToFlap(charSet, tmp, sizeof(tmp), &allMapped);
-  if (!allMapped)        return "charSet has characters not in Windows-1252";
-  if (n == 0)            return "charSet has no displayable characters";
-  if (n > SF_MAX_FLAPS)  return "charSet too long (max 64 characters)";
-  if (n + 1 > outLen)    return "charSet too long";
-  memcpy(out, tmp, n + 1);
-  return nullptr;
+  unsigned long settleMs = RESTORE_MXW_SETTLE_MS;
+  if (perEntry) {
+    // Due times are monotonic across requests (the queue is drained in order and only
+    // its head is checked), so a burst of restores queues up back to back.
+    static uint32_t lastDue = 0;
+    uint32_t now = millis();
+    uint32_t due = now + RESTORE_MXW_SETTLE_MS;     // let the module finish the map erase
+    if ((int32_t)(lastDue + RESTORE_ENTRY_GAP_MS - due) > 0) due = lastDue + RESTORE_ENTRY_GAP_MS;
+    for (const char* p = map; *p; ) {
+      char* end = NULL;
+      long idx = strtol(p, &end, 10);
+      if (end == p || *end != '=') break;
+      const char* v = end + 1;
+      long pos = strtol(v, &end, 10);
+      if (end == v) break;
+      if (idx >= 0 && idx < SF_MAX_FLAPS) {
+        char f[32];
+        int n = snprintf(f, sizeof(f), "m%dw%ld:%ld\n", wId, idx, pos);
+        if (!rs485SendScheduled((const uint8_t*)f, (size_t)n, due)) rs485Send((const uint8_t*)f, (size_t)n, false);
+        lastDue = due;
+        due += (uint32_t)RESTORE_ENTRY_GAP_MS;
+      }
+      if (*end == ',') p = end + 1; else break;
+    }
+    settleMs = (unsigned long)(lastDue - now) + RESTORE_SETTLE_MS;
+  }
+  char resp[128];
+  snprintf(resp, sizeof(resp),
+           "{\"ok\":true,\"entries\":%d,\"perEntry\":%s,\"id\":%d,\"settleMs\":%lu}",
+           entries, perEntry ? "true" : "false", wId, settleMs);
+  server.send(200, "application/json", resp);
 }
 
 // POST /api/flap/flapconfig  -- configure a module's flap set ('N', firmware v31+)
@@ -1971,6 +2050,7 @@ static void handleApiMaintenance() {
 static void handleApiQuiet() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (server.method() == HTTP_POST) {
+    if (restoreGate()) return;     // quiet ON homes the wall: a bus command
     if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
@@ -2261,6 +2341,131 @@ static void handleApiCompanionSettingsGet() {
   f.close();
 }
 
+/* ----------------------------------------------------------
+   Restore on boot (v3.12) -- see restore.h
+---------------------------------------------------------- */
+static void sendRestoreStatus(int code) {
+  static char out[640];   // static: off taskWeb's stack
+  restoreStatusJson(out, sizeof(out), true);
+  server.send(code, "application/json", out);
+}
+
+// GET /api/restore -- the setting, the stored file, and the progress of the current/last run
+static void handleApiRestoreGet() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  sendRestoreStatus(200);
+}
+
+// POST /api/restore/run {"delay":0} -- replay the stored backup now (delay in seconds)
+static void handleApiRestoreRun() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int delay = 0;
+  if (server.hasArg("plain") && server.arg("plain").length()) {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+      sendJsonError(400, "Bad JSON"); return;
+    }
+    delay = doc["delay"] | 0;
+    if (delay < 0) delay = 0;
+    if (delay > RESTORE_MAX_DELAY_S) delay = RESTORE_MAX_DELAY_S;
+  }
+  char err[64];
+  if (!restoreStart((unsigned long)delay * 1000UL, "manual", err, sizeof(err))) {
+    sendJsonError(restoreBusy() ? 409 : 404, err); return;
+  }
+  sendRestoreStatus(200);
+}
+
+// POST /api/restore/cancel -- stop a running replay after its current step
+static void handleApiRestoreCancel() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!restoreCancel()) { sendJsonError(409, "no restore running"); return; }
+  sendRestoreStatus(200);
+}
+
+// DELETE /api/restore/backup -- forget the stored backup (the setting is left as it is;
+// an enabled restore with no file simply logs and skips at boot, without locking anything)
+static void handleApiRestoreBackupDelete() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!restoreDeleteFile()) { sendJsonError(409, "restore in progress"); return; }
+  sendRestoreStatus(200);
+}
+
+/* PUT /api/restore/backup -- store a calibration backup for restore-on-boot.
+   Streams the body the same way the companion blob does (raw path, temp file, rename): a
+   JSON body has no NUL byte, but a 64-module backup is ~45 KB and the String path would
+   drag that through the internal heap. Unlike the blob this one is PARSED before it is
+   accepted -- the temp file must be a backup with at least one usable module, and only
+   then is it renamed over the live copy, so a bad upload never replaces a good backup. */
+static File   rbFile;            // temp file, open across the RAW_WRITE chunks
+static size_t rbRecvd = 0;       // bytes written so far this request
+static int    rbErr   = 0;       // 0 = ok, else the HTTP status to report
+static char   rbWhy[64] = "";    // validation failure reason (422)
+
+static void rbAbort(int status) {
+  if (rbFile) rbFile.close();
+  if (sfFsReady) FFat.remove(RESTORE_TMP);
+  rbErr = status;
+}
+
+static void handleApiRestoreBackupRaw() {
+  HTTPRaw& raw = server.raw();
+  wdgWebMs = millis();
+  switch (raw.status) {
+    case RAW_START: {
+      rbRecvd = 0; rbErr = 0; rbWhy[0] = 0;
+      size_t len = (size_t)server.clientContentLength();
+      if (!sfFsReady)               { rbErr = 503; break; }
+      if (restoreBusy())            { rbErr = 409; break; }   // not under a running replay
+      if (len == 0)                 { rbErr = 400; break; }
+      if (len > RESTORE_MAX_BYTES)  { rbErr = 413; break; }
+      FFat.remove(RESTORE_TMP);
+      rbFile = FFat.open(RESTORE_TMP, "w");
+      if (!rbFile) rbErr = 507;
+      break;
+    }
+    case RAW_WRITE:
+      if (rbErr || !rbFile) break;                             // already failed -- drain
+      if (rbRecvd + raw.currentSize > RESTORE_MAX_BYTES) { rbAbort(413); break; }
+      if (rbFile.write(raw.buf, raw.currentSize) != raw.currentSize) { rbAbort(507); break; }
+      rbRecvd += raw.currentSize;
+      break;
+    case RAW_END: {
+      if (rbErr) { rbAbort(rbErr); break; }
+      rbFile.close();
+      if (rbRecvd != (size_t)server.clientContentLength()) { rbAbort(400); break; }
+      RestoreFileInfo info;
+      if (!restoreValidateFile(RESTORE_TMP, &info, rbWhy, sizeof(rbWhy))) { rbAbort(422); break; }
+      wdgWebMs = millis();
+      FFat.remove(RESTORE_FILE);
+      if (!FFat.rename(RESTORE_TMP, RESTORE_FILE)) { rbAbort(507); break; }
+      restoreRefreshFileInfo();
+      printf("[RESTORE] backup stored: %d module(s), %u bytes\n",
+             gRestoreFile.modules, (unsigned)rbRecvd);
+      break;
+    }
+    case RAW_ABORTED:
+      rbAbort(400);
+      break;
+  }
+}
+
+static void handleApiRestoreBackupPut() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int err = rbErr;
+  rbErr = 0;                    // never leak this request's verdict into the next
+  switch (err) {
+    case 0:   break;
+    case 400: sendJsonError(400, "Empty or truncated body"); return;
+    case 409: sendJsonError(409, "restore in progress");     return;
+    case 413: sendJsonError(413, "Backup too large");        return;
+    case 422: sendJsonError(422, rbWhy);                     return;
+    case 503: sendJsonError(503, "No filesystem");           return;
+    default:  sendJsonError(507, "Write failed");            return;
+  }
+  sendRestoreStatus(200);
+}
+
 void webInit() {
   static const char* COLLECT_HDRS[] = { "If-None-Match" };
   server.collectHeaders(COLLECT_HDRS, 1);   // so handleRoot can honour conditional GETs
@@ -2277,67 +2482,67 @@ void webInit() {
   server.on("/ota",                  HTTP_GET,     handleOTAPage);
   server.on("/api/ota/upload",       HTTP_POST,    sendOTAUploadResult, handleOTAUpload);
   server.on("/api/rs485/messages",   HTTP_GET,     handleApiMessages);
-  server.on("/api/rs485/send",       HTTP_POST,    handleApiSend);
+  server.on("/api/rs485/send",       HTTP_POST,    BUSGATED(handleApiSend));
   server.on("/api/rs485/send",       HTTP_OPTIONS, handleOptions);
-  server.on("/api/rs485/batch",      HTTP_POST,    handleApiSendBatch);
+  server.on("/api/rs485/batch",      HTTP_POST,    BUSGATED(handleApiSendBatch));
   server.on("/api/rs485/batch",      HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/modules",     HTTP_GET,     handleApiModules);
   server.on("/api/display/state",    HTTP_GET,     handleApiDisplayState);
-  server.on("/api/display/cells",    HTTP_POST,    handleApiDisplayCells);
+  server.on("/api/display/cells",    HTTP_POST,    BUSGATED(handleApiDisplayCells));
   server.on("/api/display/cells",    HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/identify",    HTTP_POST,    handleApiIdentify);
+  server.on("/api/flap/identify",    HTTP_POST,    BUSGATED(handleApiIdentify));
   server.on("/api/flap/identify",    HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/char",        HTTP_POST,    handleApiChar);
+  server.on("/api/flap/char",        HTTP_POST,    BUSGATED(handleApiChar));
   server.on("/api/flap/char",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/index",       HTTP_POST,    handleApiIndex);
+  server.on("/api/flap/index",       HTTP_POST,    BUSGATED(handleApiIndex));
   server.on("/api/flap/index",       HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/text",        HTTP_POST,    handleApiText);
+  server.on("/api/flap/text",        HTTP_POST,    BUSGATED(handleApiText));
   server.on("/api/flap/text",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/home",        HTTP_POST,    handleApiHome);
+  server.on("/api/flap/home",        HTTP_POST,    BUSGATED(handleApiHome));
   server.on("/api/flap/home",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/calibrate",   HTTP_POST,    handleApiCalibrate);
+  server.on("/api/flap/calibrate",   HTTP_POST,    BUSGATED(handleApiCalibrate));
   server.on("/api/flap/calibrate",   HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/calibrate/status", HTTP_GET, handleApiCalibrateStatus);
-  server.on("/api/flap/diag",        HTTP_POST,    handleApiDiag);
+  server.on("/api/flap/diag",        HTTP_POST,    BUSGATED(handleApiDiag));
   server.on("/api/flap/diag",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/diag/mech",   HTTP_POST,    handleApiDiagMech);
+  server.on("/api/flap/diag/mech",   HTTP_POST,    BUSGATED(handleApiDiagMech));
   server.on("/api/flap/diag/mech",   HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/diag/status", HTTP_GET,     handleApiDiagStatus);
-  server.on("/api/flap/version",     HTTP_POST,    handleApiVersion);
+  server.on("/api/flap/version",     HTTP_POST,    BUSGATED(handleApiVersion));
   server.on("/api/flap/version",     HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/provision",   HTTP_POST,    handleApiProvision);
-  server.on("/api/flap/deprovision", HTTP_POST,    handleApiDeprovision);
+  server.on("/api/flap/provision",   HTTP_POST,    BUSGATED(handleApiProvision));
+  server.on("/api/flap/deprovision", HTTP_POST,    BUSGATED(handleApiDeprovision));
   server.on("/api/flap/deprovision", HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/homebysn",        HTTP_POST,    handleApiHomeBySN);
+  server.on("/api/flap/homebysn",        HTTP_POST,    BUSGATED(handleApiHomeBySN));
   server.on("/api/flap/homebysn",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/provision",       HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/homeoffset",      HTTP_POST,    handleApiHomeOffset);
+  server.on("/api/flap/homeoffset",      HTTP_POST,    BUSGATED(handleApiHomeOffset));
   server.on("/api/flap/homeoffset",      HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/totalsteps",      HTTP_POST,    handleApiTotalSteps);
+  server.on("/api/flap/totalsteps",      HTTP_POST,    BUSGATED(handleApiTotalSteps));
   server.on("/api/flap/totalsteps",      HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/nudge",           HTTP_POST,    handleApiNudge);
+  server.on("/api/flap/nudge",           HTTP_POST,    BUSGATED(handleApiNudge));
   server.on("/api/flap/nudge",           HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/goto",            HTTP_POST,    handleApiGoto);
+  server.on("/api/flap/goto",            HTTP_POST,    BUSGATED(handleApiGoto));
   server.on("/api/flap/goto",            HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/writepos",        HTTP_POST,    handleApiWritePos);
+  server.on("/api/flap/writepos",        HTTP_POST,    BUSGATED(handleApiWritePos));
   server.on("/api/flap/writepos",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/autohome",        HTTP_POST,    handleApiAutoHome);
+  server.on("/api/flap/autohome",        HTTP_POST,    BUSGATED(handleApiAutoHome));
   server.on("/api/flap/autohome",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/erase",           HTTP_POST,    handleApiErase);
+  server.on("/api/flap/erase",           HTTP_POST,    BUSGATED(handleApiErase));
   server.on("/api/flap/erase",           HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/factoryreset",    HTTP_POST,    handleApiFactoryReset);
+  server.on("/api/flap/factoryreset",    HTTP_POST,    BUSGATED(handleApiFactoryReset));
   server.on("/api/flap/factoryreset",    HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/dump",              HTTP_POST,    handleApiDump);
+  server.on("/api/flap/dump",              HTTP_POST,    BUSGATED(handleApiDump));
   server.on("/api/flap/dump",              HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/all",               HTTP_POST,    handleApiAll);
+  server.on("/api/flap/all",               HTTP_POST,    BUSGATED(handleApiAll));
   server.on("/api/flap/all",               HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/dumpbysn",          HTTP_POST,    handleApiDumpBySN);
+  server.on("/api/flap/dumpbysn",          HTTP_POST,    BUSGATED(handleApiDumpBySN));
   server.on("/api/flap/dumpbysn",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/factoryresetbysn",HTTP_POST,    handleApiFactoryResetBySN);
+  server.on("/api/flap/factoryresetbysn",HTTP_POST,    BUSGATED(handleApiFactoryResetBySN));
   server.on("/api/flap/factoryresetbysn",HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/restorebysn",     HTTP_POST,    handleApiRestoreBySN);
+  server.on("/api/flap/restorebysn",     HTTP_POST,    BUSGATED(handleApiRestoreBySN));
   server.on("/api/flap/restorebysn",     HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/flapconfig",      HTTP_POST,    handleApiFlapConfig);
+  server.on("/api/flap/flapconfig",      HTTP_POST,    BUSGATED(handleApiFlapConfig));
   server.on("/api/flap/flapconfig",      HTTP_OPTIONS, handleOptions);
   server.on("/api/capabilities",     HTTP_GET,     handleApiCapabilities);
   server.on("/api/capabilities",     HTTP_OPTIONS, handleOptions);
@@ -2362,6 +2567,17 @@ void webInit() {
   server.on("/api/companion/settings", HTTP_PUT,     handleApiCompanionSettingsPut,
                                                      handleApiCompanionSettingsRaw);
   server.on("/api/companion/settings", HTTP_OPTIONS, handleOptions);
+  // v3.12 restore-on-boot. The PUT takes the raw-body path (4th arg), like the companion blob.
+  server.on("/api/restore",          HTTP_GET,     handleApiRestoreGet);
+  server.on("/api/restore",          HTTP_OPTIONS, handleOptions);
+  server.on("/api/restore/run",      HTTP_POST,    handleApiRestoreRun);
+  server.on("/api/restore/run",      HTTP_OPTIONS, handleOptions);
+  server.on("/api/restore/cancel",   HTTP_POST,    handleApiRestoreCancel);
+  server.on("/api/restore/cancel",   HTTP_OPTIONS, handleOptions);
+  server.on("/api/restore/backup",   HTTP_PUT,     handleApiRestoreBackupPut,
+                                                   handleApiRestoreBackupRaw);
+  server.on("/api/restore/backup",   HTTP_DELETE,  handleApiRestoreBackupDelete);
+  server.on("/api/restore/backup",   HTTP_OPTIONS, handleOptions);
   server.on("/api/config",           HTTP_GET,     handleApiConfigGet);
   server.on("/api/config/wifi",      HTTP_POST,    handleApiConfigWifi);
   server.on("/api/config/wifi",      HTTP_OPTIONS, handleOptions);

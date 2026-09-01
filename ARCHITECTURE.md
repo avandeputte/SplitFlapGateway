@@ -385,3 +385,86 @@ time (self-scheduling, not a fixed interval), firing its terminal callback
 exactly once, with a generation counter that cancels any stale poller left by a
 new run or a closed modal. That combination is what stops a late `idle` read
 from clobbering a result the module actually returned.
+
+## Restore on boot: why the gateway locks itself (v3.12)
+
+`restore.cpp` replays a stored calibration backup to every module at boot (or on
+`POST /api/restore/run`). Three decisions there are worth recording.
+
+**The lock is global, and it is held from `setup()`.** The user's requirement was that
+nothing else be processed until the restore completes, and the reason is physical: a
+display frame, a home, or a companion batch arriving mid-restore would interleave with
+`mXW` frames on the half-duplex bus and with the read-back waits. So `restoreBusy()` is
+true from the moment `restoreInit()` arms the run -- before any task is running -- and
+`webInit()` wraps every bus-touching handler in `BUSGATED()`, which answers 503 instead of
+running it. MQTT commands are dropped in `mqttCallback`. This is deliberately broader than
+maintenance mode (which only gates MQTT): here the gateway's own REST API is refused too.
+The gateway's *internal* bus traffic pauses as well (the flap-set trickle, stale probes,
+the quiet schedule), for the reason below.
+
+**Verification captures ANY reply.** The restore addresses modules by serial and does not
+know which id a read-back will carry (the backup's id may differ from the module's current
+one, and it may just have been re-provisioned). So it arms the shared dump slot with
+`SF_WAIT_ANY`, and `sfParseResponse` records the answering id and, for an `A` reply, its
+serial in `gDump.gotId` / `gDump.gotSN`. That wildcard is safe only because the run has the
+bus to itself -- which is why the trickle's `m<id>A` is paused: an unsolicited `A` landing
+in a verify window would be read as the wrong module's EEPROM.
+
+**It cannot hang.** "Block everything" is only acceptable if the block is guaranteed to
+end. Every wait is bounded (`RESTORE_VERIFY_TIMEOUT_MS` x `RESTORE_VERIFY_TRIES`, plus one
+repair round), a silent module is counted as missing rather than waited for, a cancel is
+honoured between steps, and a run that cannot even start (no usable file) logs and does
+NOT lock. A re-provisioned module, which restarts and is deaf for `MODULE_POSTPROV_VER_MS`
+plus its staggered start-up, is given a `readyAt` deadline rather than a retry storm.
+
+The backup is parsed with ArduinoJson into **PSRAM** (a 64-module backup is ~45 KB, and
+the internal heap is what WiFi lives on) and the document stays alive for the whole run,
+so the write and verify phases iterate the same entries. The upload is validated by the
+same parser before it is renamed over the live file, so a bad upload never replaces a
+good backup.
+
+### What the modules taught the restore (v3.12.0, first field run)
+
+Two things the first runs on a real wall showed, both now encoded in `restore.cpp`:
+
+- **A module cannot ingest a long `mXW` at line speed.** It writes each map entry to
+  EEPROM as it parses it, its receive buffer overflows, entries vanish, and it goes deaf
+  for ~6 s. Measured on v31 firmware: a 434-byte frame left 20 of 42 entries. So the map
+  is not sent inline. `mXW` carries offset, steps and the flap set (and clears the map),
+  `RESTORE_MXW_SETTLE_MS` covers the erase, then each entry goes as its own short
+  `m<id>w<i>:<p>` frame `RESTORE_ENTRY_GAP_MS` apart -- the wizard's frames. Verification
+  waits `RESTORE_SETTLE_MS` after a module's last write. A 15-module wall restores and
+  verifies in ~33 s.
+- **A truncated `A` tail must not be believed.** A long `A` reply sometimes loses its end
+  in transit, parsing as `64:` plus a handful of characters. Recording that poisoned the
+  registry and the backups, and a restore then wrote the truncated set into the module.
+  `sfParseResponse` now treats a tail whose character count does not match its flap
+  count as "not reported", and the restore neither writes nor verifies such a set.
+
+## Module registry: permanent, re-queried, never pruned (v3.12)
+
+Until v3.12 a module not heard from in `MODULE_STALE_SECS` was probed and, if silent,
+dropped -- at load and once a minute. That made `/api/capabilities` incomplete after a
+reboot until every module had been asked again, and it forgot modules that were merely
+displaying a static message (modules only speak when addressed). The registry is now
+permanent: `sfModulesLoad` never prunes by age, and `sfModulesPruneStale` is a periodic
+RE-QUERY -- a bare version query, `MODULE_PROBE_BATCH` per cycle, spaced so the instant
+replies do not collide -- that refreshes the record and notices a swapped or re-flashed
+module. After `MODULE_PROBE_MAX_TRIES` unanswered queries the module is left alone for
+`MODULE_REPROBE_BACKOFF_MS` and then asked again. Only Identify All, De-provision, or a
+corrupt record removes an entry. The persisted flap sets are therefore always present
+at boot, which is what makes capabilities complete from the first second.
+
+## Browser OTA: never add a header per chunk (v3.12)
+
+The multipart upload callback (`handleOTAUpload`) ran once per received chunk, and it began
+with `server.sendHeader("Access-Control-Allow-Origin", "*")`. In the ESP32 core 3.x
+`WebServer::sendHeader()` appends a heap-allocated `RequestArgument` (a node plus two
+Strings) to a linked list that is only released when the response is sent -- after the whole
+body. A 1.48 MB image arrives in ~1000 chunks of 1436 bytes, so ~1000 nodes accumulated:
+~80 KB of a ~100 KB heap, min-free heap under 1 KB, and the connection reset at 1.2-1.3 MB
+on every full-size image, at any upload rate (a rate-limited upload died the same way). The
+symptom was easy to misread as the well-known "receive buffers pile up" story, which the
+release notes had blamed for two versions. The header now goes on the response, once. Rule
+for every chunked callback (upload or raw): no `sendHeader()`, no allocation that outlives
+the chunk. A full image now uploads in ~10 s with ~80 KB of heap free throughout.

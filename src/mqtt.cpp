@@ -278,10 +278,22 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
         mqttPublishStateTopics();
         return;
       }
+      // Quiet ON homes the wall, which is a bus command: refused while a restore runs.
+      if (restoreBusy()) {
+        printf("[QUIET] MQTT quiet/set ignored -- restore in progress\n");
+        mqttPublishStateTopics();
+        return;
+      }
       sfSetQuietTime(on);
       mqttPublishStateTopics();
       return;
     }
+  }
+  // Restore-on-boot lock (v3.12): NOTHING reaches the bus until the replay is done.
+  // Unlike maintenance mode this also applies to the gateway's own REST API.
+  if (restoreBusy()) {
+    DBG("[MQTT] ignored (restore in progress): %s\n", topic);
+    return;
   }
   // Maintenance mode: ignore all externally-originated DISPLAY commands. Nothing
   // from MQTT is relayed to the bus while this is on; only the gateway's own web

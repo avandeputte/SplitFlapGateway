@@ -11,6 +11,7 @@
 //   rs485.*     RS-485 half-duplex bus: framing, sanitization, TX, monitor ring
 //   modules.*   split-flap module registry, protocol commands, reply parser,
 //               FATFS persistence
+//   restore.*   restore-on-boot: replay a stored calibration backup, locking the bus
 //   mqtt.*      MQTT client, outbound publish queue, Home Assistant discovery
 //   web.*       HTTP server: dashboard page (web_ui.h) + REST API handlers
 //   ota.*       firmware update: ArduinoOTA + browser upload
@@ -27,6 +28,7 @@
 #include "rs485.h"
 #include "modules.h"
 #include "capset.h"
+#include "restore.h"
 #include "mqtt.h"
 #include "ota.h"
 #include "web.h"

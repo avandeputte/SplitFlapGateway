@@ -130,7 +130,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.11.0"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.12.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -180,11 +180,12 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 
 /* ---- Housekeeping cadences ---- */
 #define STATUS_INTERVAL_MS      60000UL   // MQTT status publish cadence (1/min)
-#define MODULE_STALE_SECS       86400UL   // 24h: prune modules not seen in this long. Modules only speak when addressed, so a module that's merely displaying static content ages toward staleness normally -- keep the window generous so a long-lived message doesn't churn the whole wall through the stale-probe path.
+#define MODULE_STALE_SECS       86400UL   // 24h: a module not heard from in this long is RE-QUERIED (a bare version query) so its record stays current. It is never dropped for being quiet (v3.12): the registry is permanent -- only Identify All, De-provision, or a corrupt record removes an entry. Modules only speak when addressed, so a long-lived static message is not a sign of absence.
+#define MODULE_REPROBE_BACKOFF_MS 3600000UL // after MODULE_PROBE_MAX_TRIES unanswered re-queries, leave the module alone for this long before asking again (it stays in the registry throughout)
 #define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before the next probe attempt
 #define MODULE_PROBE_SPACING_MS 150UL     // gap between consecutive stale probes: a module answers a bare 'v' INSTANTLY, so back-to-back queries make each reply collide with the next probe -- space them so every reply is received (and clears the probe) before the next query goes out
 #define MODULE_PROBE_BATCH      8         // max stale modules probed per prune cycle; the rest are probed on later cycles (bounds the net task's spaced-probe burst)
-#define MODULE_PROBE_MAX_TRIES  4         // stale-probe attempts before a module is actually dropped. A single reply is easily lost to a bus collision while the host is streaming display frames, so one probe is not proof of absence -- retry across several prune cycles (~1/min) before evicting a module that may well be alive and displaying.
+#define MODULE_PROBE_MAX_TRIES  4         // unanswered re-queries (one per ~1 min cycle) before backing off for MODULE_REPROBE_BACKOFF_MS. A single reply is easily lost to a bus collision while the host is streaming display frames, so one probe is not proof of absence.
 #define MODULE_POSTPROV_VER_MS  4000UL    // delay after a provisioning ack before the first version query. A freshly-provisioned module writes its new ID to EEPROM and then runs a staggered startup (~150ms x new-ID), so it can be unresponsive for several seconds; wait well past that before the first query.
 #define MODULE_VER_RETRY_MS     2500UL    // gap between post-provision version-query retries
 #define MODULE_VER_MAX_TRIES    6         // give up after this many version-query attempts (covers ~4s + 5x2.5s ~= 16s)
@@ -271,6 +272,34 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 #define COMPANION_TABS_MAX_N   10    // max tabs accepted from a companion
 #define COMPANION_TAB_ID_MAX   24    // max chars of one tab's id (the URL hash)
 #define COMPANION_TAB_LBL_MAX  24    // max chars of one tab's label
+
+/* ---- Restore on boot (FFat) -- v3.12 ----------------------------------------
+ * A calibration backup (the JSON the Settings tab's Backup produces) can be kept
+ * on the gateway and replayed to every module at boot: written by serial number,
+ * ids reassigned, read back and verified, then the wall is homed. While that
+ * runs the gateway refuses every other bus command. See restore.h / restore.cpp.
+ * Names are 8.3-safe like the other FFat files. The size cap only bounds a rogue
+ * upload: a 64-module backup is ~45 KB. */
+#define RESTORE_FILE              "/restore.bak"
+#define RESTORE_TMP               "/restore.tmp"
+#define RESTORE_MAX_BYTES         (256UL * 1024UL)
+#define RESTORE_DEFAULT_DELAY_S   10       // seconds after boot before the replay starts
+#define RESTORE_MAX_DELAY_S       600
+#define RESTORE_STEP_MS           500UL    // silence after a provisioning frame
+// A module CANNOT ingest a long mXW map at line speed: it writes each entry to EEPROM as it
+// parses it and its receive buffer overflows, so entries vanish and the module goes deaf for
+// ~6 s (measured on v31: a 434-byte frame kept 20 of 42 entries). So the map is NOT sent
+// inline. The mXW carries only offset/steps/flap set (and clears the map), the module gets
+// RESTORE_MXW_SETTLE_MS to finish that erase, then each entry goes as its own short
+// m<id>w<i>:<p> frame, RESTORE_ENTRY_GAP_MS apart -- the same frames the calibration wizard
+// sends one at a time. Verification starts no sooner than RESTORE_SETTLE_MS after a module's
+// last write.
+#define RESTORE_MXW_SETTLE_MS     1000UL   // after mXW: the module erases the map and writes the flap set
+#define RESTORE_ENTRY_GAP_MS      60UL     // between m<id>w entries (~12 ms on the wire + ~7 ms EEPROM)
+#define RESTORE_SETTLE_MS         2500UL   // from a module's last write to its first read-back
+#define RESTORE_VERIFY_TIMEOUT_MS 1500UL   // wait for a read-back ('A' is ~200 bytes at 9600 baud)
+#define RESTORE_VERIFY_TRIES      2        // read-back attempts per module per round
+#define RESTORE_REPAIR_ROUNDS     1        // a mismatch/silent module is re-written and re-read this many times
 
 /* ==========================================================================*/
 #define DBG(...) do { if (gSerialDebug) printf(__VA_ARGS__); } while(0)

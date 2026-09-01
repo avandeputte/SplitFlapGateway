@@ -117,7 +117,9 @@ void taskRS485(void* pv) {
       unsigned long nowMs = millis();
       static uint8_t verDue[MAX_MODULES];
       int verN = 0;
-      if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      // Not during a restore-on-boot run: its own read-backs fill the version anyway, and a
+      // bare 'v' (answered instantly) sent between a verify query and its reply could collide.
+      if (!restoreBusy() && sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         for (int i = 0; i < sfModuleCount && verN < MAX_MODULES; i++) {
           SFModule& m = sfModules[i];
           if (!m.verDueMs || nowMs < m.verDueMs) continue;   // not due
@@ -166,7 +168,9 @@ void taskRS485(void* pv) {
       // Not while an image is streaming. An 'A' reply is ~200 bytes that get parsed, ring-pushed
       // and MQTT-queued; none of that may compete with the upload for heap. The wall is not going
       // anywhere, and the fill resumes after the reboot.
-      if (!gOtaInProgress && nowMs - lastFlapQ >= FLAPSET_QUERY_MS) {
+      // Nor during a restore-on-boot run: its verify phase captures ANY dump reply, and a
+      // trickle 'A' landing in that window would be read as the wrong module's EEPROM.
+      if (!gOtaInProgress && !restoreBusy() && nowMs - lastFlapQ >= FLAPSET_QUERY_MS) {
         int askId = -1;
         if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           for (int i = 0; i < sfModuleCount; i++) {
@@ -236,6 +240,7 @@ bool quietSchedInWindow() {
 static void quietScheduleTick() {
   static int prevWant = -1;
   if (gOtaInProgress) return;        // never touch quiet/resync mid-flash (OTA safety)
+  if (restoreBusy())  return;        // nor mid-restore: quiet ON would home the wall under it
 
   // Does the schedule currently want Quiet ON? A DISABLED schedule counts as
   // want=0 (not a hard early-return) so that disabling an active schedule flows
@@ -416,7 +421,7 @@ void taskNetwork(void* pv) {
     }
     // Periodically prune stale modules (once a minute is plenty).
     static unsigned long lastPruneMs = 0;
-    if (millis() - lastPruneMs > 60000UL) {
+    if (!restoreBusy() && millis() - lastPruneMs > 60000UL) {   // no probes while a restore owns the bus
       lastPruneMs = millis();
       sfModulesPruneStale();
     }

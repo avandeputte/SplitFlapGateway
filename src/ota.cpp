@@ -88,7 +88,9 @@ void handleOTAPage() {
     "#status{margin-top:14px;font-size:.9rem}</style></head><body>"
     "<h2>Firmware Update</h2>"
     "<p style='color:#888;font-size:.85rem'>Select a compiled .bin file. "
-    "The gateway will reboot automatically after a successful upload.</p>"
+    "The gateway verifies the image when the last byte lands, then reboots into it. "
+    "The progress bar shows the file leaving your browser; the gateway writes it to "
+    "flash at about 90 KB/s, so a full image takes 15-20 s after the bar fills.</p>"
     "<input type='file' id='fw' accept='.bin'>"
     "<br><button onclick='upload()'>Upload Firmware</button>"
     "<progress id='prog' value='0' max='100' style='display:none'></progress>"
@@ -106,17 +108,28 @@ void handleOTAPage() {
     "document.getElementById('prog').value=p;"
     "document.getElementById('status').textContent='Uploading: '+p+'%';}"
     "};"
+    "var t0=Date.now();"
+    "function back(){"
+    "fetch('/api/config',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){"
+    "document.getElementById('status').innerHTML="
+    "'<span style=\"color:rgb(76,175,80)\">Rebooted. The gateway is back on firmware v'+(c.version||'?')+'. <a href=\"/\" style=\"color:#7c5cff\">Open the dashboard</a></span>';"
+    "}).catch(function(){"
+    "if(Date.now()-t0<90000)setTimeout(back,2000);"
+    "else document.getElementById('status').innerHTML='<span style=\"color:rgb(233,69,96)\">The gateway has not come back after 90 s. Check its power and WiFi, then reload.</span>';"
+    "});}"
     "xhr.onload=function(){"
     "if(xhr.status===200){"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(76,175,80)\">Upload successful! Rebooting... This page will stop responding; wait ~20s and reload.</span>';"
+    "'<span style=\"color:rgb(76,175,80)\">Image verified -- rebooting into it now. Waiting for the gateway to come back...</span>';"
+    "setTimeout(back,4000);"
     "}else{"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(233,69,96)\">Error: '+(xhr.responseText||'upload failed')+'</span>';}"
+    "'<span style=\"color:rgb(233,69,96)\">Error: '+(xhr.responseText||'upload failed')+' The gateway is still running its previous firmware.</span>';}"
     "};"
     "xhr.onerror=function(){"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(233,69,96)\">Upload failed (connection error).</span>';"
+    "'<span style=\"color:rgb(233,69,96)\">The connection dropped during the upload. Nothing was flashed; the gateway is still running its previous firmware. "
+    "Reload this page and try again, or use <code>pio run -e esp32s3_ota -t upload</code>.</span>';"
     "};"
     "xhr.open('POST','/api/ota/upload');"
     "xhr.send(fd);"
@@ -162,7 +175,13 @@ static void otaRestoreWifi() {
 }
 
 void handleOTAUpload() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
+  // NO sendHeader() here. This callback runs once per received chunk -- ~1000 times for a
+  // 1.5 MB image -- and WebServer::sendHeader() APPENDS its line to a String that is only
+  // cleared when the response goes out. A header added per chunk therefore grew a ~30 KB
+  // String through ~1000 reallocations in a ~100 KB heap, and the upload died of heap
+  // exhaustion near the end of every full-size image (seen at 1.17-1.30 MB, with min-free
+  // heap under 1 KB) regardless of how fast the client sent it. The CORS header belongs on
+  // the response, and sendOTAUploadResult() sets it there, once.
 
   // The firmware binary arrives as a multipart/form-data file part. The ESP32
   // WebServer streams it to us in chunks via server.upload(); the empty POST

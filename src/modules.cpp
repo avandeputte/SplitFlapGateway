@@ -208,18 +208,13 @@ void sfModulesLoad() {
     return;
   }
 
-  unsigned long nowEp = rtcEpochNow();  // 0 if RTC not yet valid
   int loaded = 0, pruned = 0;
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < hdr.count && sfModuleCount < MAX_MODULES; i++) {
-    // Prune entries older than MODULE_STALE_SECS (only when we have a
-    // valid clock AND a recorded epoch to compare against).
-    if (nowEp && recs[i].lastSeenEpoch &&
-        nowEp > recs[i].lastSeenEpoch &&
-        (nowEp - recs[i].lastSeenEpoch) > MODULE_STALE_SECS) {
-      pruned++;
-      continue;
-    }
+    // The registry is permanent (v3.12): a record is never dropped for age. A module
+    // not heard from in a long time is re-queried by sfModulesPruneStale, not forgotten,
+    // so /api/capabilities and the module list are complete from the first second after
+    // boot rather than after every module has been asked again.
     // Skip records whose SN fails validation: a bus collision before the
     // validation fix could have persisted a garbage SN (e.g. a glued frame
     // tail). Dropping the record here HEALS the registry -- the module
@@ -249,7 +244,7 @@ void sfModulesLoad() {
     loaded++;
   }
   if (sfMutex) xSemaphoreGive(sfMutex);
-  DBG("[MOD] Loaded %d modules from FATFS (%d pruned as stale)\n", loaded, pruned);
+  DBG("[MOD] Loaded %d modules from FATFS (%d dropped as corrupt)\n", loaded, pruned);
 }
 
 // Wipe both the in-memory registry and the persisted file.
@@ -278,42 +273,42 @@ void sfModulesClear() {
 // Version queries are sent OUTSIDE sfMutex (rs485Send re-takes the lock via
 // frame tracking, so probing under it would deadlock): IDs to probe are
 // collected under the lock, then queried after release.
+// Periodic RE-QUERY of quiet modules (v3.12: this used to be a prune). A module not
+// heard from in MODULE_STALE_SECS gets a bare version query so its record (firmware,
+// serial, last-seen) stays current and a swapped or re-flashed module is noticed. It is
+// NEVER removed for not answering: the registry is permanent, and only Identify All,
+// De-provision or a corrupt record takes an entry out. After MODULE_PROBE_MAX_TRIES
+// unanswered queries the module is left alone for MODULE_REPROBE_BACKOFF_MS, then asked
+// again. A reply (any frame -> sfTouch) clears the probe state.
 void sfModulesPruneStale() {
   unsigned long nowEp = rtcEpochNow();
   if (!nowEp) return;  // no valid clock yet
   unsigned long nowMs = millis();
-  bool changed = false;
   static uint8_t toProbe[MAX_MODULES];
   int probeN = 0;
 
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
-  for (int i = 0; i < sfModuleCount; ) {
+  for (int i = 0; i < sfModuleCount; i++) {
     SFModule& m = sfModules[i];
+    if (!m.provisioned || m.id == 255) continue;   // an advertising module has no id to query
     bool stale = (m.lastSeenEpoch && nowEp > m.lastSeenEpoch &&
                   (nowEp - m.lastSeenEpoch) > MODULE_STALE_SECS);
-    if (!stale || (m.probeMs != 0 && nowMs < m.probeMs)) {
-      i++;   // fresh, or a probe is still within its grace window -> leave it
+    if (!stale) continue;
+    if (m.probeMs != 0 && (long)(nowMs - m.probeMs) < 0) continue;   // grace / backoff pending
+    if (m.probeTries >= MODULE_PROBE_MAX_TRIES) {
+      // Still silent after the retries: back off, keep the record, try again later.
+      m.probeTries = 0;
+      m.probeMs    = nowMs + MODULE_REPROBE_BACKOFF_MS;
+      DBG("[MOD] module %d silent after %d re-queries -- kept, next try in %lu min\n",
+          m.id, MODULE_PROBE_MAX_TRIES, MODULE_REPROBE_BACKOFF_MS / 60000UL);
       continue;
     }
-    // Stale, and either never probed or the last probe's grace elapsed with no
-    // reply (a reply would have called sfTouch, clearing probeMs/probeTries).
-    if (m.probeTries >= MODULE_PROBE_MAX_TRIES) {
-      // Exhausted all probe attempts -> actually drop it.
-      for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
-      sfModuleCount--;
-      memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
-      changed = true;
-      // list compacted -- do not advance i
-    } else if (probeN < MODULE_PROBE_BATCH) {
-      // (Re)probe -- give it another chance to answer before dropping. Bounded
-      // batch per cycle keeps the probe burst short and collision-free; further
-      // stale modules are (re)probed on later cycles.
+    if (probeN < MODULE_PROBE_BATCH) {
+      // Bounded batch per cycle keeps the query burst short and collision-free;
+      // further quiet modules are asked on later cycles.
       m.probeMs = nowMs + MODULE_PROBE_GRACE_MS;
       m.probeTries++;
       toProbe[probeN++] = m.id;
-      i++;
-    } else {
-      i++;   // batch full this cycle -> retry next cycle (never drop here)
     }
   }
   if (sfMutex) xSemaphoreGive(sfMutex);
@@ -325,14 +320,13 @@ void sfModulesPruneStale() {
   // "probed". A short gap lets each reply land and be parsed (sfTouch clears the
   // probe and refreshes lastSeen) before the next query goes out.
   for (int i = 0; i < probeN; i++) {
-    DBG("[MOD] stale module %d -- probing before drop\n", toProbe[i]);
+    DBG("[MOD] quiet module %d -- re-querying\n", toProbe[i]);
     sfQueryVersion(toProbe[i]);
     for (unsigned long w = 0; w < MODULE_PROBE_SPACING_MS; w += 10) {
       wdgNetMs = millis();                  // keep the net-task watchdog fed
       vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
-  if (changed) sfModulesDirty = true;
 }
 
 /* ----------------------------------------------------------
@@ -557,6 +551,57 @@ void sfFactoryResetBySN(const char* sn) {
 static void sfRestoreBySN(const char* payload) {
   // payload is the full mXW... command string (caller builds it)
   rs485SendStr(payload);
+}
+
+bool sfIsValidSN(const char* sn) { return sfValidSN(sn); }
+
+bool sfLookupBySN(const char* sn, uint8_t* idOut, char* fwOut, size_t fwLen) {
+  bool found = false;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* m = sfFindBySN(sn);
+  if (m) {
+    found = true;
+    if (idOut) *idOut = m->id;
+    if (fwOut && fwLen) strlcpy(fwOut, m->fwVersion, fwLen);
+  }
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  return found;
+}
+
+// The one place the mXW frame is assembled, shared by POST /api/flap/restorebysn and
+// restore-on-boot. The firmware's mXW tail parser matches this layout: a count-only
+// tail is ":<count>", a chars-only tail "::<chars>", and both ":<count>:<chars>".
+// Every piece checks that the running length stays inside the buffer (snprintf
+// returns the length it WOULD have written), so an overflow is reported, not truncated.
+size_t sfBuildRestoreFrame(const char* sn, int homeOffset, int totalSteps, const char* map,
+                           int flapCount, const char* flapBytes, char* out, size_t outLen) {
+  bool hasCount = (flapCount >= 1 && flapCount <= SF_MAX_FLAPS);
+  bool hasChars = (flapBytes && flapBytes[0] && strlen(flapBytes) <= SF_MAX_FLAPS);
+  char tail[8 + SF_MAX_FLAPS + 2] = "";   // ":<count>:<chars>" worst case
+  if (hasCount || hasChars) {
+    int t = snprintf(tail, sizeof(tail), ":");
+    if (hasCount) t += snprintf(tail + t, sizeof(tail) - t, "%d", flapCount);
+    if (hasChars) t += snprintf(tail + t, sizeof(tail) - t, ":%s", flapBytes);
+    if (t < 0 || (size_t)t >= sizeof(tail)) return 0;
+  }
+  int n = snprintf(out, outLen, "mXW%s:%d:%d:%s%s\n", sn, homeOffset, totalSteps, map ? map : "", tail);
+  if (n < 0 || (size_t)n >= outLen) return 0;
+  return (size_t)n;
+}
+
+// `charSet` is UTF-8 (as received over JSON); it is converted to the single-byte flap
+// encoding (Windows-1252) the bus protocol and module firmware use -- so euro signs and
+// accented letters each become one flap byte (see charset.h).
+const char* sfValidateCharSet(const char* charSet, char* out, size_t outLen) {
+  char tmp[SF_MAX_FLAPS * 4 + 4];          // hold the transcode before length-check
+  bool allMapped = true;
+  size_t n = utf8ToFlap(charSet, tmp, sizeof(tmp), &allMapped);
+  if (!allMapped)        return "charSet has characters not in Windows-1252";
+  if (n == 0)            return "charSet has no displayable characters";
+  if (n > SF_MAX_FLAPS)  return "charSet too long (max 64 characters)";
+  if (n + 1 > outLen)    return "charSet too long";
+  memcpy(out, tmp, n + 1);
+  return nullptr;
 }
 
 // Home one module or all (addr=-1)
@@ -1125,8 +1170,10 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     strlcpy(clean, p + 1, sizeof(clean));
     size_t dl = strlen(clean);
     while (dl > 0 && (clean[dl-1] == '\n' || clean[dl-1] == '\r')) clean[--dl] = 0;
-    if (gDump.waitId == (int)id) {
+    if (gDump.waitId == (int)id || gDump.waitId == SF_WAIT_ANY) {
       strlcpy(gDump.data, clean, sizeof(gDump.data));
+      gDump.gotId    = id;
+      gDump.gotSN[0] = 0;          // a 'd' reply does not name its serial
       gDump.ts = millis();
     }
     // Size the MQTT-event payload to the queue slot. The REST dump path
@@ -1163,6 +1210,18 @@ void sfParseResponse(const uint8_t* data, size_t len) {
         aFlapCount = atoi(c8 + 1);
         if (c9) strlcpy(aFlapChars, c9 + 1, sizeof(aFlapChars));
       }
+      // A v31 tail is always <count>:<chars> with exactly <count> characters. Anything
+      // else means the reply lost its tail on the way in (a long 'A' reply truncated
+      // mid-transmission has been seen to yield "64:" + 3 characters). Recording THAT
+      // would poison the registry, capabilities, and any backup taken from it -- and a
+      // restore of such a backup writes the truncated set into the module. So an
+      // inconsistent tail is treated as "not reported", like a pre-v31 reply.
+      if (aFlapCount > 0 && (int)strlen(aFlapChars) != aFlapCount) {
+        DBG("[SF] Module %d: inconsistent flap tail (%d flaps, %u chars) -- ignored\n",
+            id, aFlapCount, (unsigned)strlen(aFlapChars));
+        aFlapCount = -99;
+        aFlapChars[0] = 0;
+      }
     }
     // Split into the 7 scalar fields plus the trailing map (which has no ':').
     // f: 0 ver, 1 modId, 2 sn, 3 homeOffset, 4 totalSteps, 5 autoHome, 6 curIndex, 7 map
@@ -1194,9 +1253,11 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     // 'A'-only extras (autoHome, curIndex, self-reported id) ride along in
     // dedicated globals -- they can't go in the dump string without breaking
     // parseDump, which expects exactly ho:ts:map. All set BEFORE the ready flag.
-    if (gDump.waitId == (int)id) {
+    if (gDump.waitId == (int)id || gDump.waitId == SF_WAIT_ANY) {
       snprintf(gDump.data, sizeof(gDump.data), "%s:%s:%s",
                f[3] ? f[3] : "", f[4] ? f[4] : "", f[7] ? f[7] : "");
+      gDump.gotId = id;
+      strlcpy(gDump.gotSN, f[2] ? f[2] : "", sizeof(gDump.gotSN));
       gDump.autoHome   = (f[5] && f[5][0]) ? atoi(f[5]) : -99;
       gDump.curIndex   = (f[6] && f[6][0]) ? atoi(f[6]) : -99;
       gDump.reportedId = reportedId;   // module's self-reported id (f[1])

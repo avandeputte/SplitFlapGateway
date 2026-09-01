@@ -160,6 +160,18 @@
   Sent **by character** (`m<id>-<char>`), not by index like the Matrix: index *N* names a different
   glyph on a module with a different reel, whereas the byte lets each module map it against its own.
 
+## New in 3.12
+
+- **Restore on boot** — upload a calibration backup to the gateway and have it **replayed to
+  every module on every boot**. Each module's calibration (home offset, steps per revolution,
+  flap map, and a v31+ flap set) and its **ID** are written by serial number, read back and
+  verified, and the whole wall is homed at the end. While it runs the gateway **refuses every
+  other module command** — REST answers `503 {"error":"restore in progress"}`, MQTT commands
+  are dropped — and the dashboard shows a red border and banner with the progress. It always
+  finishes on its own (a module that never answers is counted, not waited for), and it can be
+  started or cancelled by hand. Settings tab → **Restore on Boot**; see
+  [Restore on Boot](#restore-on-boot).
+
 ## Table of Contents
 
 - [Hardware](#hardware)
@@ -171,6 +183,8 @@
   - [Language](#language)
 - [Companion App](#companion-app)
   - [Companion Settings Storage](#companion-settings-storage)
+- [Module List Persistence](#module-list-persistence)
+- [Restore on Boot](#restore-on-boot)
 - [Split-Flap Protocol](#split-flap-protocol)
 - [REST API](#rest-api)
   - [RS-485 Bus](#rs-485-bus)
@@ -211,9 +225,10 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 - **Web UI** — single-page dashboard accessible from any browser, in the same **Home Assistant design language** as the companion (light or dark, following your browser/OS)
 - **[Companion app](#companion-app)** — an optional content engine (apps, playlists, schedules, triggers) that runs on a Raspberry Pi or any Linux box and drives the display over REST. It registers itself with the gateway, which then shows a **Companion** tab, and it can keep its own settings in the gateway's flash so its container stays stateless
 - **Module management** — discover, provision, home, calibrate, and deprovision split-flap modules (up to 255: IDs 0-254)
-- **Sticky module list** — the known-module registry persists across reboots in flash; a stale module is version-probed before being dropped (so a merely-quiet module isn't lost), and a gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
+- **Permanent module list** — the known-module registry persists across reboots in flash and **(v3.12)** is never pruned: a module not heard from in a day is re-queried so its record stays current, but only Identify All or De-provision removes one. A gateway that boots with an empty list broadcasts `m*v` to rediscover modules automatically
 - **Per-module actions** — each module card has Home, Info, and destructive-action icons. The Info dialog shows all known module data plus a parsed view of its EEPROM (home offset, steps/rev, and the calibrated flap map). The destructive-actions dialog (red trash icon) offers Erase EEPROM, Factory Reset, and De-provision, each with a confirmation prompt
 - **Backup & restore** — on the Settings tab: download all module calibration to a JSON file and restore it later by serial number, with an option to also reassign module IDs (a v31+ module's configurable flap set is captured and restored too)
+- **Restore on boot** — **(v3.12)** keep a backup file on the gateway and replay it to every module on **every boot**: calibration and IDs are written by serial number, read back and verified, then the wall is homed. While it runs the gateway refuses every other module command (REST answers 503, MQTT commands are dropped) and the dashboard shows a red border and banner; it always finishes on its own, and can be run or cancelled by hand. See [Restore on Boot](#restore-on-boot)
 - **Configurable flap set** — modules on firmware v31+ let you set the active flap count (1–64) and the ordered character set per module from the Info dialog, or push one set to a whole panel with a broadcast; the live values are read back from the `A` dump and persist in module EEPROM. Characters aren't limited to ASCII: the **euro sign `€` and accented letters** (Windows-1252) are supported — type them as UTF-8 and the gateway transcodes to the single byte the bus uses
 - **Module self-diagnostics** — modules on firmware v26+ gain a 🩺 icon that runs three built-in tests and interprets the results: an instant **stats snapshot** (reset cause, boot count, supply voltage, EEPROM verify, current flap index), a **Hall sensor self-test** (home-sensor health), and a motor-driven **mechanical self-test** that detects intermittent missed steps (drag / weak supply / failing driver) or a stalled reel — with a selectable rotation count (5–20, firmware v29+) for deeper runs
 - **Connection test** — a "Test Connection" button on the Settings tab verifies MQTT broker reachability and credentials before saving
@@ -367,7 +382,7 @@ preference automatically; there is no theme setting to configure.
 | **Provision** | Discover unprovisioned modules, home by serial number to identify them physically, assign IDs, de-provision individually or all at once |
 | **Calibration** | Fine-tune any module on the bus — known or not. The module picker is a grid matching your display layout (every position, IDs 0 to rows×cols−1), color-coded green (known), yellow (legacy v7), or dim (not yet seen); you can also type any ID directly, or **Home All** to home every module at once (broadcasts `m*h`). For the selected module you can edit and save **Home Offset** and **Total Steps** in place (each with Save and Revert-to-default), nudge the home offset live, and **Count Steps** (runs the calibrate command — the reel spins one revolution to measure steps/rev, then the measured value is written back). The character map shows every flap (in the module's own character order, with colour flaps as swatches) and its current step position (custom EEPROM values in green, firmware defaults in grey); clicking one opens a tune dialog to GOTO-test a target step, fine-adjust it with nudge buttons, then Lock to EEPROM or Revert (which unsets the entry so the flap uses its default again). A guided **Calibration Wizard** steps through every flap one at a time. The map, the Wizard, and the whole-board walk all honour a module's **custom flap set** (character order and flap count) on firmware v31+, falling back to the default 64-flap reel on older modules. See the **[Module Calibration Guide](CALIBRATION_GUIDE.md)** for a full walkthrough. |
 | **Bus Monitor** | Live decoded RS-485 traffic with timestamps shown in your browser's local timezone. Pause and auto-scroll preferences persist across visits, and **Download Log** saves the captured frames (up to 5000 lines) as a text file. A **Send Frame** box transmits an arbitrary frame; the gateway normalizes framing and trims trailing junk by default, with a **Raw** checkbox to send bytes verbatim for debugging. |
-| **Settings** | **Language** (defaults to *Auto*, which follows your browser — see [Language](#language)), WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update, and **backup & restore** — download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. |
+| **Settings** | **Language** (defaults to *Auto*, which follows your browser — see [Language](#language)), WiFi credentials, MQTT broker, timezone, NTP server, display layout (rows x columns for the Live Display), serial debug toggle, OTA firmware update, and **backup & restore** — download a JSON backup of every module's EEPROM calibration (keyed by serial number), and restore calibration from a backup file. Restore matches modules by serial number; an option lets you also reassign module IDs from the backup. **(v3.12)** **Restore on Boot** — store a backup on the gateway, and have it replayed on every boot (see [Restore on Boot](#restore-on-boot)). |
 | **Status** | Grouped into Network, System Health, RS-485 Bus, and Clock sections. Shows uptime, frame counters, IP addresses, free heap, minimum-ever heap, lowest per-task stack headroom, MQTT state, RTC time, and NTP sync — with color-coded health indicators |
 
 ### Language
@@ -530,12 +545,17 @@ dashboard isn't empty after a restart.
 - Only durable fields are saved (ID, serial number, provisioned flag, firmware
   version, and a last-seen wall-clock timestamp). Transient display state and
   EEPROM dumps are not persisted.
-- Entries not seen for **6 hours** are checked at boot and once a minute. Rather
-  than dropping a stale module outright, the gateway first sends it a version
-  query (`m<id>v`) and waits a few seconds — modules only speak when addressed,
-  so "not seen" usually just means "nothing talked to it." Only if the module
-  fails to answer the probe is it removed. The 6-hour window uses the
-  battery-backed RTC clock, so it measures real elapsed time across reboots.
+- **(v3.12)** The list is **permanent**. A module is never removed for being quiet:
+  modules only speak when addressed, so "not seen" just means "nothing talked to
+  it", and a wall that has been showing a static message for a week is still a
+  wall. Instead, a module not heard from in **24 hours** is re-queried once a
+  minute with a version query (`m<id>v`), a few at a time, so its firmware,
+  serial and last-seen stay current and a swapped or re-flashed module is
+  noticed; after four unanswered queries it is left alone for an hour and then
+  asked again. Only **Identify All**, **De-provision**, or a corrupt record
+  removes an entry. Because nothing has to be re-discovered, the module list and
+  `GET /api/capabilities` (which is built from the persisted flap sets) are
+  complete from the first second after boot.
 - If the gateway boots with an **empty registry** (first boot, or after Identify
   All), it broadcasts `m*v` once at startup so every module on the bus reports
   its version and serial and repopulates the list automatically.
@@ -551,6 +571,83 @@ dashboard isn't empty after a restart.
 > (a one-time operation that adds a few seconds to boot — you'll see a
 > `formatting now` message on the serial console). Every subsequent boot mounts
 > instantly.
+
+---
+
+## Restore on Boot
+
+**New in 3.12.** The gateway can keep a calibration backup in its own flash and
+**replay it to every module on every boot**. It exists for walls whose modules lose
+or corrupt their EEPROM calibration, or get swapped around: the backup is the source
+of truth, and every power cycle puts the wall back exactly as the backup describes.
+
+**Setting it up** (Settings tab → *Restore on Boot*):
+
+1. Create a backup with **Backup Calibration** (or use one you already have — it is
+   the same JSON file).
+2. **Upload to Gateway**. The file is checked before it is accepted: it must be a
+   backup with at least one usable module (a serial number and a parseable dump).
+   The card then shows how many modules it holds and when it was created. Uploading
+   again replaces it; **Delete Stored Backup** removes it.
+3. Tick **Restore calibration on every boot**, set the **delay after boot** (default
+   10 s — long enough for the modules to power up and finish their own auto-home),
+   and **Save**.
+
+**Run Restore Now** replays the stored backup immediately, without a reboot, which is
+also the way to test a freshly uploaded file.
+
+**What a run does**, in order:
+
+- **Waits** out the delay. The bus is already locked at this point.
+- **Writes** each module in turn. First an `mXW` frame by serial number carrying the
+  home offset, steps per revolution and (firmware v31+) the flap set — which also
+  clears the module's flap map — then a pause for the module to finish that erase,
+  then **every map entry as its own short `m<id>w<i>:<p>` frame**, paced, exactly as
+  the calibration wizard writes them. The map is deliberately not sent inside the
+  `mXW`: a module writes each entry to EEPROM as it parses it and cannot keep up with
+  a long frame at line speed, so entries vanish and the module goes deaf for several
+  seconds (measured on v31 firmware: a 434-byte frame left 20 of 42 entries). If the
+  backup's **ID** for that serial differs from the one the gateway knows, the module
+  is re-provisioned (`mXI`) between those two steps and given time to restart.
+- **Verifies** each module: its EEPROM is read back (`mXA` by serial on firmware
+  v25+, `mXD` on v15+, `m<id>d` on older modules) and compared field by field — home
+  offset, steps per revolution, every flap position, and the flap set when both sides
+  have one. A module that differs or does not answer is written once more and read
+  back again; after that the verdict stands. A re-provisioned module is given time to
+  restart before it is asked anything.
+- **Homes** the whole wall (`m*h`), so every reel re-homes against its restored
+  calibration.
+
+**While it runs, nothing else touches the bus.** Every REST endpoint that would send a
+frame — display, home, calibrate, provisioning, dumps, diagnostics, raw sends and
+batches, quiet-time ON — answers `503 {"error":"restore in progress"}`, and MQTT
+commands are dropped (the maintenance switch still works). The dashboard shows a red
+border and a banner with the phase and progress, and the Settings card shows the
+detail. Read-only endpoints, settings, the bus monitor, the status page and OTA keep
+working, so you can watch the run, or **cancel** it. The gateway's own background
+bus traffic (the flap-set trickle, stale-module probes, the quiet-time schedule)
+pauses too.
+
+**A flap set is only restored when it is self-consistent** — the character set must
+be exactly `flapCount` long. A backup taken from a read-back that lost its tail can
+carry `flapCount: 64` with three characters, and restoring that would write the
+truncated set into the module; such an entry restores the calibration and leaves the
+module's flap set alone. The gateway now also refuses to *record* an inconsistent tail
+from a module's `A` reply (it is treated as "not reported"), so new backups and
+`/api/capabilities` never carry one.
+
+**It always finishes.** Every wait is bounded: a module that never answers is
+counted as *not answering* and the run moves on, so a missing or unplugged module
+can never leave the gateway locked. When it ends, the card reports how many modules
+were verified, mismatched, not answering, or skipped (an entry without a serial or
+with a dump the gateway could not parse), and `GET /api/restore` carries the same
+numbers. A restore that cannot even start — the setting is on but no usable backup is
+stored — is logged and skipped **without** locking anything.
+
+The backup lives in the FATFS partition (`/restore.bak`), written via a temp file and
+rename like the module list, so an interrupted upload cannot corrupt a good copy; it
+survives OTA firmware updates. The setting and delay are in NVS with the other
+configuration.
 
 ---
 
@@ -711,7 +808,7 @@ A module running **firmware v26 or newer** shows a 🩺 diagnostics icon in the 
 | `POST` | `/api/flap/homebysn` | `{"sn":"AABBCCDD"}` | Home by serial number |
 | `POST` | `/api/flap/dumpbysn` | `{"sn":"AABBCCDD"}` | Dump EEPROM by serial number (fw v15+) |
 | `POST` | `/api/flap/factoryresetbysn` | `{"sn":"AABBCCDD"}` | Factory reset by serial number |
-| `POST` | `/api/flap/restorebysn` | `{"sn":"...","homeOffset":42,"totalSteps":4096,"map":"0=210,1=320,...","flapCount":40,"charSet":" ABC…"}` | Restore EEPROM by serial number. The optional `flapCount`/`charSet` (firmware v31+) restore the configured flap set so a backup round-trips; omit them to leave the module's flap set unchanged |
+| `POST` | `/api/flap/restorebysn` | `{"sn":"...","homeOffset":42,"totalSteps":4096,"map":"0=210,1=320,...","flapCount":40,"charSet":" ABC…","id":5}` | Restore EEPROM by serial number. The optional `flapCount`/`charSet` (firmware v31+) restore the configured flap set so a backup round-trips; omit them to leave the module's flap set unchanged. **(v3.12)** The map is written **entry by entry**: the `mXW` carries offset, steps and flap set (and clears the map), then each entry is scheduled as its own `m<id>w` frame, paced on the RS-485 task, using the optional `id` or the registry's id for that serial. Returns at once with `{ok,entries,perEntry,id,settleMs}` — wait `settleMs` before re-provisioning or reading the module back. With no id known the map goes inline (the old behaviour, which a module may not keep up with) |
 
 When a module acknowledges provisioning, the gateway marks it **provisioning-confirmed** and, after a brief settling delay, queries its firmware version (`m<id>v`) to record the version in the registry. The short delay matters: a version request sent the instant the ack arrives reaches the module before it has settled on its new ID, so no reply comes back; the query is also retried a few times until the version is read. A provisioning-confirmed module is never shown as **legacy** — legacy (v7) modules have no serial number and never acknowledge provisioning, so an ack is definitive proof the module is modern, regardless of whether its version has been read back yet. The Modules grid is always sorted by ID (unprovisioned modules last), so a newly provisioned module slots into its proper place rather than appearing at the end.
 
@@ -741,7 +838,7 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
-| `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap, maintenance and quiet flags |
+| `GET` | `/api/status` | — | Uptime, IP, MQTT, RTC time, NTP, heap, maintenance and quiet flags, and **(v3.12)** `restore` — `{state,done,total,startsIn}` of the restore-on-boot run (`state` idle/waiting/writing/verifying/homing/done/failed/cancelled) |
 | `GET` | `/api/capabilities` | — | **(v3.7)** What the wall can show: `union` (any module), `common` (every module), per-reel `sets` with the module ids that carry each, the colour flaps present by name, and `assumed`/`unknown` module lists. Answered identically by the Matrix Portal gateway. See [New in 3.7](#new-in-37) |
 | `GET` | `/api/maintenance` | — | Returns `{ok,on}` — current maintenance-mode state |
 | `POST` | `/api/mqtt/test` | `{"host":"...","port":1883,"user":"...","pass":"..."}` (all optional, defaults to saved config) | Test broker reachability + credentials without touching the live connection |
@@ -754,11 +851,16 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `POST` | `/api/companion` | `{"url":"http://192.168.1.60:8000","status":"Running: Weather","tabs":[{"id":"apps","label":"Apps"}]}` | Register the companion (an empty `url` deregisters it) and heartbeat its status. **(v3.4)** may also advertise `tabs` — the deep links its own UI offers; the reply always carries `gwTabs`. The URL is persisted (debounced); status and tabs are runtime-only |
 | `GET` | `/api/companion/settings` | — | **(v3.1)** The companion's stored settings blob (gzipped JSON, `application/gzip`), or `404` if none is stored |
 | `PUT` | `/api/companion/settings` | `gzip(minified JSON)` — binary body | **(v3.1)** Store the blob verbatim and atomically (max 64 KB). Returns `{"ok":true,"bytes":N}`. See [Companion Settings Storage](#companion-settings-storage) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.8.0"` |
+| `GET` | `/api/restore` | — | **(v3.12)** Restore-on-boot: the setting (`enabled`, `delay`), the stored backup (`file.exists/bytes/modules/entries/created`), and the current or last run (`state`, `busy`, `trigger`, `total`, `done`, `okCount`, `mismatch`, `missing`, `skipped`, `startsIn`, `elapsed`, `finishedAgo`, `lastError`). See [Restore on Boot](#restore-on-boot) |
+| `PUT` | `/api/restore/backup` | a backup JSON file — raw body | **(v3.12)** Store the backup on the gateway. It is parsed before it is accepted (at least one usable module), then written atomically; a bad file never replaces a good one. Max 256 KB. `409` while a restore runs, `422` with the reason if the file is not a usable backup |
+| `DELETE` | `/api/restore/backup` | — | **(v3.12)** Delete the stored backup (`409` while a restore runs) |
+| `POST` | `/api/restore/run` | `{"delay":0}` (optional, seconds) | **(v3.12)** Replay the stored backup now. Locks the bus at once; `409` if one is already running, `404` if nothing usable is stored |
+| `POST` | `/api/restore/cancel` | — | **(v3.12)** Stop a running restore after its current step (`409` if none is running) |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.8.0"` — and **(v3.12)** `restoreOnBoot` / `restoreDelay` |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
-| `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"haEnabled":true}` or `{"otaPassword":"..."}` | Timezone, serial debug, Home Assistant integration, or OTA password |
+| `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"haEnabled":true}` or `{"otaPassword":"..."}` or `{"restoreOnBoot":true,"restoreDelay":10}` | Timezone, serial debug, Home Assistant integration, OTA password, or **(v3.12)** restore-on-boot (enable flag and post-boot delay in seconds, 0–600) |
 
 ### OTA Firmware Update
 
@@ -885,9 +987,24 @@ After the initial USB flash, all subsequent updates can be done over WiFi.
 >
 > The common mistake is grabbing `firmware.factory.bin`. For OTA you always want the plain `firmware.bin`.
 
+> **Fixed in 3.12.** Before 3.12 the browser upload failed near the end of every full-size
+> image: the connection reset at about 1.2–1.3 MB, nothing was flashed, and the board stayed
+> on its old firmware. The upload callback added a response header on every received chunk,
+> and the web server keeps each of those (as a heap-allocated node) until the response goes
+> out, so ~1000 chunks ate ~80 KB of a 100 KB heap. The header is now set once, on the
+> response, and a full image uploads in about 10 s with 80 KB of heap to spare. The page also
+> waits for the gateway to come back and reports the firmware version it rebooted into.
+
 ### Command line (espota)
 
-As an alternative to the browser upload, you can flash over the network with `espota`. The gateway advertises over mDNS as `splitflap-gw`:
+An alternative to the browser upload that needs no page open. The gateway advertises over
+mDNS as `splitflap-gw-<6 hex digits>` (printed at boot; `dns-sd -B _arduino._tcp` lists it):
+
+```bash
+# PlatformIO: the esp32s3_ota environment is preconfigured for it
+pio run -e esp32s3_ota -t upload                       # upload_port from platformio.ini
+pio run -e esp32s3_ota -t upload --upload-port 192.168.1.105
+```
 
 ```bash
 # from .pio/build/esp32s3_devmodule/

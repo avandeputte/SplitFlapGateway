@@ -132,6 +132,12 @@ void setup() {
   xTaskCreatePinnedToCore(taskWeb,     "Web",     8192, NULL, 2, &hTaskWeb,   0);
   xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
 
+  // 8. Restore-on-boot (v3.12). If enabled and a usable backup is stored, this locks the
+  // bus NOW -- every REST/MQTT module command is refused from here on -- and schedules the
+  // replay for cfg.restoreDelaySec after boot, so the modules have finished their own
+  // power-up homing first. The lock always releases: see restore.cpp.
+  restoreInit();
+
   printf("[Boot] Ready\n");
 }
 

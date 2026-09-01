@@ -100,8 +100,15 @@ struct ModulesFileHeader {
 // The web task arms a wait-id, sends a bus frame, then polls a ready timestamp
 // the RS485 parser sets when the matching reply lands. One slot each: the
 // synchronous web server serves a single request at a time.
+// Restore-on-boot (restore.cpp) reads modules back BY SERIAL and cannot know which id
+// the reply will carry, so it arms waitId with this wildcard; the parser then records
+// which module actually answered in gotId / gotSN. Safe because every other user of
+// the slot (the REST dump handlers) is refused while a restore runs.
+#define SF_WAIT_ANY (-2)
 struct DumpCapture {                 // EEPROM 'd' dump / combined 'A' reply
-  volatile int           waitId   = -1;            // module id being waited on
+  volatile int           waitId   = -1;            // module id being waited on, or SF_WAIT_ANY
+  volatile int           gotId    = -1;            // id the captured reply came from
+  char                   gotSN[21] = "";           // serial an 'A' reply named ("" for a 'd' reply)
   char                   data[TX_MAX_BYTES] = "";  // raw dump after 'd:'
   volatile unsigned long ts       = 0;             // millis() when captured (0=none)
   // Fields ONLY an 'A' (combined) reply carries; -99 = not provided.
@@ -157,6 +164,20 @@ extern volatile unsigned long sfModulesDirtyMs;
 extern bool sfFsReady;
 
 SFModule* sfFindById(uint8_t id);
+// True if `sn` has the shape of a module serial (4-20 alphanumerics).
+bool sfIsValidSN(const char* sn);
+// Look a module up by serial (takes sfMutex). Fills the non-NULL outs; false if unknown.
+bool sfLookupBySN(const char* sn, uint8_t* idOut, char* fwOut, size_t fwLen);
+// Build the by-serial EEPROM restore frame mXW<sn>:<ho>:<ts>:<map>[:<count>[:<chars>]]\n.
+// flapCount<1 and flapBytes NULL/"" leave the module's flap set unchanged; flapBytes are
+// bus bytes (already transcoded, see sfValidateCharSet). Returns the frame length, or 0
+// if it would not fit in outLen -- a truncated restore would corrupt the module's EEPROM,
+// so callers must refuse rather than send a partial map.
+size_t sfBuildRestoreFrame(const char* sn, int homeOffset, int totalSteps, const char* map,
+                           int flapCount, const char* flapBytes, char* out, size_t outLen);
+// Validate a UTF-8 flap character set and transcode it to the single-byte bus encoding
+// (Windows-1252) into `out` (NUL-terminated). NULL on success, else an error message.
+const char* sfValidateCharSet(const char* charSet, char* out, size_t outLen);
 void sfFsInit(bool forceFormat = false);
 // The flap set a module is BELIEVED to have, and how sure the gateway is of it.
 enum FlapSetSource { FLAPSET_REPORTED, FLAPSET_ASSUMED, FLAPSET_UNKNOWN };

@@ -37,6 +37,8 @@ tags:
     description: Persistent configuration
   - name: Companion
     description: Companion-app registration and its settings blob store
+  - name: Restore
+    description: Restore-on-boot — a stored calibration backup replayed to every module (v3.12)
   - name: UI
     description: The dashboard itself (translation dictionaries)
   - name: OTA
@@ -1062,9 +1064,15 @@ paths:
       tags: [Provision]
       summary: Restore EEPROM to a module by serial number
       description: |
-        Sends `mXW<sn>:<homeOffset>:<totalSteps>:<map>[:<flapCount>:<flapChars>]\n`.
-        Module ID is always preserved; all other calibration fields and the
-        flap position map are overwritten. Map entries not present are cleared.
+        Sends `mXW<sn>:<homeOffset>:<totalSteps>:[:<flapCount>:<flapChars>]\n` (offset, steps
+        and flap set; this also clears the module's flap map), then **(v3.12)** writes the map
+        **entry by entry** as paced `m<id>w<i>:<p>` frames scheduled on the RS-485 task — a
+        module cannot keep up with a long map inside one frame (entries vanish and it goes
+        deaf for seconds). That needs the module's current id: the optional `id`, else the
+        registry's id for that serial; only if neither is known does the map go inline, the
+        old way. The call returns at once; wait `settleMs` before re-provisioning the module
+        or reading it back. Module ID is always preserved; all other calibration fields and
+        the flap position map are overwritten. Map entries not present are cleared.
         The optional `flapCount`/`charSet` (firmware v31+) restore the configurable
         flap set so a backup round-trips; omit them to leave the module's flap set
         unchanged. `charSet` is UTF-8 (any Windows-1252 character — ASCII plus € and
@@ -1086,9 +1094,20 @@ paths:
                   example: "0=210,1=320,2=430"
                 flapCount:   { type: integer, minimum: 1, maximum: 64, description: "Active flap count (firmware v31+); omit to leave unchanged." }
                 charSet:     { type: string, maxLength: 64, description: "Ordered character set (firmware v31+), UTF-8; any Windows-1252 char (ASCII + € + accents). Omit to leave unchanged." }
+                id:          { type: integer, minimum: 0, maximum: 254, description: "The module's CURRENT id, for the per-entry map frames (v3.12). Omit to use the registry's id for this serial." }
       responses:
         "200":
-          $ref: "#/components/responses/Ok"
+          description: Accepted. The mXW was sent; the map entries are scheduled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:       { type: boolean, example: true }
+                  entries:  { type: integer, description: "Map entries in the request", example: 42 }
+                  perEntry: { type: boolean, description: "true if the entries were scheduled one per frame; false if the map went inline (no id known, or the TX queue was full)", example: true }
+                  id:       { type: integer, description: "The id the entry frames were addressed to (-1 if none known)", example: 11 }
+                  settleMs: { type: integer, description: "Milliseconds until the last entry has been sent and the module has settled; wait this long before re-provisioning or reading back", example: 5960 }
         "400":
           $ref: "#/components/responses/BadRequest"
 
@@ -1399,6 +1418,142 @@ paths:
 
   # ── Companion app ───────────────────────────────────────────────
 
+  # ── Restore on boot (v3.12) ──────────────────────────────────────
+
+  /api/restore:
+    get:
+      tags: [Restore]
+      summary: Restore-on-boot setting, stored backup, and run progress
+      description: |
+        Everything the Settings tab's **Restore on Boot** card shows: whether the replay is
+        enabled and its post-boot delay, what backup is stored on the gateway, and the state
+        and counters of the current or most recent run. While `busy` is true every endpoint
+        that would touch the RS-485 bus answers `503 {"error":"restore in progress"}` and
+        MQTT commands are dropped. The setting itself is changed through
+        `POST /api/config/settings` (`restoreOnBoot`, `restoreDelay`).
+      responses:
+        "200":
+          description: Restore-on-boot status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreStatus" }
+
+  /api/restore/backup:
+    put:
+      tags: [Restore]
+      summary: Store a calibration backup on the gateway
+      description: |
+        The body is a backup JSON file — the file **Backup Calibration** downloads
+        (`{"version":1,"created":"…","modules":[{"sn","id","dump","flapCount","flapChars"}]}`).
+        It streams to a temp file and is **parsed before it is accepted**: it must be valid
+        JSON with a `modules` array holding at least one usable entry (a serial number and a
+        `dump` of the form `<homeOffset>:<totalSteps>:<map>`). Only then is it renamed over
+        the live copy, so a bad upload never replaces a good backup. At most 256 KB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: "A calibration backup file" }
+      responses:
+        "200":
+          description: Stored; the body is the new restore status (with the file summary)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreStatus" }
+        "400":
+          description: Empty or truncated body — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: A restore is running — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: Larger than 256 KB — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Not a usable backup (the `error` says why) — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: No filesystem
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Restore]
+      summary: Delete the stored backup
+      description: |
+        Removes the stored backup. The enable flag is left as it is: an enabled restore with
+        nothing stored is logged and skipped at boot, without locking the bus.
+      responses:
+        "200":
+          description: Deleted; the body is the new restore status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreStatus" }
+        "409":
+          description: A restore is running — nothing was changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/restore/run:
+    post:
+      tags: [Restore]
+      summary: Replay the stored backup now
+      description: |
+        Starts a run exactly like the one at boot, without rebooting: the bus locks at
+        once, the run starts after `delay` seconds (default 0), writes and verifies every
+        module, homes the wall, and unlocks. `409` if a run is already in progress, `404`
+        if no usable backup is stored.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                delay: { type: integer, minimum: 0, maximum: 600, example: 0, description: "Seconds to wait before the first frame" }
+      responses:
+        "200":
+          description: Started; the body is the restore status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreStatus" }
+        "404":
+          description: No usable backup is stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: A restore is already running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/restore/cancel:
+    post:
+      tags: [Restore]
+      summary: Cancel a running restore
+      description: Stops the run after its current step and releases the bus. `409` if none is running.
+      responses:
+        "200":
+          description: Cancel requested; the body is the restore status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreStatus" }
+        "409":
+          description: No restore is running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/companion:
     get:
       tags: [Companion]
@@ -1614,6 +1769,8 @@ paths:
                 serialDebug: { type: boolean, example: true }
                 haEnabled:   { type: boolean, example: true, description: "Enable Home Assistant MQTT auto-discovery and entity state topics" }
                 otaPassword: { type: string, example: "mysecret" }
+                restoreOnBoot: { type: boolean, example: true, description: "Replay the stored calibration backup on every boot (v3.12). Takes effect at the next boot" }
+                restoreDelay:  { type: integer, minimum: 0, maximum: 600, example: 10, description: "Seconds after boot before that replay starts (v3.12)" }
             examples:
               timezone:
                 value:
@@ -1630,6 +1787,10 @@ paths:
               ota_password:
                 value:
                   otaPassword: "mysecret"
+              restore_on_boot:
+                value:
+                  restoreOnBoot: true
+                  restoreDelay: 10
       responses:
         "200":
           $ref: "#/components/responses/Ok"
@@ -1756,6 +1917,37 @@ components:
           description: "What the nav shows for it"
           example: "Calibration"
 
+    RestoreStatus:
+      type: object
+      description: Restore-on-boot status (v3.12), as returned by every /api/restore endpoint.
+      properties:
+        ok:       { type: boolean, example: true }
+        enabled:  { type: boolean, description: "Replay on every boot", example: true }
+        delay:    { type: integer, description: "Seconds after boot before the replay starts", example: 10 }
+        file:
+          type: object
+          description: The backup stored on the gateway
+          properties:
+            exists:  { type: boolean, example: true }
+            bytes:   { type: integer, example: 43210 }
+            modules: { type: integer, description: "Usable entries (serial + parseable dump)", example: 45 }
+            entries: { type: integer, description: "All entries in the file", example: 45 }
+            version: { type: integer, description: "The backup's own version field", example: 1 }
+            created: { type: string, description: "The backup's created field, verbatim", example: "2026-09-01T20:46:28.897Z" }
+        state:    { type: string, enum: [idle, waiting, writing, verifying, homing, done, failed, cancelled], example: done }
+        busy:     { type: boolean, description: "true while the bus is locked (waiting/writing/verifying/homing)", example: false }
+        trigger:  { type: string, enum: ["", boot, manual], description: "What started the current/last run", example: boot }
+        total:    { type: integer, description: "Entries in the backup being replayed", example: 45 }
+        done:     { type: integer, description: "Entries completed in the current phase", example: 45 }
+        okCount:  { type: integer, description: "Read back and matched the backup", example: 44 }
+        mismatch: { type: integer, description: "Answered, but still differed after the repair round", example: 0 }
+        missing:  { type: integer, description: "Never answered the read-back", example: 1 }
+        skipped:  { type: integer, description: "Unusable entries (no serial, or an unparseable dump)", example: 0 }
+        startsIn: { type: integer, description: "Seconds until the run starts (waiting state only)", example: 0 }
+        elapsed:  { type: integer, description: "Seconds the run has taken so far, or took", example: 71 }
+        finishedAgo: { type: integer, description: "Seconds since the run ended; -1 while running or if none ran", example: 3600 }
+        lastError: { type: string, description: "Why a run could not start (failed state)", example: "" }
+
     QuietSchedule:
       type: object
       description: Daily quiet-time schedule (v3.0).
@@ -1817,6 +2009,14 @@ components:
         ntpSynced: { type: boolean, example: true }
         maint:     { type: boolean, description: "true if maintenance mode is on (external MQTT commands ignored)", example: false }
         quiet:     { type: boolean, description: "true if quiet time is on (flaps do not move for display updates)", example: false }
+        restore:
+          type: object
+          description: "Restore-on-boot progress (v3.12). While state is waiting/writing/verifying/homing every bus endpoint answers 503"
+          properties:
+            state:    { type: string, enum: [idle, waiting, writing, verifying, homing, done, failed, cancelled], example: idle }
+            done:     { type: integer, description: "Entries completed in the current phase", example: 0 }
+            total:    { type: integer, description: "Entries in the backup being replayed", example: 0 }
+            startsIn: { type: integer, description: "Seconds until the run starts (waiting state only)", example: 0 }
         minheap:   { type: integer, description: "Minimum free heap ever observed (bytes)", example: 98000 }
         stk:
           type: object
@@ -1848,3 +2048,5 @@ components:
         serialDebug:  { type: boolean, example: false }
         haEnabled:    { type: boolean, description: "true if Home Assistant MQTT discovery is enabled", example: false }
         otaPasswordSet: { type: boolean, description: "true if an OTA password is configured", example: false }
+        restoreOnBoot: { type: boolean, description: "Replay the stored calibration backup on every boot (v3.12)", example: false }
+        restoreDelay:  { type: integer, description: "Seconds after boot before that replay starts (v3.12)", example: 10 }

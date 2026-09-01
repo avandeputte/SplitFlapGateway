@@ -1,5 +1,82 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.12.0 — 2026-09-01
+
+**Restore on boot.** A calibration backup can now live on the gateway and be replayed to
+every module on every boot — for walls whose modules lose or corrupt their EEPROM, or get
+swapped around. The backup is the source of truth; every power cycle puts the wall back.
+
+### Added
+
+- **Restore on Boot** (Settings tab) — upload a backup file (the one *Backup Calibration*
+  produces) to the gateway, tick *Restore calibration on every boot*, set the post-boot delay
+  (default 10 s, so the modules finish their own auto-home first), and Save. A run writes each
+  module by serial number (`mXW`, the same frame `/api/flap/restorebysn` sends, then a fixed
+  gap for the EEPROM write), re-provisions it (`mXI`) when the backup's ID differs from the one
+  the gateway knows, reads every module back (`mXA` on v25+, `mXD` on v15+, `m<id>d` below
+  that) and compares home offset, steps per revolution, every flap position and the v31+ flap
+  set, re-writes and re-reads anything that differed or did not answer once, then homes the
+  wall. **Run Restore Now** does the same without a reboot; **Cancel Restore** stops a run
+  after its current step.
+- **The bus is locked for the whole run.** From boot (or the moment *Run Restore Now* is
+  pressed) until the run ends, every REST endpoint that would touch the RS-485 bus answers
+  `503 {"error":"restore in progress"}` and MQTT commands are dropped; the maintenance switch
+  and all read-only, settings, status and OTA endpoints keep working. The gateway's own
+  background bus traffic (flap-set trickle, stale-module probes, the quiet-time schedule)
+  pauses. The dashboard shows a red border and a banner with the phase and progress.
+- **It always finishes.** Every wait is bounded and a module that never answers is counted as
+  *not answering*, so a missing module can never leave the gateway locked. A restore that
+  cannot start (enabled, but nothing usable stored) is logged and skipped without locking.
+- REST: `GET /api/restore` (setting, stored file, run progress and counters),
+  `PUT /api/restore/backup` (validated before it is accepted, atomic, max 256 KB),
+  `DELETE /api/restore/backup`, `POST /api/restore/run`, `POST /api/restore/cancel`;
+  `restoreOnBoot` / `restoreDelay` on `GET /api/config` and `POST /api/config/settings`;
+  a `restore` object (`state`, `done`, `total`, `startsIn`) on `GET /api/status`.
+- The stored backup lives in FATFS as `/restore.bak` (temp file + rename, survives OTA).
+- **The module registry is permanent.** A module is never removed for being quiet. One not
+  heard from in 24 hours is re-queried (a version query, a few per minute) so its record stays
+  current; after four unanswered queries it is left alone for an hour and asked again. Only
+  Identify All, De-provision, or a corrupt record removes an entry, so the module list and
+  `GET /api/capabilities` are complete from the first second after boot.
+
+### Fixed
+
+- **Browser OTA no longer dies near the end of a full-size image.** The upload callback set the
+  CORS header on every received chunk, and `WebServer::sendHeader()` keeps each call as a
+  heap-allocated node until the response goes out -- ~1000 chunks ate ~80 KB of a 100 KB heap,
+  the connection reset at 1.2-1.3 MB with min-free heap under 1 KB, and nothing was flashed
+  (the browser's instant "100 %" is the file leaving the browser, not arriving). The header is
+  now set once, on the response. A 1.48 MB image uploads in ~10 s with 80 KB of heap to spare,
+  and the `/ota` page now waits for the gateway to come back and names the version it booted.
+
+### Changed
+
+- **A restore writes the flap map entry by entry**, not inside the `mXW` frame. A module writes
+  each entry to EEPROM as it parses it and cannot keep up with a long frame at line speed: on
+  v31 firmware a 434-byte restore frame left 20 of 42 entries and the module was deaf for ~6 s
+  afterwards. The boot restore now sends `mXW` with offset, steps and flap set (which clears
+  the map), waits for that erase, then one short `m<id>w<i>:<p>` per entry, paced — the
+  wizard's own frames. **`POST /api/flap/restorebysn` and the Settings tab's Restore from
+  File do the same**: the endpoint sends the `mXW` (offset, steps, flap set), schedules each
+  entry as a paced `m<id>w` frame on the RS-485 task (the batch queue, so the web server never
+  blocks), and returns at once with `{entries, perEntry, id, settleMs}`; the dashboard waits
+  `settleMs` per module before re-provisioning it or moving on. It takes an optional `id`;
+  otherwise the registry's id for that serial is used, and only with no id known at all does
+  the map go inline as before. The dashboard also drops a flap set whose character count does
+  not match its flap count from an old backup instead of writing it.
+- **An inconsistent flap-set tail is ignored.** A v31 `A` reply that lost its tail in transit
+  can parse as `64:` plus a few characters. That used to land in the registry, in
+  `/api/capabilities`, and in backups — and restoring such a backup wrote the truncated set
+  into the module. The parser now treats a tail whose character count does not match its flap
+  count as "not reported", and the restore neither writes nor verifies such a set.
+- `POST /api/flap/restorebysn` builds its frame through the same `sfBuildRestoreFrame()`
+  the boot restore uses.
+- `Access-Control-Allow-Methods` now also lists `DELETE`.
+- **`pio run -e esp32s3_ota -t upload`** — a preconfigured espota environment in
+  `platformio.ini` (`default_envs` keeps plain `pio run` on the USB build). The browser
+  upload at `/ota` still fails near the end of a full-size image on this board (heap
+  exhaustion, the connection resets and nothing is flashed); espota is the path that works.
+
 ## v3.8.0 — 2026-07-14
 
 Everything since **v3.4**, summarised. One client can now drive any wall: a new
