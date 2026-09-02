@@ -1018,6 +1018,87 @@ python3 -m espota -i 192.168.1.105 -a yourpassword -f firmware.bin
 > `upload_protocol = espota` and `upload_port = splitflap-gw.local` in `platformio.ini`
 > (see [SETUP.md ▸ OTA](SETUP.md#10-later-updates-over-wi-fi-ota)).
 
+### If the web update fails — recovery without developer tools
+
+A failed browser upload **never damages the gateway**: the new image is written to the
+inactive app slot and only made bootable once the last byte has been verified, so if the
+upload stops early the old firmware simply keeps running (you'll see the old version in the
+header, and the uptime on the Status tab keeps counting). Nothing to undo. Here are three ways
+to get the new firmware on anyway, none of which need PlatformIO, VS Code, or a build
+environment. Every release on the
+[Releases](https://github.com/avandeputte/SplitFlapGateway/releases) page carries the files
+they use.
+
+**1. Try again after a reboot.** Power-cycle the gateway, open `http://<gateway-ip>/ota` in a
+fresh tab (close the dashboard and anything else that polls the gateway), and upload
+`SplitFlapGateway-<version>.bin` again. Since 3.12 the browser upload is reliable; the one
+case that can still fail is the *first* jump **from** a firmware older than 3.12, because it
+is the *running* firmware that receives the image — and a freshly rebooted board gives it the
+most memory to do that with.
+
+**2. Over Wi-Fi with one small Python script (no USB cable).** This is the route the
+gateway's own build tooling uses, and it was never affected by the browser problem. You need
+Python 3 ([python.org](https://www.python.org/downloads/) on Windows; already on macOS and
+Linux) and one file from Espressif:
+
+1. Download **`espota.py`** from
+   <https://raw.githubusercontent.com/espressif/arduino-esp32/master/tools/espota.py>
+   (right-click → *Save as…*) into the same folder as the downloaded
+   `SplitFlapGateway-<version>.bin`.
+2. Find the gateway's IP address on its **Status** tab (or use `splitflap-gw-xxxxxx.local`,
+   the name printed on the Status tab's hostname line).
+3. In a terminal (Windows: *Command Prompt* or *PowerShell*) in that folder:
+
+   ```bash
+   python3 espota.py -i 192.168.1.105 -p 3232 -f SplitFlapGateway-3.12.0.bin
+   # Windows: use  python  instead of  python3
+   # if you set an OTA password on the Settings tab, add:  -a yourpassword
+   ```
+
+   The script prints a progress bar, the gateway verifies the image and reboots, and the
+   header shows the new version about 15 seconds later. If it reports *no response from
+   device*, a firewall on your computer is blocking the gateway's reply — allow Python
+   through it, or use option 3.
+
+**3. Over USB, from a browser (Chrome or Edge).** Nothing to install; this also works on a
+gateway that will not boot at all.
+
+1. Connect the gateway's USB-C port to your computer with a **data** cable (many USB-C
+   cables are charge-only; if no port appears in step 3, try another cable or port).
+2. Put the board in download mode: press and **hold BOOT**, tap **RESET**, release
+   **BOOT**.
+3. Open <https://espressif.github.io/esptool-js/>, click **Connect**, and choose the port
+   named *USB JTAG/serial debug unit* (or *USB Serial*).
+4. Add files to flash — **two files, two addresses**, to keep your settings:
+
+   | File (from the release) | Flash address |
+   |---|---|
+   | `SplitFlapGateway-<version>.bin` | `0x10000` |
+   | `boot_app0.bin` | `0xE000` |
+
+   The second, tiny file tells the bootloader to start from the slot you just wrote.
+   Without it, a board that had previously updated over the air may keep booting the *other*
+   slot — the old firmware — no matter how many times you flash. Your WiFi/MQTT settings,
+   the module list, and any stored restore backup all survive this flash.
+
+   *Alternatively*, flash the single **`SplitFlapGateway-<version>.factory.bin`** at
+   address **`0x0`**. That is the complete image (bootloader, partition table, boot
+   selector and app) and is the right choice for a blank board or one that is thoroughly
+   confused — but it **erases the WiFi and MQTT settings**, so afterwards you reconnect
+   through the `Split-Flap-GW` fallback access point as on [first boot](#first-boot). The
+   module list and stored backup live in a separate flash area and survive either way.
+5. Click **Program**, wait for *Leaving…*, then press **RESET** (or unplug and replug).
+   Open the dashboard and check the version in the header.
+
+Prefer a terminal over the web flasher? [`esptool`](https://github.com/espressif/esptool)
+(`pip install esptool`) does the same:
+
+```bash
+esptool --chip esp32s3 write_flash 0x10000 SplitFlapGateway-3.12.0.bin 0xE000 boot_app0.bin
+# or, full image (erases settings):
+esptool --chip esp32s3 write_flash 0x0 SplitFlapGateway-3.12.0.factory.bin
+```
+
 ---
 
 ## Default Settings

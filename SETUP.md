@@ -69,6 +69,12 @@ page — download it and flash it directly. Pick the case that matches your boar
 
 After flashing, continue from [§9 First-time configuration](#9-first-time-configuration).
 
+> **Web updater failed part-way?** Nothing was flashed and the old firmware is still
+> running. The README's
+> [recovery without developer tools](README.md#if-the-web-update-fails--recovery-without-developer-tools)
+> section covers the three no-toolchain ways forward, including a USB flash that keeps
+> your settings (app image at `0x10000` **plus** `boot_app0.bin` at `0xE000`).
+
 **Everything below is only needed if you want to build from source.**
 
 ---
