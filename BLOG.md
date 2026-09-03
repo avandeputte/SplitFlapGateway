@@ -81,8 +81,11 @@ The gateway exposes the bus through three interfaces simultaneously:
 <a href="screenshots/gateway-provision.png"><img src="screenshots/gateway-provision.png" width="380" alt="Provision tab — modules advertising their serial numbers, ready to be identified and assigned"></a>  
 *Provision tab — unprovisioned modules appear by themselves; home one to see which physical tile it is, then assign an ID*
 
-<a href="screenshots/gateway-calibration.png"><img src="screenshots/gateway-calibration.png" width="380" alt="Calibration tab — the module picker laid out like the wall, and the per-flap map"></a>  
+<a href="screenshots/gateway-calibration.png"><img src="screenshots/gateway-calibration.png" width="380" alt="Calibration tab — the module picker laid out like the wall"></a>  
 *Calibration tab — pick a module from a grid laid out like your wall, measure its steps, nudge its home position, tune any flap, or let the wizard walk every flap for you*
+
+<a href="screenshots/gateway-monitor.png"><img src="screenshots/gateway-monitor.png" width="380" alt="Bus Monitor — live RS-485 traffic, decoded"></a>  
+*Bus Monitor — every RS-485 frame in both directions, decoded into plain language, with timestamps in your browser's local time*
 
 **A REST API** with more than fifty endpoints covering every operation — sending characters, homing, calibrating, running self-diagnostics, provisioning by serial number, backing up and restoring calibration, and reading or updating configuration. One call, `GET /api/capabilities`, tells a client exactly what characters this particular wall can show. An [OpenAPI specification](https://github.com/avandeputte/SplitFlapGateway/blob/main/openapi.yaml) is included so you can import the whole API into Postman or Swagger UI with a single file.
 
@@ -93,7 +96,6 @@ The gateway exposes the bus through three interfaces simultaneously:
 A few things the gateway does on its own, because a display you want to forget about has to be able to look after itself:
 
 - **A permanent module registry.** It remembers every module it has ever met — identity, firmware, flap set — across reboots, so the wall is fully known the second the gateway comes up.
-- **Backup and restore on boot.** Take a backup of every module's calibration to a file, keep a copy on the gateway, and it can replay that backup to every module at every power-up — written by serial number, read back, verified, then the wall homed. A wiped or swapped module puts itself right.
 - **Quiet time.** A schedule, a switch, or a Home Assistant automation blanks the wall for the night and puts back what it was showing in the morning.
 - **Maintenance mode**, so home-automation traffic can't fight you while you calibrate.
 - **Over-the-air updates** from the browser. After the first USB flash, you never need a cable again.
@@ -115,7 +117,7 @@ splitflap-os solves that for the Raspberry Pi setup, and solves it well. But it'
 The [Split-Flap Companion](https://github.com/avandeputte/SplitFlapGatewayCompanion) is the third piece. It's a web app that runs on a machine you already have — a Raspberry Pi, a NAS, a home server, or as a Home Assistant app — and drives the wall over the gateway's REST API. The gateway can put any character on any flap; the companion's job is to know which ones.
 
 <a href="screenshots/companion-apps.png"><img src="screenshots/companion-apps.png" width="760" alt="The companion's Apps tab — a playlist running, the live board mirroring the wall, and the app library"></a>  
-*The companion's Apps tab — the live board mirrors the wall, one tap runs an app, and a banner shows what's playing*
+*The companion's Apps tab — the live board mirrors the wall (here the Time app is running), one tap runs an app, and the gateway's own tabs sit right in the companion's nav*
 
 What's in it:
 
@@ -130,11 +132,11 @@ What's in it:
 *Compose — click a cell, type, and it lands on the wall*
 
 <a href="screenshots/companion-playlists.png"><img src="screenshots/companion-playlists.png" width="380" alt="Playlists — editing a saved playlist"></a>  
-*Playlists — sequence apps and messages, each with its own settings and duration*
+*Shows — sequence apps and messages into playlists, each entry with its own settings and duration*
 
 ### It Speaks Your Language — and Your Reel's
 
-A global language setting (US, UK and Australian English plus the major Western-European languages) changes the translated words, the date order, the number format and the clock in every app that adapts, and currency and public holidays follow your *location*. Both can be overridden per app and per playlist entry, so one playlist can show Paris in French and Tokyo in Japanese back to back.
+A global language setting (US, UK and Australian English plus the major Western-European languages) changes the translated words, the date order, the number format and the clock in every app that adapts, and currency and public holidays follow your *location*. Both can be overridden per app and per playlist entry, so one playlist can show Paris in French and Berlin in German back to back.
 
 Whether those words can actually be shown depends on what's printed on your flaps, and this is where the three projects fit together. The gateway asks every module what its reel carries, and answers the companion's one question — *what can this wall show?* — in one call. The companion writes text the way a person writes it and lets the wall decide the case: uppercase on a physical split-flap, lowercase and accents on a display that has them. An app never needs to know which kind of wall it is talking to.
 
