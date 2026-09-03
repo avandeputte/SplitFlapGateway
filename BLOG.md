@@ -160,7 +160,7 @@ The companion's apps use the **splitflap-os plugin format** — a manifest plus 
 
 ## No Mechanical Build? Same Software, Different Wall
 
-Because the companion only ever talks to a gateway, and the gateway's job is to *be* a wall of modules, two more boards run the identical gateway firmware with **virtual** flaps: the [Matrix Gateway](https://github.com/avandeputte/MatrixPortalGateway) on an RGB LED matrix, and the [LCD Gateway](https://github.com/avandeputte/SplitFlapGatewayLCD) on a 10.1" touchscreen. Each replaces the modules *and* the gateway in one board; the companion can't tell the difference, and the same app spells its text on a physical wall and draws a richer panel on the emulated one.
+Because the companion only ever talks to a gateway, and the gateway's job is to *be* a wall of modules, two more boards offer the same thing with **virtual** flaps: the [Matrix Gateway](https://github.com/avandeputte/MatrixPortalGateway) on an RGB LED matrix, and the [LCD Gateway](https://github.com/avandeputte/SplitFlapGatewayLCD) on a 10.1" touchscreen. They are their own firmware, but they speak the same split-flap protocol (with a few capabilities a drawn flap can add, such as lowercase and accents) and present the same web UI and REST API, so each replaces the modules *and* the gateway in one board. The companion can't tell the difference, and the same app spells its text on a physical wall and draws a richer panel on the emulated one.
 
 <a href="screenshots/companion-matrix-portal.png"><img src="screenshots/companion-matrix-portal.png" width="380" alt="The Word Clock app on a Matrix Gateway"></a>  
 *The same Word Clock app, at the same minute, on an LED-matrix wall*
