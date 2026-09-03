@@ -1,8 +1,13 @@
-# Two Projects, One Goal: Making Split-Flap Displays Easier to Build and Run
+# Three Projects, One Goal: Making Split-Flap Displays Easier to Build, Run and Enjoy
 
 If you've ever wanted to build one of those beautiful mechanical split-flap displays you see in train stations and airports, you've probably come across [Adam G Makes](https://www.youtube.com/@AdamGMakes) on YouTube. His [split-flap display project](https://youtu.be/-C8_AtxEEQc?si=Gym5wikeFH2vUNRm) is a masterpiece of DIY engineering — each character cell is a compact, self-contained module built around an ATtiny1616 microcontroller, driven by a stepper motor with a Hall sensor for positioning, and connected to a shared RS-485 bus. The result is a display that looks and sounds exactly like the real thing.
 
-The hardware is excellent. But as the community around this project has grown, two separate limitations have emerged that make the display harder to scale and maintain than it needs to be. This post is about two independent projects that each tackle one of those limitations — and why both were built with great care not to break anything that already works.
+The hardware is excellent. But as the community around this project has grown, three separate limitations have emerged that make the display harder to scale, maintain, and actually *enjoy* than it needs to be. This post is about three independent projects that each tackle one of those limitations — and why all three were built with great care not to break anything that already works.
+
+<a href="screenshots/ecosystem.png"><img src="screenshots/ecosystem.png" width="760" alt="The SplitFlap ecosystem: modules, gateway, companion"></a>  
+*The three pieces and how they connect: modules on an RS-485 bus, a gateway that bridges the bus to the network, and a companion that decides what to show.*
+
+> Everything below, and a great deal more, is documented step by step in the **[SplitFlap wiki](https://github.com/avandeputte/SplitFlapGateway/wiki)** — start with the [Quick Start](https://github.com/avandeputte/SplitFlapGateway/wiki/Quick-Start) if you'd rather build than read.
 
 ---
 
@@ -32,13 +37,20 @@ mXHA3F24C0018E7D29B3F01\n
 
 One binary. Flash once per module, provision once, done.
 
+### It Grew Into More Than an ID
+
+Once every module had a permanent identity, other things became possible that the original firmware couldn't offer:
+
+- **Backup and restore by serial number.** A module's entire calibration can be read out in one command and written back later — to the same module, or to a replacement — because the serial number, not the bus position, is what identifies it.
+- **A configurable flap set.** The flap count and the character printed on each flap are stored per module. Print a reel with `É`, `Ö` or `Ñ` on it, or a shorter reel without punctuation, tell the module, and text still lands on the right flap.
+- **Built-in self-diagnostics.** A module can report its supply voltage, reset cause and EEPROM health without moving, test its own Hall sensor, and spin its reel several times to detect missed steps — so when a cell misbehaves you can tell power, sensor and motor apart without opening it.
+- **Automatic Hall-sensor polarity detection**, a brown-out detector, and a watchdog, so a module that gets into trouble recovers on its own.
+
 ### Backward Compatibility Was Non-Negotiable
 
 The universal firmware was built with full backward compatibility as a hard requirement. Every command from Adam's original protocol works exactly as before — the same syntax, the same responses, the same timing. Projects already built on the original firmware continue to work unchanged.
 
-A good example is [splitflap-os](https://github.com/csader/splitflap-os) by csader — a polished web-based control interface with over 40 apps (weather, stocks, sports scores, word clock, news headlines and more), playlists, live preview, calibration tools, and Home Assistant integration via MQTT. It runs on the Raspberry Pi alongside the display and speaks the same RS-485 protocol. The universal firmware adds provisioning commands without touching anything splitflap-os uses — both work together without any modifications.
-
-Because the provisioning protocol is open and well-documented, splitflap-os could choose to add a provisioning UI that would make `provision.py` entirely obsolete — module discovery, identification, and ID assignment all from the same web interface already used to control the display. That's entirely up to the splitflap-os project to decide; the universal firmware simply makes it possible.
+A good example is [splitflap-os](https://github.com/csader/splitflap-os) by csader — a polished web-based control interface with a large library of apps (weather, stocks, sports scores, word clock, news headlines and more), playlists, live preview, calibration tools, and Home Assistant integration via MQTT. It runs on the Raspberry Pi alongside the display and speaks the same RS-485 protocol. The universal firmware adds provisioning commands without touching anything splitflap-os uses — both work together without any modifications, and splitflap-os has since built provisioning into its own UI.
 
 ---
 
@@ -54,65 +66,134 @@ The [Split-Flap Gateway](https://github.com/avandeputte/SplitFlapGateway) replac
 
 The "heavy stuff" — the UI, the automation logic, the integration with other systems — runs somewhere you already own and maintain. Your PC, your NAS, a home automation server. You're not adding a new computer to maintain; you're connecting to infrastructure you already have.
 
-Beyond simply replacing the Raspberry Pi, the gateway opens up integration possibilities that didn't exist before. In the original project the only way to talk to the display is the RS-485 bus protocol — which means anything that wants to control the display needs to be physically wired to the bus and speak that low-level protocol directly. The gateway changes that completely. By bridging the bus to WiFi and exposing it through REST and MQTT, it means any device on your network — a phone, a laptop, a home automation controller, a cloud service — can send a character to the display with a single HTTP request or MQTT message, no knowledge of RS-485 required.
+Beyond simply replacing the Raspberry Pi, the gateway opens up integration possibilities that didn't exist before. In the original project the only way to talk to the display is the RS-485 bus protocol — which means anything that wants to control the display needs to be physically wired to the bus and speak that low-level protocol directly. The gateway changes that completely. By bridging the bus to WiFi and exposing it through REST and MQTT, any device on your network — a phone, a laptop, a home automation controller, a cloud service — can send a character to the display with a single HTTP request or MQTT message, no knowledge of RS-485 required.
 
 The gateway exposes the bus through three interfaces simultaneously:
 
----
+**A web UI** served directly from the ESP32. Open a browser, navigate to the gateway's address, and you have a full dashboard: every known module with its current character and firmware version, a live wall that mirrors what the display is showing, provisioning tools, a guided calibration wizard, a live bus monitor with every RS-485 frame decoded, and settings. It speaks fourteen languages, follows your light or dark theme, and there is no app to install and no account to create.
 
-<a href="screenshots/modules.png"><img src="screenshots/modules.png" width="380" alt="Modules tab — known modules with IDs, serial numbers and firmware versions"></a>  
-*Modules tab — every known module at a glance. Each card has icons to home it, inspect its EEPROM, or run a destructive action*
+<a href="screenshots/gateway-modules.png"><img src="screenshots/gateway-modules.png" width="380" alt="Modules tab — every known module with its ID, serial number, current character and firmware version"></a>  
+*Modules tab — every known module at a glance. Each card has icons to home it, inspect its EEPROM, run its self-diagnostics, or take a destructive action*
 
-<a href="screenshots/modules_info.png"><img src="screenshots/modules_info.png" width="380" alt="Module info dialog with parsed EEPROM calibration"></a>  
-*Module info — all known data for a module plus its EEPROM read fresh from the bus and parsed into home offset, steps-per-rev, and the calibrated flap map*
+<a href="screenshots/gateway-display.png"><img src="screenshots/gateway-display.png" width="380" alt="Display tab — the live wall, and boxes to send text or a single character"></a>  
+*Display tab — a live rendering of the wall, and boxes to push a string across the modules or address a single one*
 
-<a href="screenshots/bus_monitor.png"><img src="screenshots/bus_monitor.png" width="380" alt="Bus Monitor — live RS-485 traffic with decoded descriptions"></a>  
-*Bus Monitor — live RS-485 traffic with human-readable protocol decoding and browser-local timestamps; pause, download, and auto-scroll controls*
+<a href="screenshots/gateway-provision.png"><img src="screenshots/gateway-provision.png" width="380" alt="Provision tab — modules advertising their serial numbers, ready to be identified and assigned"></a>  
+*Provision tab — unprovisioned modules appear by themselves; home one to see which physical tile it is, then assign an ID*
 
-<a href="screenshots/provision.png"><img src="screenshots/provision.png" width="380" alt="Provision tab — discover unprovisioned modules and assign IDs"></a>  
-*Provision tab — unprovisioned modules appear automatically; home one to identify which physical tile it is, then assign an ID*
+<a href="screenshots/gateway-calibration.png"><img src="screenshots/gateway-calibration.png" width="380" alt="Calibration tab — the module picker laid out like the wall, and the per-flap map"></a>  
+*Calibration tab — pick a module from a grid laid out like your wall, measure its steps, nudge its home position, tune any flap, or let the wizard walk every flap for you*
 
-<a href="screenshots/display.png"><img src="screenshots/display.png" width="380" alt="Display tab — send text, a single character, or a flap index"></a>  
-*Display tab — push a whole string across sequential modules, send one character, or address a specific flap by index*
+**A REST API** with more than fifty endpoints covering every operation — sending characters, homing, calibrating, running self-diagnostics, provisioning by serial number, backing up and restoring calibration, and reading or updating configuration. One call, `GET /api/capabilities`, tells a client exactly what characters this particular wall can show. An [OpenAPI specification](https://github.com/avandeputte/SplitFlapGateway/blob/main/openapi.yaml) is included so you can import the whole API into Postman or Swagger UI with a single file.
 
-<a href="screenshots/settings.png"><img src="screenshots/settings.png" width="380" alt="Settings tab — WiFi, MQTT, timezone and NTP configuration"></a>  
-*Settings tab — WiFi, MQTT broker (with a connection tester), timezone, NTP server, and OTA firmware update; all saved to flash*
+**MQTT integration** using the `splitflap/` topic prefix. Every frame that travels in either direction on the RS-485 bus is published. Module events each get their own topic. Turn on Home Assistant discovery and the gateway appears there as a device, with a text entity for the display, switches for maintenance and quiet time, and diagnostic sensors.
 
-<a href="screenshots/status.png"><img src="screenshots/status.png" width="380" alt="Status tab — grouped health metrics"></a>  
-*Status tab — system health grouped into Network, System Health, RS-485 Bus, and Clock, with color-coded heap and stack indicators*
+### It Looks After the Wall
 
----
+A few things the gateway does on its own, because a display you want to forget about has to be able to look after itself:
 
-**A web UI** served directly from the ESP32. Open a browser, navigate to the gateway's IP address, and you have a full dashboard: a live bus monitor showing every RS-485 frame with decoded descriptions and local timestamps, a module grid showing all known modules with their current character and firmware version, provisioning tools, and configuration settings. No app to install, no account to create.
-
-**A REST API** with more than 40 endpoints covering every operation — sending characters, homing modules, calibrating, running module self-diagnostics, provisioning by serial number, querying firmware versions, and reading or updating configuration. An [OpenAPI specification](https://github.com/avandeputte/SplitFlapGateway) is included so you can import the entire API into Postman or Swagger UI with a single file.
-
-**MQTT integration** using the `splitflap/` topic prefix. Every frame that travels in either direction on the RS-485 bus is published. Module events each get their own topic. Any system that can publish an MQTT message can drive the display — Node-RED, Home Assistant, a Python script, or a shell command.
+- **A permanent module registry.** It remembers every module it has ever met — identity, firmware, flap set — across reboots, so the wall is fully known the second the gateway comes up.
+- **Backup and restore on boot.** Take a backup of every module's calibration to a file, keep a copy on the gateway, and it can replay that backup to every module at every power-up — written by serial number, read back, verified, then the wall homed. A wiped or swapped module puts itself right.
+- **Quiet time.** A schedule, a switch, or a Home Assistant automation blanks the wall for the night and puts back what it was showing in the morning.
+- **Maintenance mode**, so home-automation traffic can't fight you while you calibrate.
+- **Over-the-air updates** from the browser. After the first USB flash, you never need a cable again.
 
 ### Also Backward Compatible
 
-The gateway speaks the same RS-485 protocol as everything else in this ecosystem. It works with Adam's original hardcoded firmware, with the universal firmware, and with existing tools like splitflap-os. If you're already running splitflap-os on a Raspberry Pi and want to experiment with the gateway, the display protocol is identical — no changes to splitflap-os required.
+The gateway speaks the same RS-485 protocol as everything else in this ecosystem. It works with Adam's original hardcoded firmware, with the universal firmware, and with existing tools like splitflap-os, which can drive it over MQTT. If you're already running splitflap-os on a Raspberry Pi and want to experiment with the gateway, the display protocol is identical — no changes to splitflap-os required.
 
 ---
 
-## Two Projects, Independently Useful
+## Limitation Three: What Do You Actually Show?
 
-These are two separate projects that solve two different problems. They work very well together, but neither depends on the other:
+With the first two projects in place you have a wall that provisions and calibrates itself from a browser and takes an HTTP request from anywhere. And then you sit in front of it and realise that a split-flap display with nothing on it is furniture. The hard part was never sending a character. It's *deciding* what to show — the weather when you're leaving, the next train, the score of the game, a word clock at other times, a birthday message when someone walks in — and doing that every day, for years, without anyone having to think about it.
 
-- **Universal firmware without the gateway** — if you're content to keep the Raspberry Pi and use the included `provision.py` terminal tool to manage modules, the universal firmware stands completely on its own. You get runtime provisioning, one binary for all modules, and full compatibility with everything else in the ecosystem.
+splitflap-os solves that for the Raspberry Pi setup, and solves it well. But it's built around living inside the display, next to the bus, and that is exactly the arrangement the gateway set out to remove.
 
-- **Gateway without the universal firmware** — if you're happy with Adam's original hardcoded firmware and just want to remove the Raspberry Pi from the display, the gateway works perfectly. You can still send characters, home modules, monitor the bus in real time, and control the display from anywhere on your network. You just won't have the dynamic provisioning workflow, since the original firmware doesn't support it.
+### The Solution: A Content Engine That Lives Where You Do
 
-- **Both together** — the gateway's web UI includes a full provisioning interface for the universal firmware: discover unprovisioned modules, home them to identify which physical tile they are, and assign IDs, all from a browser.
+The [Split-Flap Companion](https://github.com/avandeputte/SplitFlapGatewayCompanion) is the third piece. It's a web app that runs on a machine you already have — a Raspberry Pi, a NAS, a home server, or as a Home Assistant app — and drives the wall over the gateway's REST API. The gateway can put any character on any flap; the companion's job is to know which ones.
 
-The goal in both cases was to make Adam's beautiful hardware easier to live with long-term — without breaking the growing community of projects already built around it.
+<a href="screenshots/companion-apps.png"><img src="screenshots/companion-apps.png" width="760" alt="The companion's Apps tab — a playlist running, the live board mirroring the wall, and the app library"></a>  
+*The companion's Apps tab — the live board mirrors the wall, one tap runs an app, and a banner shows what's playing*
+
+What's in it:
+
+- **Apps.** A library of ready-to-run apps — weather, clocks, a word clock, stocks and crypto, transit arrivals, sports scores, the ISS passing overhead, countdowns, quotes, animations, and many more — each with its own settings. The library keeps growing, and you can add or remove apps from inside the companion.
+- **Compose.** A click-to-type grid that mirrors your wall: click a cell, type, and each keystroke lands on that module. Colour tiles, every transition style, and a button to push the whole grid.
+- **Playlists**, on the Shows tab. Sequence apps and messages with a duration for each, save, loop. The same app can appear twice with different settings — weather for two cities in two languages, say. A multiview splits the wall into zones that each run their own thing.
+- **Schedules.** Run an app or a playlist in time-of-day windows per weekday, plus quiet hours.
+- **Triggers.** Apps that watch for something — a game starting, the ISS coming over, a weather change — and briefly interrupt the display, then let it resume.
+- **A live view** of the wall, updated in real time, and a Home All button.
+
+<a href="screenshots/companion-compose.png"><img src="screenshots/companion-compose.png" width="380" alt="Compose — the click-to-type grid"></a>  
+*Compose — click a cell, type, and it lands on the wall*
+
+<a href="screenshots/companion-playlists.png"><img src="screenshots/companion-playlists.png" width="380" alt="Playlists — editing a saved playlist"></a>  
+*Playlists — sequence apps and messages, each with its own settings and duration*
+
+### It Speaks Your Language — and Your Reel's
+
+A global language setting (US, UK and Australian English plus the major Western-European languages) changes the translated words, the date order, the number format and the clock in every app that adapts, and currency and public holidays follow your *location*. Both can be overridden per app and per playlist entry, so one playlist can show Paris in French and Tokyo in Japanese back to back.
+
+Whether those words can actually be shown depends on what's printed on your flaps, and this is where the three projects fit together. The gateway asks every module what its reel carries, and answers the companion's one question — *what can this wall show?* — in one call. The companion writes text the way a person writes it and lets the wall decide the case: uppercase on a physical split-flap, lowercase and accents on a display that has them. An app never needs to know which kind of wall it is talking to.
+
+### It Fits Into What You Already Run
+
+The companion plugs into **Home Assistant** three ways — as a sidebar app, as a HACS integration with real entities, and as an MQTT device — so the wall becomes a target for automations, voice, and dashboards. Two more doors are plain HTTP and need no Home Assistant at all:
+
+- It **answers the Vestaboard Local API**, so the large pool of software written for that commercial split-flap display — integrations, Node-RED flows, scripts — drives your wall unchanged.
+- It exposes the display as **MCP tools**, so an LLM such as Claude can read the board and drive it in plain language: *"put standup on the board for two minutes, then put back what was playing."*
+
+One companion can drive **several walls**, each with its own apps, playlists and settings. And it keeps its own configuration *in the gateway's flash*, so the container is stateless: destroy it, start another one on a different machine, and it picks up where it left off.
+
+<a href="screenshots/companion-displays.png"><img src="screenshots/companion-displays.png" width="380" alt="The Displays dialog — a network scan has found two gateways"></a>  
+*Several walls from one companion — a network scan finds the gateways, one tap adds them*
+
+### Also Backward Compatible
+
+The companion's apps use the **splitflap-os plugin format** — a manifest plus a small Python file or a data file — and run on a behaviour-identical plugin runtime. Any app written for splitflap-os drops in unchanged, and an app you write for the companion is an app for splitflap-os too. The two projects share a format rather than compete for one.
+
+---
+
+## No Mechanical Build? Same Software, Different Wall
+
+Because the companion only ever talks to a gateway, and the gateway's job is to *be* a wall of modules, two more boards run the identical gateway firmware with **virtual** flaps: the [Matrix Gateway](https://github.com/avandeputte/MatrixPortalGateway) on an RGB LED matrix, and the [LCD Gateway](https://github.com/avandeputte/SplitFlapGatewayLCD) on a 10.1" touchscreen. Each replaces the modules *and* the gateway in one board; the companion can't tell the difference, and the same app spells its text on a physical wall and draws a richer panel on the emulated one.
+
+<a href="screenshots/companion-matrix-portal.png"><img src="screenshots/companion-matrix-portal.png" width="380" alt="The Word Clock app on a Matrix Gateway"></a>  
+*The same Word Clock app, at the same minute, on an LED-matrix wall*
+
+It's a good way to try the whole stack before cutting a single flap — and a good display in its own right.
+
+---
+
+## Three Projects, Independently Useful
+
+These are three separate projects that solve three different problems. They work best together, and the wiki's [Quick Start](https://github.com/avandeputte/SplitFlapGateway/wiki/Quick-Start) walks that path — but none of them depends on the others:
+
+- **Universal firmware without the gateway** — keep the Raspberry Pi, provision from splitflap-os or the included terminal tool, and you still get one binary for all modules, backup and restore by serial number, custom flap sets and self-diagnostics.
+
+- **Gateway without the universal firmware** — happy with Adam's original hardcoded firmware and just want the Pi out of the display? The gateway works perfectly: send characters, home, calibrate, monitor the bus, control the wall from anywhere on your network. You just won't have provisioning, since the original firmware doesn't support it.
+
+- **Gateway without the companion** — drive it by hand from its own web UI, from your own scripts against the REST API, from Home Assistant over MQTT, or from splitflap-os.
+
+- **All three together** — flash once, provision and calibrate from a browser, and let the companion decide what the wall shows, when, and in which language, from wherever you already run things.
+
+Every viable mix is compared, with a feature grid, in the wiki's [Choosing a Configuration](https://github.com/avandeputte/SplitFlapGateway/wiki/Choosing-a-Configuration).
+
+<a href="screenshots/configurations.png"><img src="screenshots/configurations.png" width="760" alt="The seven working configurations at a glance"></a>  
+*Every combination is a working display; they differ in what you get around it*
+
+The goal in every case was the same: make Adam's beautiful hardware easier to live with long-term — without breaking the growing community of projects already built around it.
 
 ---
 
 ## Getting Started
 
+- **[The SplitFlap wiki](https://github.com/avandeputte/SplitFlapGateway/wiki)** — the complete guide, from a bare board to a message on the wall; the [Quick Start](https://github.com/avandeputte/SplitFlapGateway/wiki/Quick-Start) is the recommended path
 - **[Adam G Makes on YouTube](https://www.youtube.com/@AdamGMakes)** — start here for the hardware build
-- **[SplitFlapUniversalFirmware](https://github.com/avandeputte/SplitFlapUniversalFirmware)** — optional: flash this onto your modules to enable runtime provisioning
-- **[SplitFlapGateway](https://github.com/avandeputte/SplitFlapGateway)** — optional: flash this onto the ESP32-S3 to remove the Raspberry Pi from your display
-- **[splitflap-os](https://github.com/csader/splitflap-os)** — a full-featured web UI with 40+ apps, if you're keeping the Raspberry Pi
+- **[SplitFlapUniversalFirmware](https://github.com/avandeputte/SplitFlapUniversalFirmware)** — flash this onto your modules for runtime provisioning, custom flap sets and self-diagnostics
+- **[SplitFlapGateway](https://github.com/avandeputte/SplitFlapGateway)** — flash this onto the ESP32-S3 to take the Raspberry Pi out of your display; a [prebuilt image](https://github.com/avandeputte/SplitFlapGateway/releases) needs no build environment
+- **[SplitFlapGatewayCompanion](https://github.com/avandeputte/SplitFlapGatewayCompanion)** — the content engine: apps, playlists, schedules, triggers; runs in Docker or as a Home Assistant app
+- **[splitflap-os](https://github.com/csader/splitflap-os)** — csader's full-featured web UI and app library, if you're keeping the Raspberry Pi
 - **[Waveshare ESP32-S3-RS485-CAN on Amazon](https://www.amazon.com/dp/B0FNCWZ3D1)** — the recommended gateway hardware
