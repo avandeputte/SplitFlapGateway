@@ -423,7 +423,11 @@ static void handleApiDisplayState() {
       cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"%s\"", i ? "," : "", u);
     }
     if (cn < 0) cn = 0;
-    if (bl + (size_t)cn >= sizeof(batch)) { server.sendContent(batch); bl = 0; }
+    if (bl + (size_t)cn >= sizeof(batch)) {
+      batch[bl] = 0;                 // sendContent() strlen()s its argument: terminate BEFORE the
+      server.sendContent(batch);     // flush, or stale bytes past bl leak into the JSON (v3.12.1)
+      bl = 0;
+    }
     memcpy(batch + bl, cellBuf, cn); bl += cn;
   }
   if (bl) { batch[bl] = 0; server.sendContent(batch); }

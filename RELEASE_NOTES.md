@@ -1,5 +1,17 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.12.1 — 2026-09-14
+
+### Fixed
+
+- **Display layouts of more than about 50 cells broke the Display and Calibration tabs**
+  ("Could not load display state", "Error loading layout"). `GET /api/display/state` streams
+  its cell list in 256-byte batches, and every batch but the last was sent without a string
+  terminator, so stale bytes leaked into the JSON at each batch boundary. A small wall fits in
+  one batch and never hit it; a 6 × 20 wall did on every poll. The batch is now terminated
+  before each flush. No other endpoint had the flaw (the module list streamer already
+  terminated its chunks).
+
 ## v3.12.0 — 2026-09-01
 
 **Restore on boot.** A calibration backup can now live on the gateway and be replayed to
