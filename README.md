@@ -148,7 +148,7 @@
   ```
 
   Each cell is exactly one of `ch` (a character), `color` (a named flag: red orange yellow green
-  blue purple white), `blank` (home the module), or `skip` (leave it alone). `step_ms` (0–30)
+  blue purple white), `blank` (home the module), or `skip` (leave it alone). `step_ms` (0–100)
   paces the cascade, scheduled on the RS-485 task rather than blocking the web server.
 
   It is **lenient**, and that is the one real difference from the Matrix's strict form: this wall's
@@ -740,7 +740,7 @@ All `POST` endpoints accept `Content-Type: application/json`.
 |---|---|---|---|
 | `GET` | `/api/rs485/messages` | — | Drain buffered frames (up to 64) |
 | `POST` | `/api/rs485/send` | `{"data":"m5-A\n"}` (optional `"raw":true`) | Send raw ASCII frame. Framing/junk is normalized by default; `"raw":true` sends bytes verbatim |
-| `POST` | `/api/rs485/batch` | `{"frames":["m00-A\n","m01-B\n",…],"step_ms":15}` | **(v3.0)** Send many frames in one request (each normalized like `/send`); optional `step_ms` (0–30) paces the cascade device-side. Lets a host draw a whole animated page in one HTTP call instead of one request per module. Capped at 512 frames. **(v3.4)** Paced frames are now *queued* and sent by the bus task, so the call returns at once — `200` means **accepted**, not yet on the wire (see [Batch pacing](#batch-pacing-v34)) |
+| `POST` | `/api/rs485/batch` | `{"frames":["m00-A\n","m01-B\n",…],"step_ms":15}` | **(v3.0)** Send many frames in one request (each normalized like `/send`); optional `step_ms` (0–100) paces the cascade device-side. Lets a host draw a whole animated page in one HTTP call instead of one request per module. Capped at 512 frames. **(v3.4)** Paced frames are now *queued* and sent by the bus task, so the call returns at once — `200` means **accepted**, not yet on the wire (see [Batch pacing](#batch-pacing-v34)) |
 
 #### Batch pacing (v3.4)
 
@@ -772,7 +772,7 @@ callers:
 | `POST` | `/api/flap/char` | `{"id":5,"char":"A"}` | Show character (`id:-1` = all) |
 | `POST` | `/api/flap/index` | `{"id":5,"index":1}` | Show flap by index 0–63 |
 | `POST` | `/api/flap/text` | `{"text":"HELLO","start":0}` | Send text across sequential modules |
-| `POST` | `/api/display/cells` | `{"start":0,"step_ms":15,"cells":[{"ch":"H"},{"color":"red"},{"blank":true},{"skip":true}]}` | **(v3.8)** Set a run of modules in one call, the same contract the Matrix Portal gateway answers. Each cell is one of `ch`/`color`/`blank`/`skip`; `step_ms` (0–30) paces the cascade. **Lenient** — a cell that cannot be shown is skipped, and the response is `{ok,cells,sent,skipped}`; only structural errors 400. See [New in 3.8](#new-in-38) |
+| `POST` | `/api/display/cells` | `{"start":0,"step_ms":15,"cells":[{"ch":"H"},{"color":"red"},{"blank":true},{"skip":true}]}` | **(v3.8)** Set a run of modules in one call, the same contract the Matrix Portal gateway answers. Each cell is one of `ch`/`color`/`blank`/`skip`; `step_ms` (0–100) paces the cascade. **Lenient** — a cell that cannot be shown is skipped, and the response is `{ok,cells,sent,skipped}`; only structural errors 400. See [New in 3.8](#new-in-38) |
 | `POST` | `/api/flap/home` | `{"id":5}` | Home module (`id:-1` = all) |
 | `POST` | `/api/flap/version` | `{"id":5}` | Query version — waits up to 500ms, returns `{ok,id,ver,sn,stale,lastSeen}` |
 | `POST` | `/api/flap/dump` | `{"id":5}` | Fetch EEPROM fresh — waits up to 500ms (1s if SN fallback needed), returns `{ok,id,sn,dump}` |
@@ -856,11 +856,11 @@ Each entry from `/api/flap/modules` includes `lastSeen` (millis-since-boot, rese
 | `DELETE` | `/api/restore/backup` | — | **(v3.12)** Delete the stored backup (`409` while a restore runs) |
 | `POST` | `/api/restore/run` | `{"delay":0}` (optional, seconds) | **(v3.12)** Replay the stored backup now. Locks the bus at once; `409` if one is already running, `404` if nothing usable is stored |
 | `POST` | `/api/restore/cancel` | — | **(v3.12)** Stop a running restore after its current step (`409` if none is running) |
-| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.8.0"` — and **(v3.12)** `restoreOnBoot` / `restoreDelay` |
+| `GET` | `/api/config` | — | Current configuration (passwords excluded). Includes `"version"` — the firmware version, e.g. `"3.8.0"`, **(v3.12)** `restoreOnBoot` / `restoreDelay`, and **(v3.13)** `stepMs` — the default per-module cascade pacing a client should use (the companion reads it as its default `step_ms`) |
 | `POST` | `/api/config/wifi` | `{"ssid":"...","pass":"..."}` | WiFi credentials |
 | `POST` | `/api/config/mqtt` | `{"host":"...","port":1883,"user":"...","pass":"...","prefix":"splitflap"}` | MQTT settings |
 | `POST` | `/api/config/rs485` | `{"baud":9600,"dataBits":8,"parity":0,"stopBits":1}` | RS-485 bus parameters |
-| `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"haEnabled":true}` or `{"otaPassword":"..."}` or `{"restoreOnBoot":true,"restoreDelay":10}` | Timezone, serial debug, Home Assistant integration, OTA password, or **(v3.12)** restore-on-boot (enable flag and post-boot delay in seconds, 0–600) |
+| `POST` | `/api/config/settings` | `{"posixTZ":"EST5EDT,..."}` or `{"serialDebug":true}` or `{"haEnabled":true}` or `{"otaPassword":"..."}` or `{"restoreOnBoot":true,"restoreDelay":10}` or `{"stepMs":25}` | Timezone, serial debug, Home Assistant integration, OTA password, **(v3.12)** restore-on-boot (enable flag and post-boot delay in seconds, 0–600), or **(v3.13)** the default step pacing in ms (0–100). The gateway stores and reports `stepMs`; it does not pace its own sends by it |
 
 ### OTA Firmware Update
 

@@ -1,5 +1,22 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.13.0 — 2026-09-23
+
+### Added
+
+- **A default step-pacing setting (`stepMs`).** Settings ▸ *Display Layout* gains *Default step
+  pacing (ms)*, stored in NVS and reported as `stepMs` on `GET /api/config` (set it with
+  `POST /api/config/settings {"stepMs":25}`, 0–100, default 15). The companion (v2.10.22+)
+  reads it as its default `step_ms` -- the per-module gap every app page send and Compose
+  inherit -- so the pacing a wall needs lives with the wall, not in each client. Larger walls
+  need slower pacing: measured on 60 modules, 15 ms lost 27, 20 ms lost 9, 25 ms was stable.
+  The gateway stores and reports the value; it does **not** pace its own sends by it.
+
+### Changed
+
+- The per-request `step_ms` cap on `/api/rs485/batch` and `/api/display/cells` is raised from
+  30 to 100 ms to match, so a stored default above 30 is honoured rather than silently clamped.
+
 ## v3.12.1 — 2026-09-14
 
 ### Fixed

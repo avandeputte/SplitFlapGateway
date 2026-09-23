@@ -139,7 +139,7 @@ paths:
                 step_ms:
                   type: integer
                   default: 0
-                  description: Delay (0–30 ms) between frames, for a paced cascade.
+                  description: Delay (0–100 ms) between frames, for a paced cascade.
             example: { frames: ["m00-A\n", "m01-B\n", "m02-y\n"], step_ms: 15 }
       responses:
         "200":
@@ -307,7 +307,7 @@ paths:
 
         Each cell is exactly one of `ch` (a character), `color` (a named colour flag), `blank`
         (home the module), or `skip` (leave it alone). Cell `i` addresses module `start + i`.
-        `step_ms` (0..30) paces the cascade; it is scheduled on the RS-485 task, never a blocking
+        `step_ms` (0..100) paces the cascade; it is scheduled on the RS-485 task, never a blocking
         delay.
 
         LENIENT: this wall's modules each carry their own reel and may differ, so a cell that
@@ -327,7 +327,7 @@ paths:
               required: [cells]
               properties:
                 start:   { type: integer, description: "First module id (default 0)", example: 0 }
-                step_ms: { type: integer, description: "Cascade pacing, 0..30 ms", example: 15 }
+                step_ms: { type: integer, description: "Cascade pacing, 0..100 ms", example: 15 }
                 cells:
                   type: array
                   items:
@@ -1771,6 +1771,7 @@ paths:
                 otaPassword: { type: string, example: "mysecret" }
                 restoreOnBoot: { type: boolean, example: true, description: "Replay the stored calibration backup on every boot (v3.12). Takes effect at the next boot" }
                 restoreDelay:  { type: integer, minimum: 0, maximum: 600, example: 10, description: "Seconds after boot before that replay starts (v3.12)" }
+                stepMs:        { type: integer, minimum: 0, maximum: 100, example: 25, description: "Default per-module cascade pacing in ms (v3.13), reported on GET /api/config for clients to use as their step_ms" }
             examples:
               timezone:
                 value:
@@ -1791,6 +1792,9 @@ paths:
                 value:
                   restoreOnBoot: true
                   restoreDelay: 10
+              step_pacing:
+                value:
+                  stepMs: 25
       responses:
         "200":
           $ref: "#/components/responses/Ok"
@@ -2050,3 +2054,4 @@ components:
         otaPasswordSet: { type: boolean, description: "true if an OTA password is configured", example: false }
         restoreOnBoot: { type: boolean, description: "Replay the stored calibration backup on every boot (v3.12)", example: false }
         restoreDelay:  { type: integer, description: "Seconds after boot before that replay starts (v3.12)", example: 10 }
+        stepMs:        { type: integer, minimum: 0, maximum: 100, description: "Default per-module cascade pacing in ms (v3.13). Stored and reported for clients -- the companion uses it as its default step_ms; the gateway does not pace its own sends by it", example: 15 }

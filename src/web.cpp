@@ -247,7 +247,7 @@ static void handleApiSendBatch() {
   if (frames.isNull()) { sendJsonError(400, "'frames' array required"); return; }
   int step = doc["step_ms"] | 0;
   if (step < 0)  step = 0;
-  if (step > 30) step = 30;          // keep per-frame pacing small
+  if (step > STEP_MS_MAX) step = STEP_MS_MAX;   // same cap as the stored default (v3.13)
   // One 'REST' row marking the batch, just above the TX frames it produces.
   { char cd[48]; snprintf(cd, sizeof(cd), "batch %u frames, step=%dms",
       (unsigned)frames.size(), step); ringPushCommand('R', cd); }
@@ -1142,7 +1142,7 @@ static void handleApiCapabilities() {
  *
  * Body: { "start": 0, "step_ms": 15, "cells": [ {ch|color|blank|skip}, ... ] }
  *   start     first module id the cells land on (default 0). id = start + position.
- *   step_ms   0..30, paces the cascade -- SCHEDULED on taskRS485, never a delay() here (a
+ *   step_ms   0..100, paces the cascade -- SCHEDULED on taskRS485, never a delay() here (a
  *             blocking wait would freeze the one-connection HTTP server; see the batch API).
  *   cells     one per module, left to right, each exactly one of:
  *               {"ch":"A"}        a character. Lowercase folds to uppercase, '"' reaches the
@@ -1176,7 +1176,7 @@ static void handleApiDisplayCells() {
   if (start < 0 || start > 254) { sendJsonError(400, "'start' must be 0..254"); return; }
   int step = doc["step_ms"] | 0;
   if (step < 0)  step = 0;
-  if (step > 30) step = 30;
+  if (step > STEP_MS_MAX) step = STEP_MS_MAX;
 
   { char cd[48]; snprintf(cd, sizeof(cd), "cells from id %d, step=%dms", start, step);
     ringPushCommand('R', cd); }
@@ -1293,6 +1293,7 @@ static void handleApiConfigGet() {
   doc["otaPasswordSet"] = (strlen(cfg.otaPassword) > 0);
   doc["restoreOnBoot"]  = cfg.restoreOnBoot;      // v3.12
   doc["restoreDelay"]   = cfg.restoreDelaySec;
+  doc["stepMs"]         = cfg.stepMs;             // v3.13: the companion's default step_ms
   char out[840];   // headroom for "version" + JSON-escaped SSID/TZ strings
   serializeJson(doc, out, sizeof(out));
   server.send(200, "application/json", out);
@@ -1456,6 +1457,14 @@ static void handleApiConfigSettings() {
     cfg.gridRows = (uint8_t)gr;
     cfg.gridCols = (uint8_t)gc;
     DBG("[CFG] Display grid set to %dx%d (rows x cols)\n", gr, gc);
+  }
+  // Default step pacing (v3.13). Stored and reported only; see STEP_MS_MAX in common.h.
+  if (doc["stepMs"].is<int>()) {
+    int sm = doc["stepMs"].as<int>();
+    if (sm < 0) sm = 0;
+    if (sm > STEP_MS_MAX) sm = STEP_MS_MAX;
+    cfg.stepMs = (uint8_t)sm;
+    printf("[CFG] Default step pacing set to %d ms\n", sm);
   }
   bool baudChanged = (newBaud != cfg.rs485Baud);
   cfg.rs485Baud = newBaud;

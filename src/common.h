@@ -130,7 +130,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.12.1"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.13.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -280,6 +280,15 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
  * runs the gateway refuses every other bus command. See restore.h / restore.cpp.
  * Names are 8.3-safe like the other FFat files. The size cap only bounds a rogue
  * upload: a 64-module backup is ~45 KB. */
+/* ---- Default step pacing (v3.13) ---------------------------------------------------
+ * The per-module cascade gap a client should use when it paces a page send. The gateway
+ * STORES and REPORTS this (GET /api/config "stepMs"); it does not pace its own sends by
+ * it -- the batch and cells endpoints still take an explicit step_ms per request, which
+ * the companion fills from this default. Larger walls need slower pacing: measured on 60
+ * modules, 15 ms lost 27, 20 ms lost 9, 25 ms was stable. STEP_MS_MAX also caps the
+ * per-request step_ms, so a stored default is never silently clamped below itself. */
+#define DEFAULT_STEP_MS           15
+#define STEP_MS_MAX               100
 #define RESTORE_FILE              "/restore.bak"
 #define RESTORE_TMP               "/restore.tmp"
 #define RESTORE_MAX_BYTES         (256UL * 1024UL)

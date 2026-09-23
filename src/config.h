@@ -39,6 +39,8 @@ struct GwConfig {
   // ---- v3.12 ----
   bool          restoreOnBoot;     // replay the stored calibration backup on every boot (restore.h)
   uint16_t      restoreDelaySec;   // seconds after boot before that replay starts
+  // ---- v3.13 ----
+  uint8_t       stepMs;            // default per-module cascade pacing, reported to clients (common.h)
 };
 
 // ---- owned globals (defined in globals.cpp) ----

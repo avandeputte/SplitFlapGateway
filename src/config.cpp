@@ -32,6 +32,7 @@ void cfgSetDefaults() {
   // v3.12 defaults
   cfg.restoreOnBoot   = false;
   cfg.restoreDelaySec = RESTORE_DEFAULT_DELAY_S;
+  cfg.stepMs          = DEFAULT_STEP_MS;   // v3.13
 }
 // Migrate settings from old NVS namespace "rs485gw" to "splitflap".
 // Runs once after firmware update; no-op on subsequent boots.
@@ -69,6 +70,9 @@ void loadConfig() {
   cfg.restoreOnBoot   = prefs.getBool("rbEn", false);
   cfg.restoreDelaySec = prefs.getUShort("rbDelay", RESTORE_DEFAULT_DELAY_S);
   if (cfg.restoreDelaySec > RESTORE_MAX_DELAY_S) cfg.restoreDelaySec = RESTORE_MAX_DELAY_S;
+  // v3.13
+  cfg.stepMs = prefs.getUChar("stepMs", DEFAULT_STEP_MS);
+  if (cfg.stepMs > STEP_MS_MAX) cfg.stepMs = STEP_MS_MAX;
   strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
   setenv("TZ", gPosixTZ, 1);
   tzset();
@@ -105,5 +109,7 @@ void saveConfig() {
   // v3.12
   prefs.putBool  ("rbEn",      cfg.restoreOnBoot);
   prefs.putUShort("rbDelay",   cfg.restoreDelaySec);
+  // v3.13
+  prefs.putUChar ("stepMs",    cfg.stepMs);
   prefs.end();
 }
