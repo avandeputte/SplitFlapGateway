@@ -268,14 +268,15 @@ static void quietScheduleTick() {
   prevWant = want;
 }
 
+// taskRTC ONLY reads the clock. The quiet-time schedule used to be evaluated here too, and
+// that was a crash: taskRTC has a 2 KB stack that already peaks at ~1.4 KB, and asserting
+// Quiet Time from it sends bus frames -- sfSetQuietTime -> sfHome -> rs485Send (336 B) ->
+// mqttPublishMsg (976 B) plus printf -- about 1.5 KB more. Stack overflow, panic, reboot.
+// With restore-on-boot enabled that showed as a loop: boot, restore, quiet asserts, crash,
+// boot again. The schedule now ticks on taskNetwork (6 KB). (v3.13.1)
 void taskRTC(void* pv) {
-  uint32_t lastSched = 0;
   while (true) {
     rtcRead();
-    if (lastSched == 0 || millis() - lastSched > 5000UL) {
-      lastSched = millis();
-      quietScheduleTick();     // evaluate the quiet window every 5s (prompt flip)
-    }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
@@ -418,6 +419,13 @@ void taskNetwork(void* pv) {
         sfModulesDirty   = false;
         sfModulesDirtyMs = 0;
       }
+    }
+    // Quiet-time schedule, every 5 s (prompt flip at a window boundary). Here and not on
+    // taskRTC: asserting quiet sends bus frames, and this task has the stack for that.
+    static uint32_t lastSched = 0;
+    if (lastSched == 0 || millis() - lastSched > 5000UL) {
+      lastSched = millis();
+      quietScheduleTick();
     }
     // Periodically prune stale modules (once a minute is plenty).
     static unsigned long lastPruneMs = 0;

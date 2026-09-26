@@ -11,9 +11,9 @@ The firmware runs five FreeRTOS tasks plus `loop()`:
 | Task | Core | Priority | Responsibility |
 |---|---|---|---|
 | `taskRS485` | 0 | 3 | Byte accumulator for the RS-485 bus |
-| `taskRTC` | 0 | 2 | Reads the PCF85063 RTC every second |
+| `taskRTC` | 0 | 2 | Reads the PCF85063 RTC every second -- and nothing else (see below) |
 | `taskWeb` | 0 | 2 | `server.handleClient()` loop |
-| `taskNetwork` | 1 | 1 | WiFi/MQTT/NTP, status publishing |
+| `taskNetwork` | 1 | 1 | WiFi/MQTT/NTP, status publishing, registry persistence, the quiet-time schedule |
 | `taskOTA` | 1 | 1 | `ArduinoOTA.handle()` every 100ms |
 | `loop()` | — | — | Watchdog check every 30s |
 

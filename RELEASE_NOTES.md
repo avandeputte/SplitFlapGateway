@@ -1,5 +1,22 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.13.1 — 2026-09-25
+
+### Fixed
+
+- **A Quiet Time schedule could reboot the gateway -- and with Restore on Boot enabled, loop.**
+  The schedule was evaluated on the RTC task, which has a 2 KB stack that already peaks at
+  about 1.4 KB just reading the clock. Asserting Quiet Time from there sends bus frames through
+  a call chain (`sfSetQuietTime` → `sfHome` → `rs485Send` → `mqttPublishMsg`, plus `printf`)
+  that needs roughly 1.5 KB more: a stack overflow, a panic, a reboot. Reported as "quiet time
+  does not work with restore on boot: it goes blank, after a minute it loads the backup, and
+  loops" -- exactly that sequence: power-up homing (blank), the boot restore, the schedule
+  asserting quiet the moment the restore released the bus, the crash, and round again. The
+  schedule now ticks on the network task, which has the stack for it.
+- **Restore on Boot now takes the bus before any task starts.** It used to be armed after the
+  tasks were spawned, so the first schedule tick could assert Quiet Time in the gap and the
+  restore then ran under it (its final home-all suppressed).
+
 ## v3.13.0 — 2026-09-23
 
 ### Added

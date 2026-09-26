@@ -125,18 +125,20 @@ void setup() {
   mqttInit();
   webInit();
 
-  // 7. Spawn tasks after WiFi stack is ready
+  // 7. Restore-on-boot (v3.12). If enabled and a usable backup is stored, this locks the
+  // bus NOW -- before any task exists, so nothing (the quiet-time schedule included) can
+  // touch the bus first -- and schedules the replay for cfg.restoreDelaySec after boot, so
+  // the modules have finished their own power-up homing. The lock always releases: see
+  // restore.cpp. (Moved ahead of the tasks in v3.13.1: it used to follow them, and the
+  // first schedule tick could assert Quiet Time in the gap.)
+  restoreInit();
+
+  // 8. Spawn tasks after WiFi stack is ready
   xTaskCreatePinnedToCore(taskRTC,     "RTC",     2048, NULL, 2, &hTaskRTC,   0);
   xTaskCreatePinnedToCore(taskRS485,   "RS485",   6144, NULL, 3, &hTaskRS485, 0);
   xTaskCreatePinnedToCore(taskOTA,     "OTA",     4096, NULL, 1, &hTaskOTA,   1);
   xTaskCreatePinnedToCore(taskWeb,     "Web",     8192, NULL, 2, &hTaskWeb,   0);
   xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
-
-  // 8. Restore-on-boot (v3.12). If enabled and a usable backup is stored, this locks the
-  // bus NOW -- every REST/MQTT module command is refused from here on -- and schedules the
-  // replay for cfg.restoreDelaySec after boot, so the modules have finished their own
-  // power-up homing first. The lock always releases: see restore.cpp.
-  restoreInit();
 
   printf("[Boot] Ready\n");
 }
