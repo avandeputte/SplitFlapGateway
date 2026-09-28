@@ -218,6 +218,12 @@
 
 The RS-485 bus runs at **9600 baud, 8N1**.
 
+> **Mount it on the rail.** [`SplitFlapGatewayCase.3mf`](SplitFlapGatewayCase.3mf) is a printed
+> case that replaces the Waveshare enclosure, clips the gateway onto the modules' DIN rail, and
+> takes 12 V and the RS-485 bus from the conductor rail through four pogo pins — no wiring to
+> the wall at all. The build, and the soldering it needs, is on the wiki:
+> **[Gateway Case](https://github.com/avandeputte/SplitFlapGateway/wiki/Gateway-Case)**.
+
 ---
 
 ## Features
