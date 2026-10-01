@@ -7,7 +7,7 @@ The hardware is excellent. But as the community around this project has grown, t
 <a href="screenshots/ecosystem.png"><img src="screenshots/ecosystem.png" width="760" alt="The SplitFlap ecosystem: modules, gateway, companion"></a>  
 *The three pieces and how they connect: modules on an RS-485 bus, a gateway that bridges the bus to the network, and a companion that decides what to show.*
 
-> Everything below, and a great deal more, is documented step by step in the **[SplitFlap wiki](https://github.com/avandeputte/SplitFlapGateway/wiki)** — start with the [Quick Start](https://github.com/avandeputte/SplitFlapGateway/wiki/Quick-Start) if you'd rather build than read.
+> Everything below, and a great deal more, is documented step by step in the **[SplitFlap wiki](https://splitflap.iothing.net/docs/)** — start with the [Quick Start](https://splitflap.iothing.net/docs/Quick-Start/) if you'd rather build than read.
 
 ---
 
@@ -171,7 +171,7 @@ It's a good way to try the whole stack before cutting a single flap — and a go
 
 ## Three Projects, Independently Useful
 
-These are three separate projects that solve three different problems. They work best together, and the wiki's [Quick Start](https://github.com/avandeputte/SplitFlapGateway/wiki/Quick-Start) walks that path — but none of them depends on the others:
+These are three separate projects that solve three different problems. They work best together, and the wiki's [Quick Start](https://splitflap.iothing.net/docs/Quick-Start/) walks that path — but none of them depends on the others:
 
 - **Universal firmware without the gateway** — keep the Raspberry Pi, provision from splitflap-os or the included terminal tool, and you still get one binary for all modules, backup and restore by serial number, custom flap sets and self-diagnostics.
 
@@ -181,7 +181,7 @@ These are three separate projects that solve three different problems. They work
 
 - **All three together** — flash once, provision and calibrate from a browser, and let the companion decide what the wall shows, when, and in which language, from wherever you already run things.
 
-Every viable mix is compared, with a feature grid, in the wiki's [Choosing a Configuration](https://github.com/avandeputte/SplitFlapGateway/wiki/Choosing-a-Configuration).
+Every viable mix is compared, with a feature grid, in the wiki's [Choosing a Configuration](https://splitflap.iothing.net/docs/Choosing-a-Configuration/).
 
 <a href="screenshots/configurations.png"><img src="screenshots/configurations.png" width="760" alt="The seven working configurations at a glance"></a>  
 *Every combination is a working display; they differ in what you get around it*
@@ -192,7 +192,7 @@ The goal in every case was the same: make Adam's beautiful hardware easier to li
 
 ## Getting Started
 
-- **[The SplitFlap wiki](https://github.com/avandeputte/SplitFlapGateway/wiki)** — the complete guide, from a bare board to a message on the wall; the [Quick Start](https://github.com/avandeputte/SplitFlapGateway/wiki/Quick-Start) is the recommended path
+- **[The SplitFlap wiki](https://splitflap.iothing.net/docs/)** — the complete guide, from a bare board to a message on the wall; the [Quick Start](https://splitflap.iothing.net/docs/Quick-Start/) is the recommended path
 - **[Adam G Makes on YouTube](https://www.youtube.com/@AdamGMakes)** — start here for the hardware build
 - **[SplitFlapUniversalFirmware](https://github.com/avandeputte/SplitFlapUniversalFirmware)** — flash this onto your modules for runtime provisioning, custom flap sets and self-diagnostics
 - **[SplitFlapGateway](https://github.com/avandeputte/SplitFlapGateway)** — flash this onto the ESP32-S3 to take the Raspberry Pi out of your display; a [prebuilt image](https://github.com/avandeputte/SplitFlapGateway/releases) needs no build environment

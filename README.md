@@ -1,9 +1,9 @@
 # Split-Flap Gateway
 
-> ### 📖 [SplitFlap Wiki — the comprehensive documentation](https://github.com/avandeputte/SplitFlapGateway/wiki)
-> Quick start · choosing a configuration · provisioning & calibration · the SplitFlap and
-> Matrix Gateways · the companion and its apps · APIs and wire protocols — the whole
-> ecosystem, documented in one place.
+> ### 🌐 [splitflap.iothing.net](https://splitflap.iothing.net) · 📖 [Documentation](https://splitflap.iothing.net/docs/)
+> Quick start · choosing a configuration · provisioning & calibration · the SplitFlap,
+> Matrix and LCD gateways · the companion and its apps · APIs and wire protocols — the
+> whole ecosystem, documented in one place.
 
 
 **Firmware version: 3.8.0**
@@ -222,7 +222,7 @@ The RS-485 bus runs at **9600 baud, 8N1**.
 > case that replaces the Waveshare enclosure, clips the gateway onto the modules' DIN rail, and
 > takes 12 V and the RS-485 bus from the conductor rail through four pogo pins — no wiring to
 > the wall at all. The build, and the soldering it needs, is on the wiki:
-> **[Gateway Case](https://github.com/avandeputte/SplitFlapGateway/wiki/Gateway-Case)**.
+> **[Gateway Case](https://splitflap.iothing.net/docs/Gateway-Case/)**.
 
 ---
 
