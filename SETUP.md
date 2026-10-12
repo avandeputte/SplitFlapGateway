@@ -71,7 +71,7 @@ After flashing, continue from [§9 First-time configuration](#9-first-time-confi
 
 > **Web updater failed part-way?** Nothing was flashed and the old firmware is still
 > running. The README's
-> [recovery without developer tools](README.md#if-the-web-update-fails--recovery-without-developer-tools)
+> [recovery without developer tools](https://splitflap.iothing.net/docs/SplitFlap-Gateway/#if-the-web-update-fails-recovery-without-developer-tools)
 > section covers the three no-toolchain ways forward, including a USB flash that keeps
 > your settings (app image at `0x10000` **plus** `boot_app0.bin` at `0xE000`).
 
@@ -287,7 +287,7 @@ The board has no Wi-Fi credentials yet, so it starts its own access point.
    **<http://splitflap-gw.local>** (mDNS).
 
 For provisioning modules, calibration, MQTT, etc., see the [README](README.md) and
-[CALIBRATION_GUIDE](CALIBRATION_GUIDE.md).
+[Calibration guide](https://splitflap.iothing.net/docs/Calibration/).
 
 ---
 
@@ -374,4 +374,4 @@ pio pkg update           # update platform + libraries
 
 Need the bigger picture (architecture, REST API, MQTT, module provisioning,
 calibration)? See [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and
-[CALIBRATION_GUIDE.md](CALIBRATION_GUIDE.md).
+[Calibration guide](https://splitflap.iothing.net/docs/Calibration/).
