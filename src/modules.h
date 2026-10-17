@@ -185,6 +185,46 @@ struct ProbeState {
   ProbeStep              s[PROBE_STEPS];
 };
 
+/* Bus soak test (v3.15) -- the probe, for the whole wall, for a long time, silently.
+ *
+ * "A couple of modules play up now and then" is the report that a single probe cannot catch.
+ * The soak walks every provisioned module in turn, pass after pass, for the number of minutes
+ * you ask, asking for a reply of a different size each pass -- 'v', 'Q', 'd', 'A' -- and
+ * keeps a tally per module per size. Nothing it sends moves a flap. It holds the bus (bus.h)
+ * so content cannot interleave, and it stops on its own at the deadline or on cancel.
+ *
+ * Reading the result: a module that fails only 'd' and 'A' is losing LONG frames (the bus,
+ * not the module); one that fails everything, or intermittently at every size, is a power or
+ * contact problem; a wall where every module is clean for 30 minutes is a wall you can trust.
+ */
+struct SoakRow {
+  uint8_t  id;
+  uint8_t  tries[PROBE_STEPS];
+  uint8_t  ok[PROBE_STEPS];
+  uint16_t maxLen;           // longest reply seen from this module
+  uint8_t  streak;           // consecutive failures right now (worst-case flicker detector)
+  uint8_t  worstStreak;
+};
+struct SoakState {
+  volatile bool          active    = false;
+  volatile bool          done      = false;
+  volatile bool          cancel    = false;
+  volatile int           modules   = 0;      // rows in use
+  volatile int           passes    = 0;
+  volatile int           queries   = 0;
+  volatile int           failures  = 0;
+  volatile unsigned long startedMs = 0;
+  volatile unsigned long deadlineMs= 0;
+  volatile unsigned long elapsedMs = 0;
+  volatile unsigned long dropsBefore = 0, dropsDuring = 0, rejectsBefore = 0, rejectsDuring = 0;
+  SoakRow*               rows      = NULL;   // MAX_MODULES, in PSRAM, allocated on first start
+};
+extern SoakState gSoak;
+// Start a soak of `minutes` (1-60) over every provisioned module. False if something else
+// owns the bus (probe, self-test, calibration) or the task will not start.
+bool sfSoakStart(int minutes);
+void sfSoakCancel();
+
 // ---- owned globals (defined in globals.cpp) ----
 extern ProbeState gProbe;
 extern SFModule* sfModules;

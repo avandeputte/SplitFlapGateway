@@ -33,6 +33,9 @@ static void handleApiFactoryResetBySN();
 static void handleApiFlapConfig();
 static void handleApiProbe();
 static void handleApiBus();
+static void handleApiSoak();
+static void handleApiSoakCancel();
+static void handleApiSoakStatus();
 static void handleApiBusHold();
 static void handleApiBusRelease();
 static void handleApiProbeStatus();
@@ -596,7 +599,7 @@ static void handleApiDiag() {
   if (id < 0 || id > 254) { sendJsonError(400, "valid id required"); return; }
   DBG("[API] diagnostics module %d (Q + Hall)\n", id);
 
-  if (gProbe.active) { sendJsonError(409, "a bus probe is running -- wait for it to finish"); return; }
+  if (gProbe.active || gSoak.active) { sendJsonError(409, "a bus probe or soak is running -- wait for it to finish"); return; }
   // Reject if a motor test is already running for a different module.
   if (gDiag.jobActive && gDiag.jobId != id) {
     char busy[96];
@@ -2026,8 +2029,8 @@ static void handleApiProbe() {
   // A motor test (or a calibration measure) owns the bus for tens of seconds. A probe run
   // alongside one gets no replies and would report a healthy module as "nothing answered" --
   // which is worse than no diagnostic at all.
-  if (gDiag.jobActive || gCalib.jobActive) {
-    sendJsonError(409, "a self-test is still running on the bus -- wait for it to finish");
+  if (gDiag.jobActive || gCalib.jobActive || gSoak.active) {
+    sendJsonError(409, "a self-test or soak is still running on the bus -- wait for it to finish");
     return;
   }
   if (gProbe.active) {
@@ -2107,6 +2110,73 @@ static void handleApiBusRelease() {
   static char out[384];
   busStatusJson(out, sizeof(out));
   server.send(200, "application/json", out);
+}
+
+/* POST /api/flap/soak {"minutes":10} -- see SoakState in modules.h. Returns at once; the
+   run happens on its own task. POST /api/flap/soak/cancel stops it after the current query.
+   GET /api/flap/soak/status streams progress and the per-module table. */
+static void handleApiSoak() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int minutes = 10;
+  if (server.hasArg("plain") && server.arg("plain").length()) {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
+    minutes = doc["minutes"] | 10;
+  }
+  if (gSoak.active) { sendJsonError(409, "a soak test is already running"); return; }
+  if (gProbe.active || gDiag.jobActive || gCalib.jobActive) {
+    sendJsonError(409, "a probe, self-test or calibration is still running on the bus"); return;
+  }
+  if (!sfSoakStart(minutes)) { sendJsonError(500, "could not start the soak test (no provisioned modules?)"); return; }
+  char out[80];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"modules\":%d,\"minutes\":%d}",
+           (int)gSoak.modules, minutes < 1 ? 1 : (minutes > 60 ? 60 : minutes));
+  server.send(200, "application/json", out);
+}
+static void handleApiSoakCancel() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!gSoak.active) { sendJsonError(409, "no soak test running"); return; }
+  sfSoakCancel();
+  server.send(200, "application/json", "{\"ok\":true,\"cancelling\":true}");
+}
+static void handleApiSoakStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.client().setConnectionTimeout(1500);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  static char chunk[1400]; size_t cl = 0;
+  auto put = [&](const char* s) {
+    size_t n = strlen(s);
+    if (cl + n >= sizeof(chunk)) { chunk[cl] = 0; server.sendContent(chunk); cl = 0; wdgWebMs = millis(); }
+    memcpy(chunk + cl, s, n); cl += n;
+  };
+  char head[320];
+  unsigned long now = millis();
+  long remaining = gSoak.active ? (long)((gSoak.deadlineMs - now + 999) / 1000) : 0;
+  if (remaining < 0) remaining = 0;
+  snprintf(head, sizeof(head),
+    "{\"ok\":true,\"state\":\"%s\",\"modules\":%d,\"passes\":%d,\"queries\":%d,\"failures\":%d,"
+    "\"elapsed\":%lu,\"remaining\":%ld,\"drops\":%lu,\"rejects\":%lu,\"rows\":[",
+    gSoak.active ? "running" : (gSoak.done ? (gSoak.cancel ? "cancelled" : "done") : "idle"),
+    (int)gSoak.modules, (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures,
+    (unsigned long)(gSoak.active ? now - gSoak.startedMs : gSoak.elapsedMs), remaining,
+    (unsigned long)(gSoak.active ? rxDropped - gSoak.dropsBefore : gSoak.dropsDuring),
+    (unsigned long)(gSoak.active ? sfParseRejects - gSoak.rejectsBefore : gSoak.rejectsDuring));
+  put(head);
+  if (gSoak.rows) {
+    char row[160];
+    for (int i = 0; i < gSoak.modules; i++) {
+      const SoakRow& r = gSoak.rows[i];
+      snprintf(row, sizeof(row),
+        "%s{\"id\":%d,\"v\":[%d,%d],\"Q\":[%d,%d],\"d\":[%d,%d],\"A\":[%d,%d],\"max\":%d,\"streak\":%d,\"worst\":%d}",
+        i ? "," : "", r.id, r.ok[0], r.tries[0], r.ok[1], r.tries[1], r.ok[2], r.tries[2], r.ok[3], r.tries[3],
+        (int)r.maxLen, (int)r.streak, (int)r.worstStreak);
+      put(row);
+    }
+  }
+  put("]}");
+  if (cl) { chunk[cl] = 0; server.sendContent(chunk); }
+  server.sendContent("");
 }
 
 // POST /api/flap/identify
@@ -2675,6 +2745,10 @@ void webInit() {
   server.on("/api/flap/probe",       HTTP_POST,    BUSGATED(handleApiProbe));
   server.on("/api/flap/probe",       HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/probe/status",HTTP_GET,     handleApiProbeStatus);
+  server.on("/api/flap/soak",        HTTP_POST,    BUSGATED(handleApiSoak));
+  server.on("/api/flap/soak",        HTTP_OPTIONS, handleOptions);
+  server.on("/api/flap/soak/cancel", HTTP_POST,    handleApiSoakCancel);
+  server.on("/api/flap/soak/status", HTTP_GET,     handleApiSoakStatus);
   server.on("/api/bus",              HTTP_GET,     handleApiBus);
   server.on("/api/bus/hold",         HTTP_POST,    handleApiBusHold);
   server.on("/api/bus/hold",         HTTP_OPTIONS, handleOptions);

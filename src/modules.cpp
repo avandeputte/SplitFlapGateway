@@ -619,8 +619,100 @@ static void taskProbe(void* pv) {
   vTaskDelete(NULL);
 }
 
+/* ---- Bus soak test (v3.15) ----------------------------------------------------------
+   See SoakState in modules.h. Its own task, like the probe; the browser polls
+   GET /api/flap/soak/status. The per-module table lives in PSRAM: 255 rows x 16 B. */
+static TaskHandle_t hTaskSoak = NULL;
+
+static void taskSoak(void* pv) {
+  static const char kCmds[PROBE_STEPS] = {'v', 'Q', 'd', 'A'};
+  static char out[TX_MAX_BYTES];
+  for (int pass = 0; !gSoak.cancel && (long)(millis() - gSoak.deadlineMs) < 0; pass++) {
+    busHold("soak", BUS_BUSY, 180000UL);                 // renewed every pass
+    const int k = pass % PROBE_STEPS;
+    const char cmd = kCmds[k];
+    for (int i = 0; i < gSoak.modules && !gSoak.cancel; i++) {
+      if ((long)(millis() - gSoak.deadlineMs) >= 0) break;
+      SoakRow& r = gSoak.rows[i];
+      char fw[8] = ""; char sn[21] = "";
+      if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+      SFModule* m = sfFindById(r.id);
+      if (m) { strlcpy(fw, m->fwVersion, sizeof(fw)); strlcpy(sn, m->serialNum, sizeof(sn)); }
+      if (sfMutex) xSemaphoreGive(sfMutex);
+      const char* v = (fw[0] == 'v' || fw[0] == 'V') ? fw + 1 : fw;
+      const int fwNum = atoi(v);
+      if (cmd == 'Q' && fwNum && fwNum < 26) continue;   // cannot answer: not a failure
+      if (cmd == 'A' && fwNum && fwNum < 25) continue;
+      rxLastLen = 0;
+      bool ok;
+      char frame[48];
+      if (cmd == 'v')      ok = sfSendVersionAndWait(r.id, 700, NULL, 0, NULL, 0, NULL);
+      else if (cmd == 'Q') ok = sfSendAndCaptureQ(r.id, 900);
+      else {
+        if (cmd == 'A' && sn[0])       snprintf(frame, sizeof(frame), "mXA%s\n", sn);
+        else if (cmd == 'A')           snprintf(frame, sizeof(frame), "m%dA\n", r.id);
+        else if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
+        else                           snprintf(frame, sizeof(frame), "m%dd\n", r.id);
+        ok = sfSendAndCaptureDump(r.id, frame, 1400, out, sizeof(out));
+      }
+      if (r.tries[k] < 255) r.tries[k]++;
+      gSoak.queries = gSoak.queries + 1;
+      if (ok) {
+        if (r.ok[k] < 255) r.ok[k]++;
+        if ((int)rxLastLen > r.maxLen) r.maxLen = (uint16_t)rxLastLen;
+        r.streak = 0;
+      } else {
+        gSoak.failures = gSoak.failures + 1;
+        if (r.streak < 255) r.streak++;
+        if (r.streak > r.worstStreak) r.worstStreak = r.streak;
+      }
+      vTaskDelay(pdMS_TO_TICKS(150));                    // gentle: ~1 query per 150 ms + reply time
+    }
+    gSoak.passes = pass + 1;
+  }
+  gSoak.dropsDuring   = rxDropped - gSoak.dropsBefore;
+  gSoak.rejectsDuring = sfParseRejects - gSoak.rejectsBefore;
+  gSoak.elapsedMs     = millis() - gSoak.startedMs;
+  busRelease("soak");
+  gSoak.active = false;
+  gSoak.done   = true;
+  printf("[SOAK] %s after %lus: %d passes, %d queries, %d failures, %lu dropped, %lu rejected\n",
+         gSoak.cancel ? "cancelled" : "finished", gSoak.elapsedMs / 1000UL,
+         (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures,
+         (unsigned long)gSoak.dropsDuring, (unsigned long)gSoak.rejectsDuring);
+  hTaskSoak = NULL;
+  vTaskDelete(NULL);
+}
+
+bool sfSoakStart(int minutes) {
+  if (gSoak.active || hTaskSoak || gProbe.active || gDiag.jobActive || gCalib.jobActive) return false;
+  if (minutes < 1) minutes = 1;
+  if (minutes > 60) minutes = 60;
+  if (!gSoak.rows) gSoak.rows = (SoakRow*)psramAlloc("soak table", sizeof(SoakRow) * MAX_MODULES);
+  if (!gSoak.rows) return false;
+  memset(gSoak.rows, 0, sizeof(SoakRow) * MAX_MODULES);
+  int n = 0;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++)
+    if (sfModules[i].provisioned && sfModules[i].id != 255) gSoak.rows[n++].id = sfModules[i].id;
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  if (!n) return false;
+  gSoak.modules = n; gSoak.passes = 0; gSoak.queries = 0; gSoak.failures = 0;
+  gSoak.startedMs = millis(); gSoak.deadlineMs = millis() + (unsigned long)minutes * 60000UL;
+  gSoak.elapsedMs = 0; gSoak.dropsBefore = rxDropped; gSoak.rejectsBefore = sfParseRejects;
+  gSoak.dropsDuring = 0; gSoak.rejectsDuring = 0;
+  gSoak.cancel = false; gSoak.done = false; gSoak.active = true;
+  busHold("soak", BUS_BUSY, 180000UL);
+  if (xTaskCreatePinnedToCore(taskSoak, "Soak", 4096, NULL, 1, &hTaskSoak, 1) != pdPASS) {
+    hTaskSoak = NULL; gSoak.active = false; busRelease("soak"); return false;
+  }
+  printf("[SOAK] %d module(s) for %d min\n", n, minutes);
+  return true;
+}
+void sfSoakCancel() { if (gSoak.active) gSoak.cancel = true; }
+
 bool sfProbeStart(int id, int rounds) {
-  if (gProbe.active || hTaskProbe) return false;
+  if (gProbe.active || hTaskProbe || gSoak.active) return false;
   if (rounds < 1) rounds = 1;
   if (rounds > 10) rounds = 10;
   static const char kCmds[PROBE_STEPS] = {'v', 'Q', 'd', 'A'};

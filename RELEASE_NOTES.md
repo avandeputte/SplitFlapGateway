@@ -1,5 +1,37 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.15.0 — 2026-10-18
+
+Maintenance that happens by itself, and a soak test for the whole wall.
+
+### Added
+
+- **The bus hold.** Provisioning, calibration, the module self-tests, the probe, a backup sweep
+  and a restore now take a hold on the bus automatically — nothing to remember, no switch to
+  flip. While a hold is in force, display content is paused: MQTT display commands are dropped
+  and the display endpoints answer `503` to any caller that is not the gateway's own dashboard,
+  while the operator keeps working. The banner names what is holding the bus and for how long.
+  A restore takes the stronger form, which refuses everything until it is done.
+
+  Every hold carries a lease and expires on its own, so an abandoned job or a closed browser tab
+  can never leave the wall locked. The manual **Maintenance** switch is the one hold without
+  expiry, and it now shares the mechanism — which closes a gap it always had: it gated MQTT only,
+  so a companion driving the wall over REST painted straight over a calibration in progress.
+  The dashboard tags its own requests (`X-SF-Client: dashboard`); anything without the tag is
+  content. The **Calibration tab holds the bus for as long as it is open.**
+
+  `GET /api/bus` shows the holds; `POST /api/bus/hold {"reason","seconds"}` takes or renews a
+  lease (capped at 300 s) and `POST /api/bus/release` drops it; `GET /api/status` carries
+  `bus.lock`.
+
+- **A whole-wall soak test**, on the Status tab under Bus Health. Pick 5, 10, 20 or 30 minutes
+  and it asks every provisioned module, pass after pass, for replies of four different sizes —
+  version, stats snapshot, EEPROM dump and the combined dump — keeping score per module per
+  size. Nothing moves; display content is paused for the run. It catches the module that only
+  drops out now and then, and its verdict separates a bus that loses long frames from a module
+  that is failing at every size. `POST /api/flap/soak {"minutes"}`, `…/soak/status`,
+  `…/soak/cancel`. The probe, the self-tests and the soak refuse to run over one another.
+
 ## v3.14.0 — 2026-10-17
 
 Bus diagnostics. A module that stops answering used to look the same whether it was silent or

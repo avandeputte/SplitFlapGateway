@@ -117,6 +117,7 @@ DumpCapture gDump;     // EEPROM dump / 'A' combined-reply capture
 CalibState  gCalib;    // calibration capture + async measure job
 DiagState   gDiag;     // Q/T/M self-diagnostics capture + motor-test job
 ProbeState  gProbe;    // bus probe: which reply SIZES does a module manage? (modules.h)
+SoakState   gSoak;     // bus soak test: the probe, wall-wide, for minutes (modules.h)
 volatile bool          sfModulesDirty   = false;  // pending NVS save
 volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
 bool          ntpSynced   = false; // true once NTP sync succeeds (in taskNetwork)
