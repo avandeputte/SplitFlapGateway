@@ -74,8 +74,7 @@ void loadConfig() {
   cfg.stepMs = prefs.getUChar("stepMs", DEFAULT_STEP_MS);
   if (cfg.stepMs > STEP_MS_MAX) cfg.stepMs = STEP_MS_MAX;
   strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
-  setenv("TZ", gPosixTZ, 1);
-  tzset();
+  rtcApplyTZ();
   prefs.end();
 }
 

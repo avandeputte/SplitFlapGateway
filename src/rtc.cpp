@@ -63,18 +63,42 @@ static void rtcWriteUnix(time_t t) {
   rtcI2CWrite(PCF85063_SEC_REG, buf, 7);
 }
 
+// The single writer of the TZ environment variable.
+//
+// It MUST be re-applied after every configTime() call. The Arduino core's
+// configTime() ends with setTimeZone(-gmtOffset, daylight), which does its own
+// setenv("TZ", ...) + tzset() -- so configTime(0, 0, ...) below silently
+// overwrites the configured zone with "UTC0DST0", and every localtime_r() after
+// that returns UTC. That was the "timezone setting not respected" bug: once the
+// first NTP sync had run, the Status page showed UTC whatever zone was selected,
+// and re-picking the zone only fixed it until the next sync (issue #2).
+//
+// Takes timeMutex: setenv/tzset/localtime are not thread-safe in newlib, and
+// rtcFormatTime() calls localtime_r() from the web and RS-485 tasks.
+void rtcApplyTZ() {
+  bool locked = (timeMutex && xSemaphoreTake(timeMutex, pdMS_TO_TICKS(50)) == pdTRUE);
+  setenv("TZ", gPosixTZ[0] ? gPosixTZ : "UTC0", 1);
+  tzset();
+  if (locked) xSemaphoreGive(timeMutex);
+}
+
 // rtcNTPSync: always syncs in UTC. The timezone offset is applied only
 // We never pass a tz offset to configTime -- that avoids mktime/gmtime
 // double-offset bugs entirely.
 bool rtcNTPSync() {
   const char* ntpSrv = cfg.ntpServer[0] ? cfg.ntpServer : DEFAULT_NTP_SERVER;
   DBG("[NTP] Syncing (UTC) via %s...\n", ntpSrv);
+  // NOTE: configTime() also overwrites TZ with UTC (see rtcApplyTZ above). That
+  // is what we want *during* the sync -- getLocalTime() then yields UTC and
+  // mktime() acts as timegm() -- so the zone is restored on the way out, on
+  // every return path.
   configTime(0, 0, ntpSrv);  // always fetch UTC
   struct tm info;
   unsigned long start = millis();
   while (!getLocalTime(&info, 200)) {
     if (millis() - start > NTP_TIMEOUT_MS) {
       DBG("[NTP] Timed out\n");
+      rtcApplyTZ();            // configTime() clobbered TZ -- put the zone back
       return false;
     }
   }
@@ -85,6 +109,7 @@ bool rtcNTPSync() {
   time_t utc = mktime(&info);
   rtcWriteUnix(utc);
   rtcNow.valid = true;
+  rtcApplyTZ();                // configTime() clobbered TZ -- put the zone back
   char tbuf[32];
   strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &info);
   return true;

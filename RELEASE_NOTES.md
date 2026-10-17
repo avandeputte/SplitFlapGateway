@@ -1,5 +1,23 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.13.2 — 2026-10-17
+
+### Fixed
+
+- **The timezone setting was ignored: the Status page always showed UTC**
+  ([#2](https://github.com/avandeputte/SplitFlapGateway/issues/2)). The NTP sync fetches UTC with
+  `configTime(0, 0, server)`, and the ESP32 core's `configTime()` ends by writing the `TZ`
+  environment variable itself — so it overwrote the configured zone with `UTC0DST0`, and every
+  local-time conversion after the first sync returned UTC. Re-picking the zone appeared to work
+  and then reverted, because changing it also forced an NTP re-sync, which clobbered it again.
+  The zone is now re-applied after every sync, through a single `rtcApplyTZ()` that holds the
+  time mutex (`setenv`/`tzset`/`localtime` are not thread-safe in newlib, and the time is
+  formatted from other tasks). Changing the zone no longer forces a re-sync: the clock is stored
+  in UTC, so the zone only affects formatting.
+
+  Affected the Status page clock and the `wt` wall-clock field on bus-monitor and MQTT frames.
+  The Monitor tab was never wrong — it renders the UTC epoch in your browser's timezone.
+
 ## v3.13.1 — 2026-09-25
 
 ### Fixed

@@ -1436,9 +1436,9 @@ static void handleApiConfigSettings() {
   if (doc["posixTZ"].is<const char*>()) {
     strlcpy(cfg.posixTZ, doc["posixTZ"] | "UTC0", sizeof(cfg.posixTZ));
     strlcpy(gPosixTZ, cfg.posixTZ, sizeof(gPosixTZ));
-    setenv("TZ", gPosixTZ, 1);
-    tzset();
-    ntpSynced = false;
+    rtcApplyTZ();
+    // No NTP re-sync here: the RTC holds UTC, so a zone change only affects
+    // formatting. (Re-syncing was also what put the zone back to UTC.)
     DBG("[CFG] Timezone set to %s\n", cfg.posixTZ);
   }
   if (doc["ntpServer"].is<const char*>()) {
