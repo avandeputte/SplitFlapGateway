@@ -162,7 +162,15 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
    ~620 bytes. TX_MAX_BYTES bounds what rs485Send will transmit; the monitor
    ring still stores only the first MSG_MAX_BYTES for display. */
 #define MSG_RING_SIZE        64    // monitor ring: number of frames retained
-#define MSG_MAX_BYTES        256   // monitor ring: bytes stored per frame
+#define MSG_MAX_BYTES        256   // debug/command text buffers, and the MQTT frame payload cap
+/* What the monitor RING stores per frame. Sized to TX_MAX_BYTES so every frame the bus can
+   carry is kept WHOLE: a fully calibrated module's 'A' reply runs 600-750 bytes, and storing
+   256 of it meant the monitor showed a truncated line in exactly the situation you would be
+   using the monitor to investigate. The ring lives in PSRAM (64 x ~812 B = ~52 KB), so this
+   costs no internal RAM. It is deliberately NOT the same constant as MSG_MAX_BYTES above:
+   that one also sizes stack buffers on 6 KB tasks and the MQTT queue slot, neither of which
+   can take a 768-byte frame (let alone its 3x UTF-8 expansion). -- v3.14 */
+#define RING_FRAME_BYTES     TX_MAX_BYTES
 #define TX_MAX_BYTES         768   // max bytes rs485Send will transmit in one frame
 #define MQTT_BUF_SIZE        1024  // MQTT packet buffer + queue slot: holds a full
                                    // restore command AND the worst-case rx/tx monitor

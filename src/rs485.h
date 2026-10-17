@@ -13,8 +13,8 @@ struct RS485Msg {
   char          dir;            // 'T' transmitted to bus, 'R' received from a module, 'C' inbound REST/MQTT command marker
   char          origin;         // 'C' rows only: 'R' REST or 'M' MQTT (0 for TX/RX)
   bool          sanitized;      // TX only: true if the gateway trimmed trailing junk past a complete command
-  uint8_t       data[MSG_MAX_BYTES];
-  size_t        len;            // bytes STORED here (capped at MSG_MAX_BYTES)
+  uint8_t       data[RING_FRAME_BYTES];
+  size_t        len;            // bytes STORED here (capped at RING_FRAME_BYTES)
   size_t        fullLen;        // bytes actually on the wire; > len means the row is truncated
   char          wallTime[24];   // gateway-TZ string (MQTT / serial debug)
   unsigned long epoch;          // UTC epoch at capture (0 if RTC not valid);
@@ -51,7 +51,10 @@ void psramAllocInit();
 void* psramAlloc(const char* name, size_t bytes);
 void ringPush(const RS485Msg& m);
 void ringPushCommand(char origin, const char* desc);  // log an inbound REST/MQTT command ('C' row)
-String ringDrain();
+// Stream the frames captured since the last call as a JSON array. The rows are emitted in
+// bounded chunks through `emit` rather than returned as one String: a full ring of
+// whole-frame rows is ~150 KB once escaped, which has no business on the internal heap.
+void ringDrain(void (*emit)(const char* chunk));
 void rs485Begin();
 void rs485Send(const uint8_t* data, size_t len, bool raw = false);
 void rs485SendStr(const char* s);

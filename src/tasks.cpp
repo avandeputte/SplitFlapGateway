@@ -94,7 +94,7 @@ void taskRS485(void* pv) {
         m.sanitized = false;   // RX frames are never sanitized
         // The monitor ring entry is fixed-size; store at most MSG_MAX_BYTES.
         // The full frame is still parsed below -- this copy is display-only.
-        size_t ringLen = (lineLen > MSG_MAX_BYTES) ? MSG_MAX_BYTES : lineLen;
+        size_t ringLen = (lineLen > RING_FRAME_BYTES) ? RING_FRAME_BYTES : lineLen;
         m.len       = ringLen;
         m.fullLen   = lineLen;            // the monitor shows when a row is truncated
         rxLastLen = lineLen;

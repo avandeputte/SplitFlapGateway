@@ -35,11 +35,16 @@ void mqttPublishMsg(const RS485Msg& m) {
   if (!mqtt.connected()) return;
   // Build the JSON with snprintf + a direct transcode -- no JsonDocument heap
   // allocation in this hot path. One worst-case buffer holds the whole message
-  // so it is NEVER truncated: the fixed prefix is <=59 bytes, the command body
-  // is at most MSG_MAX_BYTES*3 (every flap byte -> a 3-byte UTF-8 glyph), and
+  // so it is never truncated below MSG_MAX_BYTES: the fixed prefix is <=59 bytes, the
+  // command body is at most MSG_MAX_BYTES*3 (every flap byte -> a 3-byte UTF-8 glyph), and
   // the "} suffix is 2 -- all inside MSG_MAX_BYTES*3 + 80. A single buffer (vs a
   // separate transcode scratch) keeps stack use modest: mqttPublishMsg runs on
   // taskRS485 and taskNetwork, both of which have only a 6KB stack.
+  //
+  // NOTE this stays at MSG_MAX_BYTES and NOT the ring's whole-frame size (v3.14). The
+  // monitor ring keeps a frame whole, in PSRAM; this buffer is on a 6 KB task stack and the
+  // queue slot it feeds is MQTT_BUF_SIZE, so a frame longer than MSG_MAX_BYTES is published
+  // truncated rather than blowing either. The web monitor is the place to read a long frame.
   char buf[MSG_MAX_BYTES * 3 + 80];
   int pre = snprintf(buf, sizeof(buf),
     "{\"ts\":%lu,\"wt\":\"%s\",\"command\":\"", m.timestamp, m.wallTime);
@@ -48,7 +53,8 @@ void mqttPublishMsg(const RS485Msg& m) {
   // line breaks, maps unprintable bytes to a space, and shows high Windows-1252
   // bytes as their real glyph (shared with the web monitor). Reserve 3 bytes for
   // the closing "} and NUL.
-  size_t body = flapToJsonUtf8((const char*)m.data, m.len,
+  size_t mqLen = (m.len > MSG_MAX_BYTES) ? MSG_MAX_BYTES : m.len;
+  size_t body = flapToJsonUtf8((const char*)m.data, mqLen,
                                buf + pre, sizeof(buf) - (size_t)pre - 3, ' ');
   size_t n = (size_t)pre + body;
   buf[n++] = '"';

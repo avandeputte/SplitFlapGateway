@@ -106,7 +106,7 @@ void ringPushCommand(char origin, const char* desc) {
   m.origin    = origin;
   m.sanitized = false;
   size_t n = desc ? strlen(desc) : 0;
-  if (n > MSG_MAX_BYTES) n = MSG_MAX_BYTES;
+  if (n > RING_FRAME_BYTES) n = RING_FRAME_BYTES;
   if (n) memcpy(m.data, desc, n);
   m.len     = n;
   m.fullLen = n;
@@ -115,48 +115,53 @@ void ringPushCommand(char origin, const char* desc) {
   ringPush(m);
 }
 
-String ringDrain() {
-  if (!msgMutex || !msgRing) return "[]";
+void ringDrain(void (*emit)(const char* chunk)) {
+  if (!msgMutex || !msgRing) { emit("[]"); return; }
   xSemaphoreTake(msgMutex, portMAX_DELAY);
   int head = msgHead;
   xSemaphoreGive(msgMutex);
 
-  String out;
-  // Reserve for the actual pending count (~330 bytes/message worst case:
-  // 256 escaped chars + JSON overhead). A fixed 512 caused repeated reallocs
-  // after a burst filled the ring (up to 64 messages = ~21KB).
-  int pending = (head - msgPollCursor + MSG_RING_SIZE) % MSG_RING_SIZE;
-  out.reserve((size_t)pending * 330 + 16);
-  out = "[";
+  // One static scratch for the escaped frame, one for the outgoing chunk. Static, not stack:
+  // a whole 768-byte frame expands to ~2.3 KB as UTF-8, and taskWeb (the only caller) has
+  // ~3.5 KB of headroom. Single caller, no reentrancy.
+  static char utf8[RING_FRAME_BYTES * 3 + 1];
+  static char chunk[1400];        // ~ one TCP segment, like the module-list streamer
+  size_t cl = 0;
+  #define RING_FLUSH() do { if (cl) { chunk[cl] = 0; emit(chunk); cl = 0; } } while (0)
+  #define RING_PUT(str) do { const char* _s = (str); size_t _n = strlen(_s); \
+      if (cl + _n >= sizeof(chunk)) RING_FLUSH(); \
+      if (_n >= sizeof(chunk)) { emit(_s); } \
+      else { memcpy(chunk + cl, _s, _n); cl += _n; } } while (0)
+
+  RING_PUT("[");
   bool first = true;
   int i = msgPollCursor;
+  char num[24];
   while (i != head) {
     const RS485Msg& m = msgRing[i];
-    if (!first) out += ',';
+    if (!first) RING_PUT(",");
     first = false;
-    // Stack buffer -- no heap allocation per message. Render as JSON-safe UTF-8
-    // via the shared helper: escapes "/\, strips newlines, maps unprintable
-    // bytes to a space, and shows high Windows-1252 flap bytes (accent/euro/
-    // symbol) as their REAL glyph rather than a placeholder. The byte on the bus
-    // is unchanged; this only affects how it reads back to the browser. Sized
-    // for up to 3 UTF-8 bytes per flap byte.
-    char utf8[MSG_MAX_BYTES * 3 + 1];
+    // JSON-safe UTF-8: escapes "/\, strips newlines, maps unprintable bytes to a space, and
+    // renders high Windows-1252 flap bytes as their real glyph. The bus bytes are unchanged.
     flapToJsonUtf8((const char*)m.data, m.len, utf8, sizeof(utf8), ' ');
-    out += "{\"ts\":";      out += m.timestamp;
-    out += ",\"ep\":";      out += m.epoch;
-    out += ",\"wt\":\"";    out += m.wallTime;  out += '"';
-    out += ",\"dir\":\"";   out += m.dir;       out += '"';
-    if (m.dir == 'C') { out += ",\"src\":\""; out += m.origin; out += '"'; }  // REST/MQTT command marker
-    out += ",\"command\":\""; out += utf8;        out += '"';
-    out += ",\"len\":";     out += (unsigned long)(m.fullLen ? m.fullLen : m.len);
-    if (m.fullLen > m.len) out += ",\"trunc\":1";   // monitor marks the row as cut short
-    if (m.sanitized) out += ",\"san\":1";
-    out += '}';
+    RING_PUT("{\"ts\":");     snprintf(num, sizeof(num), "%lu", m.timestamp);      RING_PUT(num);
+    RING_PUT(",\"ep\":");     snprintf(num, sizeof(num), "%lu", m.epoch);          RING_PUT(num);
+    RING_PUT(",\"wt\":\"");    RING_PUT(m.wallTime);                                 RING_PUT("\"");
+    RING_PUT(",\"dir\":\"");   { char d[2] = { m.dir, 0 }; RING_PUT(d); }            RING_PUT("\"");
+    if (m.dir == 'C') { RING_PUT(",\"src\":\""); { char o[2] = { m.origin, 0 }; RING_PUT(o); } RING_PUT("\""); }
+    RING_PUT(",\"command\":\"");RING_PUT(utf8);                                      RING_PUT("\"");
+    RING_PUT(",\"len\":");    snprintf(num, sizeof(num), "%lu",
+                                (unsigned long)(m.fullLen ? m.fullLen : m.len));    RING_PUT(num);
+    if (m.fullLen > m.len) RING_PUT(",\"trunc\":1");   // only if a frame ever exceeds the ring entry
+    if (m.sanitized)       RING_PUT(",\"san\":1");
+    RING_PUT("}");
     i = (i + 1) % MSG_RING_SIZE;
   }
-  out += ']';
+  RING_PUT("]");
+  RING_FLUSH();
+  #undef RING_PUT
+  #undef RING_FLUSH
   msgPollCursor = head;
-  return out;
 }
 static uint32_t buildSerialConfig() {
   struct Entry { uint8_t d, p, s; uint32_t c; };
@@ -519,9 +524,9 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
   // Reconstruct the on-wire frame for the monitor ring (bare command plus the
   // terminator we actually sent), bounded to MSG_MAX_BYTES. This keeps TX ring
   // entries consistent with RX entries, which carry their own '\n'.
-  size_t ringLen = (bare > MSG_MAX_BYTES) ? MSG_MAX_BYTES : bare;
+  size_t ringLen = (bare > RING_FRAME_BYTES) ? RING_FRAME_BYTES : bare;
   memcpy(m.data, data, ringLen);
-  if (appendNL && ringLen < MSG_MAX_BYTES) m.data[ringLen++] = '\n';
+  if (appendNL && ringLen < RING_FRAME_BYTES) m.data[ringLen++] = '\n';
   m.len     = ringLen;
   m.fullLen = bare + (appendNL ? 1 : 0);   // true on-wire length, even when the row is capped
   rtcFormatTime(m.wallTime, sizeof(m.wallTime));

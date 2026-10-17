@@ -207,7 +207,13 @@ static void handleRoot() {
 // GET /api/rs485/messages
 static void handleApiMessages() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", ringDrain());
+  server.client().setConnectionTimeout(1500);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  // Streamed, not one String: the ring now keeps whole frames (768 B), and a full ring of
+  // those escapes to ~150 KB. Each chunk also feeds the web watchdog, as the module list does.
+  ringDrain([](const char* c) { server.sendContent(c); wdgWebMs = millis(); });
+  server.sendContent("");
 }
 
 // POST /api/rs485/send
