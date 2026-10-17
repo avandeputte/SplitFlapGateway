@@ -2127,9 +2127,9 @@ static void handleApiQuietSchedule() {
    registration so its nav can link exactly the tabs this firmware has, instead of
    a list hard-coded over there that goes stale whenever this one changes. Keep in
    step with the <nav> in web_ui.h and the M map beside it. -- v3.4 */
-static const char* const GW_TAB_ID[]  = {"modules", "display", "provision", "calibration",
+static const char* const GW_TAB_ID[]  = {"modules", "display", "calibration",
                                          "monitor", "settings", "status"};
-static const char* const GW_TAB_LBL[] = {"Modules", "Display", "Provision", "Calibration",
+static const char* const GW_TAB_LBL[] = {"Modules", "Display", "Calibration",
                                          "Monitor", "Settings", "Status"};
 static const size_t GW_TAB_N = sizeof(GW_TAB_ID) / sizeof(GW_TAB_ID[0]);
 
