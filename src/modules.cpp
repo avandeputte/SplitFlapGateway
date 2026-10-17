@@ -555,6 +555,90 @@ static void sfRestoreBySN(const char* payload) {
 
 bool sfIsValidSN(const char* sn) { return sfValidSN(sn); }
 
+/* ---- Bus probe (v3.14) -------------------------------------------------------------
+   Walks a module through four replies of increasing size and records which come back and
+   how big they were. See the contract on ProbeState in modules.h.
+
+   Its own task, like the restore: the steps add up to several seconds of waiting, and
+   taskWeb must never block that long (the HTTP server serves one connection at a time).
+   The browser polls GET /api/flap/probe/status. */
+static TaskHandle_t hTaskProbe = NULL;
+
+static void taskProbe(void* pv) {
+  const int id = gProbe.id;
+  char fw[8] = ""; char sn[21] = "";
+  { if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+    SFModule* m = sfFindById((uint8_t)id);
+    if (m) { strlcpy(fw, m->fwVersion, sizeof(fw)); strlcpy(sn, m->serialNum, sizeof(sn)); }
+    if (sfMutex) xSemaphoreGive(sfMutex); }
+  const char* v = (fw[0] == 'v' || fw[0] == 'V') ? fw + 1 : fw;
+  const int fwNum = atoi(v);
+
+  for (int r = 0; r < gProbe.rounds; r++) {
+    for (int k = 0; k < PROBE_STEPS; k++) {
+      char cmd = gProbe.s[k].cmd;
+      // Skip what this firmware cannot answer, rather than recording a false failure.
+      if (cmd == 'Q' && fwNum && fwNum < 26) { gProbe.step = r * PROBE_STEPS + k + 1; continue; }
+      if (cmd == 'A' && fwNum && fwNum < 25) { gProbe.step = r * PROBE_STEPS + k + 1; continue; }
+      rxLastLen = 0;
+      bool ok = false;
+      char frame[48];
+      if (cmd == 'v') {
+        ok = sfSendVersionAndWait(id, 700, NULL, 0, NULL, 0, NULL);
+      } else if (cmd == 'Q') {
+        ok = sfSendAndCaptureQ(id, 900);
+      } else {
+        static char out[TX_MAX_BYTES];
+        if (cmd == 'A' && sn[0]) snprintf(frame, sizeof(frame), "mXA%s\n", sn);
+        else if (cmd == 'A')     snprintf(frame, sizeof(frame), "m%dA\n", id);
+        else if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
+        else                     snprintf(frame, sizeof(frame), "m%dd\n", id);
+        ok = sfSendAndCaptureDump(id, frame, 1400, out, sizeof(out));
+      }
+      gProbe.s[k].tries = gProbe.s[k].tries + 1;
+      if (ok) {
+        gProbe.s[k].ok = gProbe.s[k].ok + 1;
+        int len = (int)rxLastLen;
+        if (len > gProbe.s[k].bytes) gProbe.s[k].bytes = len;
+      }
+      gProbe.step = r * PROBE_STEPS + k + 1;
+      vTaskDelay(pdMS_TO_TICKS(120));                 // let the bus settle between asks
+    }
+  }
+  gProbe.dropsDuring = rxDropped - gProbe.dropsBefore;
+  gProbe.elapsedMs   = millis() - gProbe.startedMs;
+  gProbe.active      = false;
+  gProbe.done        = true;
+  printf("[PROBE] module %d: v %d/%d, Q %d/%d, d %d/%d (%dB), A %d/%d (%dB), %lu dropped frames\n",
+         id, gProbe.s[0].ok, gProbe.s[0].tries, gProbe.s[1].ok, gProbe.s[1].tries,
+         gProbe.s[2].ok, gProbe.s[2].tries, gProbe.s[2].bytes,
+         gProbe.s[3].ok, gProbe.s[3].tries, gProbe.s[3].bytes,
+         (unsigned long)gProbe.dropsDuring);
+  hTaskProbe = NULL;
+  vTaskDelete(NULL);
+}
+
+bool sfProbeStart(int id, int rounds) {
+  if (gProbe.active || hTaskProbe) return false;
+  if (rounds < 1) rounds = 1;
+  if (rounds > 10) rounds = 10;
+  static const char kCmds[PROBE_STEPS] = {'v', 'Q', 'd', 'A'};
+  for (int i = 0; i < PROBE_STEPS; i++) {
+    gProbe.s[i].cmd = kCmds[i];
+    gProbe.s[i].tries = 0; gProbe.s[i].ok = 0; gProbe.s[i].bytes = 0;
+  }
+  gProbe.id = id; gProbe.rounds = rounds; gProbe.step = 0;
+  gProbe.startedMs = millis(); gProbe.elapsedMs = 0;
+  gProbe.dropsBefore = rxDropped; gProbe.dropsDuring = 0;
+  gProbe.done = false; gProbe.active = true;
+  if (xTaskCreatePinnedToCore(taskProbe, "Probe", 4096, NULL, 1, &hTaskProbe, 1) != pdPASS) {
+    hTaskProbe = NULL; gProbe.active = false;
+    return false;
+  }
+  printf("[PROBE] module %d: %d round(s) of v/Q/d/A\n", id, rounds);
+  return true;
+}
+
 bool sfLookupBySN(const char* sn, uint8_t* idOut, char* fwOut, size_t fwLen) {
   bool found = false;
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);

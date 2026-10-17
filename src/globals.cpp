@@ -116,6 +116,7 @@ int      sfModuleCount = 0;
 DumpCapture gDump;     // EEPROM dump / 'A' combined-reply capture
 CalibState  gCalib;    // calibration capture + async measure job
 DiagState   gDiag;     // Q/T/M self-diagnostics capture + motor-test job
+ProbeState  gProbe;    // bus probe: which reply SIZES does a module manage? (modules.h)
 volatile bool          sfModulesDirty   = false;  // pending NVS save
 volatile unsigned long sfModulesDirtyMs = 0;      // millis() when first dirtied
 bool          ntpSynced   = false; // true once NTP sync succeeds (in taskNetwork)
@@ -141,6 +142,11 @@ HardwareSerial         rs485(1);
 volatile unsigned long rxCount = 0;
 volatile unsigned long txCount = 0;
 volatile unsigned long sfParseRejects = 0;  // corrupt/garbled frames rejected at parse
+// Bus health counters (v3.14) -- see the note in rs485.h.
+volatile unsigned long rxDropped    = 0;
+volatile unsigned long rxDropBytes  = 0;
+volatile unsigned long rxMaxLen     = 0;
+volatile unsigned long rxLastLen    = 0;
 bool sfFsReady = false;   // set true once FFat is mounted
 WiFiClient   wifiClient;
 WiFiClient   mqttWifiClient;        // persistent client for PubSubClient

@@ -1,5 +1,40 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.14.0 — 2026-10-17
+
+Bus diagnostics. A module that stops answering used to look the same whether it was silent or
+whether it answered and the gateway threw the reply away. These changes tell those apart.
+
+### Added
+
+- **A bus reply-size probe**, on the 🩺 diagnostics dialog. It asks one module for four replies
+  of increasing size — version (~32 B), stats snapshot (~19 B), EEPROM dump, and the combined
+  dump, which is the longest reply a module ever sends — repeats each a few times, and reports
+  which came back and how big they were. The verdict is in plain language: everything answered;
+  or short replies get through and long ones do not, which points at the bus rather than the
+  module; or nothing answered, which is power, wiring or the wrong ID. `POST /api/flap/probe`
+  and `GET /api/flap/probe/status`. It refuses to run while a motor self-test or a calibration
+  owns the bus, since a probe alongside one reports a healthy module as silent.
+- **Bus Health on the Status tab** — frames discarded, parse rejects, and the longest complete
+  reply received since boot, also on `GET /api/status` as `bus`. Discards and rejects should sit
+  at zero; if they climb, suspect the wiring before the modules.
+
+### Changed
+
+- **A discarded frame is now counted and logged.** A reply that overruns the receive buffer, or
+  never reaches its newline, used to be dropped in silence — indistinguishable from a module
+  that said nothing, which is exactly the case that is hard to debug. It now increments a
+  counter, records its size, and prints `[RX] discarded N bytes with no terminator`.
+- **`GET /api/flap/all` falls back to the shorter `v`+`d` when the combined `A` read times out.**
+  It used to return stale on the assumption that a timeout means the module is offline, which is
+  wrong whenever the failure depends on reply *length*: `A` grows with the calibrated flap map
+  (600–750 bytes on a fully calibrated module, against a 768-byte ceiling) and a bus that cannot
+  carry it will often still carry `d`. This is the difference between a backup that silently
+  skips modules and one that gets them. The response reports `mode` as `A>vd` when it happened.
+- **The bus monitor reports a frame's true length** and marks a row that was stored truncated.
+  The ring holds 256 bytes per frame, so a 447-byte reply was displayed cut short with nothing
+  saying so — misleading in exactly the situation you would be using the monitor to investigate.
+
 ## v3.13.2 — 2026-10-17
 
 ### Fixed

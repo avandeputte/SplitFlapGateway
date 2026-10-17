@@ -73,7 +73,13 @@ void taskRS485(void* pv) {
       if (lineLen < TX_MAX_BYTES - 1) {
         lineBuf[lineLen++] = c;
       } else {
-        // Buffer full without a newline -- corrupt/oversized frame, discard.
+        // Buffer full without a newline -- corrupt/oversized frame. COUNT it and say so:
+        // dropping this silently is what makes "the module never answered" and "the module
+        // answered at length and we threw it away" look identical from the outside.
+        rxDropped++;
+        rxDropBytes = lineLen;
+        printf("[RX] discarded %u bytes with no terminator (frame too long or corrupt)\n",
+               (unsigned)lineLen);
         lineLen = 0;
         continue;
       }
@@ -90,6 +96,9 @@ void taskRS485(void* pv) {
         // The full frame is still parsed below -- this copy is display-only.
         size_t ringLen = (lineLen > MSG_MAX_BYTES) ? MSG_MAX_BYTES : lineLen;
         m.len       = ringLen;
+        m.fullLen   = lineLen;            // the monitor shows when a row is truncated
+        rxLastLen = lineLen;
+        if (lineLen > rxMaxLen) rxMaxLen = lineLen;
         memcpy(m.data, lineBuf, ringLen);
         rtcFormatTime(m.wallTime, sizeof(m.wallTime));
         m.epoch     = rtcEpochNow();  // UTC epoch for browser-local display

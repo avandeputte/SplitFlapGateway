@@ -151,7 +151,42 @@ struct DiagState {                   // self-diagnostics (module fw v26+/v28+)
   volatile unsigned long jobDeadline = 0;
 };
 
+/* Bus probe (v3.14) -- "does this module answer SHORT replies but not LONG ones?"
+ *
+ * The question a silent module cannot answer for you. Each step asks for a reply of a
+ * different size -- 'v' (~30 B), 'Q' (~40 B), 'd' (offset/steps/map) and 'A' (everything,
+ * and the only reply that carries the flap set, so the longest a module ever sends). Each is
+ * repeated a few times and the reply SIZE is recorded.
+ *
+ * Reading the result:
+ *   all four clean                  the module and the bus are fine
+ *   short pass, 'd'/'A' fail        reply-length dependent -- a long frame is being corrupted
+ *                                   or overrun, not a dead module. Check bus termination, and
+ *                                   the [RX] discarded counter on the Status tab.
+ *   nothing answers                 the module really is silent: power, wiring, or wrong ID
+ */
+#define PROBE_STEPS 4
+struct ProbeStep {
+  char cmd;                  // 'v' 'Q' 'd' 'A'
+  volatile int tries;
+  volatile int ok;
+  volatile int bytes;        // longest reply seen for this step (0 = never answered)
+};
+struct ProbeState {
+  volatile bool          active   = false;
+  volatile bool          done     = false;   // a finished run is waiting to be read
+  volatile int           id       = -1;
+  volatile int           rounds   = 0;
+  volatile int           step     = 0;       // steps completed, for progress
+  volatile unsigned long startedMs = 0;
+  volatile unsigned long elapsedMs = 0;
+  volatile unsigned long dropsBefore = 0;    // rxDropped when the run started
+  volatile unsigned long dropsDuring = 0;
+  ProbeStep              s[PROBE_STEPS];
+};
+
 // ---- owned globals (defined in globals.cpp) ----
+extern ProbeState gProbe;
 extern SFModule* sfModules;
 extern SemaphoreHandle_t sfMutex;
 extern StaticSemaphore_t sfMutexBuf;
@@ -224,5 +259,7 @@ void sfHomeBySN(const char* sn);
 void sfSendText(int startAddr, const char* text, bool blankUnused);
 void sfSetQuietTime(bool on);
 void sfParseResponse(const uint8_t* data, size_t len);
+// Start a bus probe on `id`. False if one is already running or the task will not start.
+bool sfProbeStart(int id, int rounds);
 
 #endif // SFGW_MODULES_H

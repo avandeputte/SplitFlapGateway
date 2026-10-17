@@ -108,7 +108,8 @@ void ringPushCommand(char origin, const char* desc) {
   size_t n = desc ? strlen(desc) : 0;
   if (n > MSG_MAX_BYTES) n = MSG_MAX_BYTES;
   if (n) memcpy(m.data, desc, n);
-  m.len = n;
+  m.len     = n;
+  m.fullLen = n;
   rtcFormatTime(m.wallTime, sizeof(m.wallTime));
   m.epoch = rtcEpochNow();
   ringPush(m);
@@ -147,7 +148,8 @@ String ringDrain() {
     out += ",\"dir\":\"";   out += m.dir;       out += '"';
     if (m.dir == 'C') { out += ",\"src\":\""; out += m.origin; out += '"'; }  // REST/MQTT command marker
     out += ",\"command\":\""; out += utf8;        out += '"';
-    out += ",\"len\":";     out += m.len;
+    out += ",\"len\":";     out += (unsigned long)(m.fullLen ? m.fullLen : m.len);
+    if (m.fullLen > m.len) out += ",\"trunc\":1";   // monitor marks the row as cut short
     if (m.sanitized) out += ",\"san\":1";
     out += '}';
     i = (i + 1) % MSG_RING_SIZE;
@@ -520,7 +522,8 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
   size_t ringLen = (bare > MSG_MAX_BYTES) ? MSG_MAX_BYTES : bare;
   memcpy(m.data, data, ringLen);
   if (appendNL && ringLen < MSG_MAX_BYTES) m.data[ringLen++] = '\n';
-  m.len = ringLen;
+  m.len     = ringLen;
+  m.fullLen = bare + (appendNL ? 1 : 0);   // true on-wire length, even when the row is capped
   rtcFormatTime(m.wallTime, sizeof(m.wallTime));
   m.epoch = rtcEpochNow();   // UTC epoch; web UI renders in browser-local time
   ringPush(m);

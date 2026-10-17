@@ -14,7 +14,8 @@ struct RS485Msg {
   char          origin;         // 'C' rows only: 'R' REST or 'M' MQTT (0 for TX/RX)
   bool          sanitized;      // TX only: true if the gateway trimmed trailing junk past a complete command
   uint8_t       data[MSG_MAX_BYTES];
-  size_t        len;
+  size_t        len;            // bytes STORED here (capped at MSG_MAX_BYTES)
+  size_t        fullLen;        // bytes actually on the wire; > len means the row is truncated
   char          wallTime[24];   // gateway-TZ string (MQTT / serial debug)
   unsigned long epoch;          // UTC epoch at capture (0 if RTC not valid);
                                 // the web UI renders this in the BROWSER's
@@ -33,6 +34,15 @@ extern HardwareSerial rs485;
 extern volatile unsigned long rxCount;
 extern volatile unsigned long txCount;
 extern volatile unsigned long sfParseRejects;
+// Bus health (v3.14). A reply that overruns the receive accumulator, or never reaches its
+// newline, used to be dropped in silence -- indistinguishable from a module that said nothing,
+// which is exactly the case that is hard to debug. Count it, and remember how big the largest
+// frame we have actually seen is, so "the module is quiet" and "the module answered with 612
+// bytes and we binned it" stop looking the same.
+extern volatile unsigned long rxDropped;   // frames discarded: too long, or no terminator
+extern volatile unsigned long rxDropBytes; // bytes in the most recent such frame
+extern volatile unsigned long rxMaxLen;    // longest COMPLETE frame received since boot
+extern volatile unsigned long rxLastLen;   // length of the most recent complete frame
 
 void psramAllocInit();
 // A large buffer in PSRAM (internal RAM as a fallback), zeroed. Internal RAM is what the

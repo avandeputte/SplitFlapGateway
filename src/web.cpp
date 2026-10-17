@@ -31,6 +31,8 @@ static void handleApiErase();
 static void handleApiFactoryReset();
 static void handleApiFactoryResetBySN();
 static void handleApiFlapConfig();
+static void handleApiProbe();
+static void handleApiProbeStatus();
 static void handleApiGoto();
 static void handleApiHome();
 static void handleApiHomeBySN();
@@ -569,6 +571,7 @@ static void handleApiDiag() {
   if (id < 0 || id > 254) { sendJsonError(400, "valid id required"); return; }
   DBG("[API] diagnostics module %d (Q + Hall)\n", id);
 
+  if (gProbe.active) { sendJsonError(409, "a bus probe is running -- wait for it to finish"); return; }
   // Reject if a motor test is already running for a different module.
   if (gDiag.jobActive && gDiag.jobId != id) {
     char busy[96];
@@ -1246,14 +1249,15 @@ static void handleApiStatus() {
   long compAge = gCompanionSeenMs ? (long)((millis() - gCompanionSeenMs) / 1000UL) : -1;
   char rst[112];                       // v3.12: {"state","done","total","startsIn"}
   restoreStatusJson(rst, sizeof(rst), false);
-  char out[900];
+  char out[1024];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
     "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
-    "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s}",
+    "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s,"
+    "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu}}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -1266,7 +1270,8 @@ static void handleApiStatus() {
     ntpSynced?"true":"false",
     gMaintenanceMode?"true":"false",
     gQuietTime?"true":"false",
-    gCompanionStatus, compAge, rst);
+    gCompanionStatus, compAge, rst,
+    sfParseRejects, rxDropped, rxDropBytes, rxMaxLen);
   server.send(200, "application/json", out);
 }
 
@@ -1900,15 +1905,27 @@ static void handleApiAll() {
   const char* mode = "A";
 
   if (fwVerNum >= 25) {
-    // Known v25+: one combined 'A' transaction. If it times out the module is
-    // offline -- a v+d fallback would almost certainly also time out, just ~2s
-    // slower -- so we return stale rather than fall back. The next version read
-    // (Identify, stale-probe, explicit query) self-corrects the cache if the
-    // module was in fact downgraded or swapped for an older one.
+    // Known v25+: one combined 'A' transaction.
     char f[64];
     if (sn[0]) { DBG("[API] all via mXA %s\n", sn); snprintf(f, sizeof(f), "mXA%s\n", sn); }
     else       { DBG("[API] all via m%dA\n", id);   snprintf(f, sizeof(f), "m%dA\n", id); }
     gotReply = sfSendAndCaptureDump(id, f, 1300, rawDump, sizeof(rawDump));  // 'A' ~570ms + assembly
+    // v3.14: fall back to v+d when 'A' does not come back. This used to return stale on the
+    // assumption that a timeout means the module is offline -- which is wrong whenever the
+    // failure depends on reply LENGTH. 'A' is the longest reply a module ever sends (it grows
+    // with the calibrated flap map, ~600-750 bytes on a fully calibrated module), and a bus
+    // that corrupts or overruns it will often still carry the shorter 'd'. That is the
+    // difference between a backup that skips a module and one that gets it.
+    if (!gotReply) {
+      printf("[API] module %d: 'A' did not answer -- retrying with the shorter v+d\n", id);
+      mode = "A>vd";
+      sfSendVersionAndWait(id, 700, fwVer, sizeof(fwVer), sn, sizeof(sn), NULL);
+      char f2[40];
+      if (sn[0]) snprintf(f2, sizeof(f2), "mXD%s\n", sn);
+      else       snprintf(f2, sizeof(f2), "m%dd\n", id);
+      gotReply = sfSendAndCaptureDump(id, f2, 1300, rawDump, sizeof(rawDump));
+      if (gotReply) printf("[API] module %d: v+d succeeded where 'A' did not\n", id);
+    }
   } else {
     // Unknown or older firmware: version query, then dump (two transactions).
     // Wait for the version reply to clear the bus before the dump goes out.
@@ -1959,6 +1976,59 @@ static void handleApiAll() {
            "\"flapCount\":%d,\"flapChars\":\"%s\",\"stale\":%s,\"mode\":\"%s\"}",
            id, fwVer, sn, escDump, aAutoHome, aCurIndex, aReportedId,
            aFlapCount, aFlapChars, gotReply ? "false" : "true", mode);
+  server.send(200, "application/json", out);
+}
+
+/* POST /api/flap/probe  {"id":5,"rounds":3}  -- see ProbeState in modules.h.
+   Returns at once; the run happens on its own task and the browser polls
+   GET /api/flap/probe/status. */
+static void handleApiProbe() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendJsonError(400, "Bad JSON"); return;
+  }
+  int id = doc["id"] | -99;
+  if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
+  int rounds = doc["rounds"] | 3;
+  // A motor test (or a calibration measure) owns the bus for tens of seconds. A probe run
+  // alongside one gets no replies and would report a healthy module as "nothing answered" --
+  // which is worse than no diagnostic at all.
+  if (gDiag.jobActive || gCalib.jobActive) {
+    sendJsonError(409, "a self-test is still running on the bus -- wait for it to finish");
+    return;
+  }
+  if (gProbe.active) {
+    char busy[80];
+    snprintf(busy, sizeof(busy), "{\"ok\":false,\"error\":\"probe already running for module %d\"}", (int)gProbe.id);
+    server.send(409, "application/json", busy);
+    return;
+  }
+  if (!sfProbeStart(id, rounds)) { sendJsonError(500, "could not start probe"); return; }
+  char out[64];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d}", id);
+  server.send(200, "application/json", out);
+}
+
+// GET /api/flap/probe/status -- progress while running, then the result.
+static void handleApiProbeStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  static char out[480];
+  int n = snprintf(out, sizeof(out),
+    "{\"ok\":true,\"state\":\"%s\",\"id\":%d,\"step\":%d,\"total\":%d,"
+    "\"elapsed\":%lu,\"drops\":%lu,\"steps\":[",
+    gProbe.active ? "running" : (gProbe.done ? "done" : "idle"),
+    (int)gProbe.id, (int)gProbe.step, (int)gProbe.rounds * PROBE_STEPS,
+    (unsigned long)(gProbe.active ? millis() - gProbe.startedMs : gProbe.elapsedMs),
+    (unsigned long)gProbe.dropsDuring);
+  for (int i = 0; i < PROBE_STEPS && n > 0 && n < (int)sizeof(out); i++) {
+    n += snprintf(out + n, sizeof(out) - n,
+      "%s{\"cmd\":\"%c\",\"tries\":%d,\"ok\":%d,\"bytes\":%d}",
+      i ? "," : "", gProbe.s[i].cmd, (int)gProbe.s[i].tries,
+      (int)gProbe.s[i].ok, (int)gProbe.s[i].bytes);
+  }
+  snprintf(out + n, sizeof(out) - n, "]}");
   server.send(200, "application/json", out);
 }
 
@@ -2521,6 +2591,9 @@ void webInit() {
   server.on("/api/flap/diag/mech",   HTTP_POST,    BUSGATED(handleApiDiagMech));
   server.on("/api/flap/diag/mech",   HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/diag/status", HTTP_GET,     handleApiDiagStatus);
+  server.on("/api/flap/probe",       HTTP_POST,    BUSGATED(handleApiProbe));
+  server.on("/api/flap/probe",       HTTP_OPTIONS, handleOptions);
+  server.on("/api/flap/probe/status",HTTP_GET,     handleApiProbeStatus);
   server.on("/api/flap/version",     HTTP_POST,    BUSGATED(handleApiVersion));
   server.on("/api/flap/version",     HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/provision",   HTTP_POST,    BUSGATED(handleApiProvision));
