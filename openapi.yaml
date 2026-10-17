@@ -1698,12 +1698,17 @@ paths:
       tags: [Status]
       summary: Whole-wall soak test (v3.15)
       description: |
-        Asks every provisioned module, pass after pass, for replies of four different sizes
-        (`v`, `Q`, `d`, `A`, one size per pass) for `minutes`, keeping a tally per module per
-        size and counting discarded and corrupt frames over the run. Nothing it sends moves a
+        Works the bus seven ways for `minutes`, one kind per pass, keeping a tally per module
+        per kind: a **broadcast roll call** (`m*v<lo>-<hi>`, scoring a reply that is missing,
+        damaged, or arrives twice for one id), the four single-module replies of increasing
+        size (`v`, `Q`, `d`, `A`), a **broadcast combined dump** (`m*A<lo>-<hi>`, the longest
+        replies back to back), and a **write round trip** (the module's home offset and one
+        calibrated map entry, each nudged by one half-step, read back, put back, and read back
+        again). Discarded and corrupt frames are counted over the run. Nothing it sends moves a
         flap. Holds the bus (BUSY) for the run so content cannot interleave; stops at the
-        deadline or on cancel. Refuses to start (409) while a probe, self-test or calibration
-        owns the bus. The dashboard offers 5/10/20/30 minutes; the API takes 1-60.
+        deadline or on cancel, never in the middle of a write round trip. Refuses to start (409)
+        while a probe, self-test or calibration owns the bus. The dashboard offers 5/10/20/30
+        minutes; the API takes 1-60.
       requestBody:
         required: false
         content:
@@ -1747,7 +1752,10 @@ paths:
     get:
       tags: [Status]
       summary: Progress and per-module tally of the soak test
-      description: Streamed; the `rows` array has one entry per provisioned module.
+      description: |
+        Streamed; the `rows` array has one entry per provisioned module. Each kind of traffic is
+        a `[ok, tries]` pair: `v`/`Q`/`d`/`A` the single-module replies, `V` the broadcast roll
+        call, `B` the broadcast combined dump, `W` the write round trip.
       responses:
         "200":
           description: Running progress, or the finished result
@@ -1765,19 +1773,37 @@ paths:
                   remaining: { type: integer, description: "seconds, while running" }
                   drops:     { type: integer, description: "Frames discarded during the run" }
                   rejects:   { type: integer, description: "Frames that arrived corrupt during the run" }
+                  writes:      { type: integer, description: "Write round trips run" }
+                  restoreFail: { type: integer, description: "Written values that could NOT be confirmed put back (see rows[].alt)" }
+                  dups:        { type: integer, description: "Broadcast replies beyond the first from one id" }
+                  stray:       { type: integer, description: "Broadcast replies from ids not in the module table" }
                   rows:
                     type: array
                     items:
                       type: object
                       properties:
                         id:     { type: integer }
-                        v:      { type: array, items: { type: integer }, description: "[ok, tries]" }
-                        Q:      { type: array, items: { type: integer }, description: "[ok, tries]" }
-                        d:      { type: array, items: { type: integer }, description: "[ok, tries]" }
-                        A:      { type: array, items: { type: integer }, description: "[ok, tries]" }
+                        v:      { type: array, items: { type: integer }, description: "[ok, tries] -- version" }
+                        Q:      { type: array, items: { type: integer }, description: "[ok, tries] -- stats snapshot" }
+                        d:      { type: array, items: { type: integer }, description: "[ok, tries] -- EEPROM dump" }
+                        A:      { type: array, items: { type: integer }, description: "[ok, tries] -- combined dump" }
+                        V:      { type: array, items: { type: integer }, description: "[ok, tries] -- broadcast roll call" }
+                        B:      { type: array, items: { type: integer }, description: "[ok, tries] -- broadcast combined dump" }
+                        W:      { type: array, items: { type: integer }, description: "[ok, tries] -- write round trip" }
                         max:    { type: integer, description: "Longest reply seen from this module" }
                         streak: { type: integer, description: "Consecutive misses right now" }
                         worst:  { type: integer, description: "Longest run of consecutive misses" }
+                        alt:    { type: integer, description: "Written and NOT confirmed put back: bit0 home offset, bit1 map entry. With `orig`, the values found before the first write" }
+                        bad:    { type: integer, description: "Broadcast replies from this id that arrived but did not parse whole" }
+                        dup:    { type: integer, description: "Broadcasts in which this id answered more than once -- two modules share it" }
+                        ww:     { type: integer, description: "Why the write leg failed: bit0 a write did not read back, bit1 it could not be put back" }
+                        orig:
+                          type: object
+                          description: "Present when alt is set: the home offset, map index and position this module had before the test wrote to it"
+                          properties:
+                            ho:  { type: integer }
+                            idx: { type: integer }
+                            pos: { type: integer }
 
   /api/companion:
     get:

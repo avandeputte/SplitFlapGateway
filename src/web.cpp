@@ -2150,27 +2150,35 @@ static void handleApiSoakStatus() {
     if (cl + n >= sizeof(chunk)) { chunk[cl] = 0; server.sendContent(chunk); cl = 0; wdgWebMs = millis(); }
     memcpy(chunk + cl, s, n); cl += n;
   };
-  char head[320];
+  char head[400];
   unsigned long now = millis();
   long remaining = gSoak.active ? (long)((gSoak.deadlineMs - now + 999) / 1000) : 0;
   if (remaining < 0) remaining = 0;
   snprintf(head, sizeof(head),
     "{\"ok\":true,\"state\":\"%s\",\"modules\":%d,\"passes\":%d,\"queries\":%d,\"failures\":%d,"
-    "\"elapsed\":%lu,\"remaining\":%ld,\"drops\":%lu,\"rejects\":%lu,\"rows\":[",
+    "\"elapsed\":%lu,\"remaining\":%ld,\"drops\":%lu,\"rejects\":%lu,"
+    "\"writes\":%d,\"restoreFail\":%d,\"dups\":%d,\"stray\":%d,\"rows\":[",
     gSoak.active ? "running" : (gSoak.done ? (gSoak.cancel ? "cancelled" : "done") : "idle"),
     (int)gSoak.modules, (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures,
     (unsigned long)(gSoak.active ? now - gSoak.startedMs : gSoak.elapsedMs), remaining,
     (unsigned long)(gSoak.active ? rxDropped - gSoak.dropsBefore : gSoak.dropsDuring),
-    (unsigned long)(gSoak.active ? sfParseRejects - gSoak.rejectsBefore : gSoak.rejectsDuring));
+    (unsigned long)(gSoak.active ? sfParseRejects - gSoak.rejectsBefore : gSoak.rejectsDuring),
+    (int)gSoak.writes, (int)gSoak.restoreFail, (int)gSoak.dups, (int)gSoak.stray);
   put(head);
   if (gSoak.rows) {
-    char row[160];
+    static char row[360];
     for (int i = 0; i < gSoak.modules; i++) {
       const SoakRow& r = gSoak.rows[i];
-      snprintf(row, sizeof(row),
-        "%s{\"id\":%d,\"v\":[%d,%d],\"Q\":[%d,%d],\"d\":[%d,%d],\"A\":[%d,%d],\"max\":%d,\"streak\":%d,\"worst\":%d}",
+      int n = snprintf(row, sizeof(row),
+        "%s{\"id\":%d,\"v\":[%d,%d],\"Q\":[%d,%d],\"d\":[%d,%d],\"A\":[%d,%d],\"W\":[%d,%d],\"V\":[%d,%d],\"B\":[%d,%d],"
+        "\"max\":%d,\"streak\":%d,\"worst\":%d,\"alt\":%d,\"bad\":%d,\"dup\":%d,\"ww\":%d",
         i ? "," : "", r.id, r.ok[0], r.tries[0], r.ok[1], r.tries[1], r.ok[2], r.tries[2], r.ok[3], r.tries[3],
-        (int)r.maxLen, (int)r.streak, (int)r.worstStreak);
+        r.ok[4], r.tries[4], r.ok[5], r.tries[5], r.ok[6], r.tries[6],
+        (int)r.maxLen, (int)r.streak, (int)r.worstStreak, (int)r.altered, (int)r.mangled, (int)r.dup, (int)r.wWhy);
+      if (r.altered)   // what the write leg found before it first wrote, so a hand repair is possible
+        n += snprintf(row + n, sizeof(row) - n, ",\"orig\":{\"ho\":%d,\"idx\":%d,\"pos\":%d}",
+                      (int)r.origHo, (int)r.origIdx, (int)r.origPos);
+      snprintf(row + n, sizeof(row) - n, "}");
       put(row);
     }
   }

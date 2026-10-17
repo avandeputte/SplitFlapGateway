@@ -1,5 +1,7 @@
 {
  "$name": "English",
+ "\"+t(\"Show every kind of traffic\")+\"": "\"+t(\"Show every kind of traffic\")+\"",
+ "\"+t(\"Show the summary\")+\"": "\"+t(\"Show the summary\")+\"",
  "' to": "' to",
  "(adjusting)": "(adjusting)",
  "(custom)": "(custom)",

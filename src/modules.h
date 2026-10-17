@@ -188,22 +188,47 @@ struct ProbeState {
 /* Bus soak test (v3.15) -- the probe, for the whole wall, for a long time, silently.
  *
  * "A couple of modules play up now and then" is the report that a single probe cannot catch.
- * The soak walks every provisioned module in turn, pass after pass, for the number of minutes
- * you ask, asking for a reply of a different size each pass -- 'v', 'Q', 'd', 'A' -- and
- * keeps a tally per module per size. Nothing it sends moves a flap. It holds the bus (bus.h)
- * so content cannot interleave, and it stops on its own at the deadline or on cancel.
+ * The soak walks every provisioned module, pass after pass, for the number of minutes you
+ * ask, and each pass exercises the bus a different way:
+ *   'V'  broadcast roll call (m*v<lo>-<hi>): every module answers in its timed slot; a reply
+ *        that is missing, arrives damaged, or arrives TWICE for one id is scored
+ *   'v' 'Q' 'd' 'A'  one module at a time, replies of increasing size (the probe's four)
+ *   'B'  broadcast combined dump (m*A<lo>-<hi>): the longest replies, back to back
+ *   'W'  write round trip: the module's home offset, then one calibrated map entry, is
+ *        nudged by one half-step, read back, PUT BACK, and read back again. Both writes
+ *        are a bare EEPROM store on the module -- the reel is not told to go anywhere.
+ *        A module whose original value cannot be confirmed restored is flagged (altered)
+ *        and its original values are kept, so it can be put right by hand.
+ * There is deliberately NO "fill the whole map" leg. One was tried (2026-10-17): on module
+ * firmware v32 a module whose 64 map entries are all set can no longer send its 'd' or 'A'
+ * reply at all -- it answers 'v' and 'Q' but the dump never comes -- and stays that way
+ * until the map is erased. That is the field report "module stopped answering mXA, erasing
+ * EEPROM fixed it", reproduced on eight modules at once. The soak detects that signature
+ * from its ordinary passes instead (short replies 100%, long replies 0%), and the fix is
+ * the module firmware's to make. Nothing the soak sends moves a flap. It holds the bus (bus.h) so content cannot interleave, and
+ * it stops on its own at the deadline or on cancel -- never in the middle of a write round
+ * trip, which always runs to its restore step.
  *
- * Reading the result: a module that fails only 'd' and 'A' is losing LONG frames (the bus,
- * not the module); one that fails everything, or intermittently at every size, is a power or
- * contact problem; a wall where every module is clean for 30 minutes is a wall you can trust.
+ * Reading the result: a module that fails only 'd', 'A' and 'B' is losing LONG frames (the
+ * bus, not the module); one that fails everything, or intermittently at every size, is a
+ * power or contact problem; misses only on 'V'/'B' are replies colliding (timing, or two
+ * modules on one id); a wall where every module is clean for 30 minutes is a wall you can
+ * trust.
  */
+#define SOAK_STEPS 7                 // order of SoakRow.tries/ok: v Q d A W V B
 struct SoakRow {
   uint8_t  id;
-  uint8_t  tries[PROBE_STEPS];
-  uint8_t  ok[PROBE_STEPS];
+  uint8_t  tries[SOAK_STEPS];
+  uint8_t  ok[SOAK_STEPS];
   uint16_t maxLen;           // longest reply seen from this module
   uint8_t  streak;           // consecutive failures right now (worst-case flicker detector)
   uint8_t  worstStreak;
+  uint8_t  altered;          // bit0 home offset, bit1 map entry: written and NOT confirmed put back
+  uint8_t  mangled;          // broadcast replies from this id that arrived but did not parse whole
+  uint8_t  dup;              // broadcast windows in which this id answered more than once
+  uint8_t  wWhy;             // why the write leg failed, OR of: 1 write did not read back, 2 restore
+  int8_t   origIdx;          // the map entry the write leg uses (-1 none) ...
+  uint16_t origHo, origPos;  // ... and the values it found there before the first write
 };
 struct SoakState {
   volatile bool          active    = false;
@@ -217,9 +242,17 @@ struct SoakState {
   volatile unsigned long deadlineMs= 0;
   volatile unsigned long elapsedMs = 0;
   volatile unsigned long dropsBefore = 0, dropsDuring = 0, rejectsBefore = 0, rejectsDuring = 0;
+  volatile int           writes    = 0;      // write round trips run
+  volatile int           restoreFail = 0;    // values that could not be confirmed put back
+  volatile int           dups      = 0;      // broadcast replies beyond the first from one id
+  volatile int           stray     = 0;      // broadcast replies from ids not in the table
+  volatile int           idLo      = 0, idHi = 0;   // broadcast range (provisioned ids)
   SoakRow*               rows      = NULL;   // MAX_MODULES, in PSRAM, allocated on first start
 };
 extern SoakState gSoak;
+// Called by the reply parser (taskRS485) for every 'v' and 'A' reply; counted only while
+// the soak has a broadcast window open. `whole` = the reply parsed completely.
+void sfSoakNoteReply(uint8_t id, char cmd, bool whole);
 // Start a soak of `minutes` (1-60) over every provisioned module. False if something else
 // owns the bus (probe, self-test, calibration) or the task will not start.
 bool sfSoakStart(int minutes);

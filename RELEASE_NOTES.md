@@ -25,12 +25,40 @@ Maintenance that happens by itself, and a soak test for the whole wall.
   `bus.lock`.
 
 - **A whole-wall soak test**, on the Status tab under Bus Health. Pick 5, 10, 20 or 30 minutes
-  and it asks every provisioned module, pass after pass, for replies of four different sizes —
-  version, stats snapshot, EEPROM dump and the combined dump — keeping score per module per
-  size. Nothing moves; display content is paused for the run. It catches the module that only
-  drops out now and then, and its verdict separates a bus that loses long frames from a module
-  that is failing at every size. `POST /api/flap/soak {"minutes"}`, `…/soak/status`,
-  `…/soak/cancel`. The probe, the self-tests and the soak refuse to run over one another.
+  and it works the bus seven ways, pass after pass, keeping score per module per kind:
+
+  | Pass | What it sends | What it catches |
+  |---|---|---|
+  | Roll call | `m*v<lo>-<hi>` — every module answers in its own timed slot | a reply that is missing, damaged, or arrives **twice** for one ID |
+  | Version, snapshot | `v`, `Q` — the short replies, one module at a time | power and contact faults, which hit every size equally |
+  | Dump, combined dump | `d`, `A` — the long replies | a line that loses long frames |
+  | Broadcast dump | `m*A<lo>-<hi>` — the longest replies, back to back | slot timing under the worst load the bus ever sees |
+  | Write round trip | the home offset and one map entry, each nudged one half-step, read back, **put back**, and read back again | a write that does not land, or an EEPROM that no longer holds one |
+
+  Nothing it sends moves a flap, and display content is paused for the run. The report is a
+  list of findings, not a scoreboard: each one names the modules, the evidence, and what to do
+  about it — long frames lost but short ones fine reads as termination and cable; misses at
+  every size as power or contact at those modules; misses only in broadcasts as replies
+  colliding; an ID that answers twice as two boards sharing it; a value that could not be put
+  back is reported first, with the original value to write back. `POST /api/flap/soak
+  {"minutes"}`, `…/soak/status`, `…/soak/cancel`. The probe, the self-tests and the soak refuse
+  to run over one another.
+
+  A module whose own values could not be confirmed restored keeps them in the report, so
+  nothing is lost silently. `tools/soak_sim.py` in the repo models a flaky bus — termination,
+  contact, a duplicated ID, a worn EEPROM, a silent module — and prints the status JSON, so the
+  report can be worked on without a wall to break.
+
+### Found while testing
+
+- **A module on firmware v32 whose calibration map is completely full can no longer send its
+  EEPROM dump at all.** It answers `v` and `Q` as usual, and `d`/`A` never arrive, until the map
+  is erased. This is the field report "the module stopped answering `mXA`, erasing the EEPROM
+  fixed it", reproduced deliberately on eight modules. The soak reads that signature out of its
+  ordinary passes — short replies 100%, long replies 0%, not intermittent — and says so, with
+  the recovery: erase the map and restore from a backup, which writes the entries one at a time.
+  The lasting fix belongs to the module firmware, which assembles the whole reply before
+  sending it.
 
 ## v3.14.0 — 2026-10-17
 

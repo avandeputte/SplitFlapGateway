@@ -621,18 +621,174 @@ static void taskProbe(void* pv) {
 
 /* ---- Bus soak test (v3.15) ----------------------------------------------------------
    See SoakState in modules.h. Its own task, like the probe; the browser polls
-   GET /api/flap/soak/status. The per-module table lives in PSRAM: 255 rows x 16 B. */
+   GET /api/flap/soak/status. The per-module table lives in PSRAM: 255 rows x 26 B. */
 static TaskHandle_t hTaskSoak = NULL;
 
+/* Broadcast roll call: replies per id while a window is open (taskRS485 writes, taskSoak
+   reads; a byte each way, no lock needed). */
+static volatile bool gSoakBcArmed = false;
+static volatile char gSoakBcCmd   = 0;
+static uint8_t gSoakBcSeen[256];
+static uint8_t gSoakBcBad[256];
+void sfSoakNoteReply(uint8_t id, char cmd, bool whole) {
+  if (!gSoakBcArmed || gSoakBcCmd != cmd) return;
+  if (gSoakBcSeen[id] < 255) gSoakBcSeen[id]++;
+  if (!whole && gSoakBcBad[id] < 255) gSoakBcBad[id]++;
+}
+
+// "ho:ts:idx=pos,..." as sfSendAndCaptureDump returns it. Also picks the FIRST calibrated
+// map entry (idx = -1 when the map is empty): the only kind of entry a write test can put
+// back, since a single entry cannot be un-calibrated.
+static bool soakParseDump(const char* d, int* ho, int* ts, int* idx, int* pos) {
+  char* end;
+  long h = strtol(d, &end, 10); if (end == d || *end != ':') return false;
+  const char* q = end + 1;
+  long t = strtol(q, &end, 10); if (end == q || *end != ':') return false;
+  *ho = (int)h; *ts = (int)t; *idx = -1; *pos = 0;
+  const char* mp = end + 1;
+  if (isdigit((unsigned char)*mp)) {
+    long i = strtol(mp, &end, 10);
+    if (*end == '=') {
+      long p = strtol(end + 1, &end, 10);
+      if (i >= 0 && i < SF_MAX_FLAPS && p > 0 && p < 65000) { *idx = (int)i; *pos = (int)p; }
+    }
+  }
+  return true;
+}
+static bool soakMapLookup(const char* d, int idx, int* pos) {
+  const char* p = strchr(d, ':'); if (!p) return false;
+  p = strchr(p + 1, ':');         if (!p) return false;
+  p++;
+  while (*p) {
+    char* end; long i = strtol(p, &end, 10);
+    if (end == p || *end != '=') return false;
+    long v = strtol(end + 1, &end, 10);
+    if (i == idx) { *pos = (int)v; return true; }
+    if (*end != ',') return false;
+    p = end + 1;
+  }
+  return false;
+}
+static bool soakDump(int id, const char* sn, int fwNum, char* out, size_t outLen) {
+  char frame[48];
+  if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
+  else                      snprintf(frame, sizeof(frame), "m%dd\n", id);
+  return sfSendAndCaptureDump(id, frame, 1400, out, outLen);
+}
+// Send a write, read the dump back, compare. 1 = the value is there; 0 = read back, but
+// different; -1 = the read-back got no reply.
+static int soakWriteVerify(int id, const char* sn, int fwNum, const char* frame,
+                           int which, int idx, int want, char* out, size_t outLen) {
+  rs485SendStr(frame);
+  vTaskDelay(pdMS_TO_TICKS(120));
+  if (!soakDump(id, sn, fwNum, out, outLen)) return -1;
+  int ho, ts, i0, p0;
+  if (!soakParseDump(out, &ho, &ts, &i0, &p0)) return 0;
+  if (which == 0) return ho == want ? 1 : 0;
+  int p; if (!soakMapLookup(out, idx, &p)) return 0;
+  return p == want ? 1 : 0;
+}
+// The write leg for one module. Never writes blind: a module that does not answer the
+// baseline dump is scored as a miss and left alone. Each value is nudged by one half-step
+// (downwards when it can be, so it stays inside the reel), read back, written back to the
+// original, read back again -- up to four tries for the restore. A value that cannot be
+// confirmed put back is flagged on the row; the flag is sticky, and the original values
+// the leg first saw are kept so the module can be put right by hand.
+static bool soakWriteRoundTrip(SoakRow& r, const char* sn, int fwNum, char* out, size_t outLen) {
+  int ho, ts, idx, pos;
+  if (!soakDump(r.id, sn, fwNum, out, outLen)) return false;
+  if (!soakParseDump(out, &ho, &ts, &idx, &pos)) return false;
+  if (!r.origHo && !r.altered) { r.origHo = (uint16_t)ho; r.origIdx = (int8_t)idx; r.origPos = (uint16_t)pos; }
+  gSoak.writes = gSoak.writes + 1;
+  bool ok = true;
+  char frame[48];
+  for (int L = 0; L < 2; L++) {
+    if (L == 1 && idx < 0) break;
+    const int orig = L ? pos : ho;
+    const int alt  = orig > 1 ? orig - 1 : orig + 1;
+    const uint8_t bit = L ? 2 : 1;
+    if (L) snprintf(frame, sizeof(frame), "m%dw%d:%d\n", r.id, idx, alt);
+    else   snprintf(frame, sizeof(frame), "m%do%d\n", r.id, alt);
+    if (soakWriteVerify(r.id, sn, fwNum, frame, L, idx, alt, out, outLen) != 1) { ok = false; r.wWhy |= 1; }
+    if (L) snprintf(frame, sizeof(frame), "m%dw%d:%d\n", r.id, idx, orig);
+    else   snprintf(frame, sizeof(frame), "m%do%d\n", r.id, orig);
+    bool back = false;
+    for (int t = 0; t < 4 && !back; t++)
+      back = soakWriteVerify(r.id, sn, fwNum, frame, L, idx, orig, out, outLen) == 1;
+    if (!back) {
+      ok = false;
+      r.wWhy |= 2;
+      r.altered |= bit;
+      gSoak.restoreFail = gSoak.restoreFail + 1;
+      printf("[SOAK] module %d: %s %d could NOT be confirmed put back (last dump: %.40s)\n",
+             r.id, L ? "map entry" : "home offset", orig, out);
+    }
+  }
+  return ok;
+}
+// One broadcast window: send m*<cmd><lo>-<hi>, wait for every slot, then score each row.
+static void soakBroadcast(char cmd, int k) {
+  memset(gSoakBcSeen, 0, sizeof(gSoakBcSeen));
+  memset(gSoakBcBad, 0, sizeof(gSoakBcBad));
+  gSoakBcCmd = cmd; gSoakBcArmed = true;
+  char frame[24];
+  snprintf(frame, sizeof(frame), "m*%c%d-%d\n", cmd, (int)gSoak.idLo, (int)gSoak.idHi);
+  rs485SendStr(frame);
+  const unsigned long slot = (cmd == 'A') ? 700UL : 100UL;            // the module's reply slots
+  const unsigned long waitMs = 30 + (unsigned long)(gSoak.idHi - gSoak.idLo + 1) * slot + (cmd == 'A' ? 1500 : 600);
+  vTaskDelay(pdMS_TO_TICKS(waitMs));
+  gSoakBcArmed = false;
+  static bool inTable[256];
+  memset(inTable, 0, sizeof(inTable));
+  for (int i = 0; i < gSoak.modules; i++) {
+    SoakRow& r = gSoak.rows[i];
+    inTable[r.id] = true;
+    if (cmd == 'A') {                       // pre-v25 firmware cannot answer: not a failure
+      char fw[8] = "";
+      if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+      SFModule* m = sfFindById(r.id);
+      if (m) strlcpy(fw, m->fwVersion, sizeof(fw));
+      if (sfMutex) xSemaphoreGive(sfMutex);
+      const int fwNum = atoi((fw[0] == 'v' || fw[0] == 'V') ? fw + 1 : fw);
+      if (fwNum && fwNum < 25) continue;
+    }
+    if (r.tries[k] < 255) r.tries[k]++;
+    gSoak.queries = gSoak.queries + 1;
+    const uint8_t seen = gSoakBcSeen[r.id], bad = gSoakBcBad[r.id];
+    if (bad && r.mangled < 255 - bad) r.mangled += bad;
+    if (seen > 1) { if (r.dup < 255) r.dup++; gSoak.dups = gSoak.dups + (seen - 1); }
+    if (seen >= 1 && bad == 0 && seen == 1) {
+      if (r.ok[k] < 255) r.ok[k]++;
+      r.streak = 0;
+    } else {
+      gSoak.failures = gSoak.failures + 1;
+      if (r.streak < 255) r.streak++;
+      if (r.streak > r.worstStreak) r.worstStreak = r.streak;
+    }
+  }
+  for (int id = 0; id < 255; id++)
+    if (!inTable[id] && gSoakBcSeen[id]) gSoak.stray = gSoak.stray + gSoakBcSeen[id];
+}
+
 static void taskSoak(void* pv) {
-  static const char kCmds[PROBE_STEPS] = {'v', 'Q', 'd', 'A'};
+  // Per-pass order. The quick single-module sizes come first so even a short run covers
+  // them; the write leg closes the cycle. Index k into SoakRow.tries/ok: v Q d A W V B.
+  static const struct { char cmd; int k; } kPass[SOAK_STEPS] =
+    { {'V', 5}, {'v', 0}, {'Q', 1}, {'d', 2}, {'A', 3}, {'B', 6}, {'W', 4} };
   static char out[TX_MAX_BYTES];
   for (int pass = 0; !gSoak.cancel && (long)(millis() - gSoak.deadlineMs) < 0; pass++) {
-    busHold("soak", BUS_BUSY, 180000UL);                 // renewed every pass
-    const int k = pass % PROBE_STEPS;
-    const char cmd = kCmds[k];
+    const char cmd = kPass[pass % SOAK_STEPS].cmd;
+    const int  k   = kPass[pass % SOAK_STEPS].k;
+    busHold("soak", BUS_BUSY, 180000UL);
+    if (cmd == 'V' || cmd == 'B') {
+      soakBroadcast(cmd == 'V' ? 'v' : 'A', k);
+      gSoak.passes = pass + 1;
+      vTaskDelay(pdMS_TO_TICKS(150));
+      continue;
+    }
     for (int i = 0; i < gSoak.modules && !gSoak.cancel; i++) {
       if ((long)(millis() - gSoak.deadlineMs) >= 0) break;
+      busHold("soak", BUS_BUSY, 180000UL);              // renewed per module: a write pass over a big wall is long
       SoakRow& r = gSoak.rows[i];
       char fw[8] = ""; char sn[21] = "";
       if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
@@ -646,7 +802,8 @@ static void taskSoak(void* pv) {
       rxLastLen = 0;
       bool ok;
       char frame[48];
-      if (cmd == 'v')      ok = sfSendVersionAndWait(r.id, 700, NULL, 0, NULL, 0, NULL);
+      if (cmd == 'W')      ok = soakWriteRoundTrip(r, sn, fwNum, out, sizeof(out));
+      else if (cmd == 'v') ok = sfSendVersionAndWait(r.id, 700, NULL, 0, NULL, 0, NULL);
       else if (cmd == 'Q') ok = sfSendAndCaptureQ(r.id, 900);
       else {
         if (cmd == 'A' && sn[0])       snprintf(frame, sizeof(frame), "mXA%s\n", sn);
@@ -659,7 +816,7 @@ static void taskSoak(void* pv) {
       gSoak.queries = gSoak.queries + 1;
       if (ok) {
         if (r.ok[k] < 255) r.ok[k]++;
-        if ((int)rxLastLen > r.maxLen) r.maxLen = (uint16_t)rxLastLen;
+        if (cmd != 'W' && (int)rxLastLen > r.maxLen) r.maxLen = (uint16_t)rxLastLen;
         r.streak = 0;
       } else {
         gSoak.failures = gSoak.failures + 1;
@@ -676,9 +833,11 @@ static void taskSoak(void* pv) {
   busRelease("soak");
   gSoak.active = false;
   gSoak.done   = true;
-  printf("[SOAK] %s after %lus: %d passes, %d queries, %d failures, %lu dropped, %lu rejected\n",
+  printf("[SOAK] %s after %lus: %d passes, %d queries, %d failures, %d writes (%d not put back), "
+         "%d duplicate and %d stray broadcast replies, %lu dropped, %lu rejected\n",
          gSoak.cancel ? "cancelled" : "finished", gSoak.elapsedMs / 1000UL,
-         (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures,
+         (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures, (int)gSoak.writes,
+         (int)gSoak.restoreFail, (int)gSoak.dups, (int)gSoak.stray,
          (unsigned long)gSoak.dropsDuring, (unsigned long)gSoak.rejectsDuring);
   hTaskSoak = NULL;
   vTaskDelete(NULL);
@@ -691,12 +850,19 @@ bool sfSoakStart(int minutes) {
   if (!gSoak.rows) gSoak.rows = (SoakRow*)psramAlloc("soak table", sizeof(SoakRow) * MAX_MODULES);
   if (!gSoak.rows) return false;
   memset(gSoak.rows, 0, sizeof(SoakRow) * MAX_MODULES);
-  int n = 0;
+  int n = 0, lo = 255, hi = 0;
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++)
-    if (sfModules[i].provisioned && sfModules[i].id != 255) gSoak.rows[n++].id = sfModules[i].id;
+    if (sfModules[i].provisioned && sfModules[i].id != 255) {
+      const uint8_t id = sfModules[i].id;
+      gSoak.rows[n].id = id; gSoak.rows[n].origIdx = -1; n++;
+      if (id < lo) lo = id;
+      if (id > hi) hi = id;
+    }
   if (sfMutex) xSemaphoreGive(sfMutex);
   if (!n) return false;
+  gSoak.idLo = lo; gSoak.idHi = hi;
+  gSoak.writes = 0; gSoak.restoreFail = 0; gSoak.dups = 0; gSoak.stray = 0;
   gSoak.modules = n; gSoak.passes = 0; gSoak.queries = 0; gSoak.failures = 0;
   gSoak.startedMs = millis(); gSoak.deadlineMs = millis() + (unsigned long)minutes * 60000UL;
   gSoak.elapsedMs = 0; gSoak.dropsBefore = rxDropped; gSoak.rejectsBefore = sfParseRejects;
@@ -1305,6 +1471,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       DBG("[SF] rejecting corrupt version response for module %d (sn:%s)\n",
           id, field[2] ? field[2] : "");
       sfParseRejects++;
+      sfSoakNoteReply((uint8_t)id, 'v', false);
       if (sfNoteCorruptVersionReply((uint8_t)id)) {
         DBG("[SF] *** possible DUPLICATE ID %d on the bus: %d corrupt version replies "
             "(framing intact, serial garbled) -- two modules may share this ID ***\n",
@@ -1315,6 +1482,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       }
       return;
     }
+    sfSoakNoteReply((uint8_t)id, 'v', true);
     DBG("[SF] Module %d fw:%s reportedId:%d sn:%s\n",
                   id, fwCopy, reportedId, field[2] ? field[2] : "");
     char payload[96];
@@ -1378,6 +1546,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     // reply has only 7 colons and no tail, leaving these at -99/"".
     int  aFlapCount = -99;
     char aFlapChars[SF_MAX_FLAPS + 1] = "";
+    bool aTailBroken = false;
     {
       int colons = 0; const char* c8 = nullptr; const char* c9 = nullptr;
       for (const char* cp = aBuf; *cp; cp++) {
@@ -1396,6 +1565,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       if (aFlapCount > 0 && (int)strlen(aFlapChars) != aFlapCount) {
         DBG("[SF] Module %d: inconsistent flap tail (%d flaps, %u chars) -- ignored\n",
             id, aFlapCount, (unsigned)strlen(aFlapChars));
+        aTailBroken = true;
         aFlapCount = -99;
         aFlapChars[0] = 0;
       }
@@ -1415,6 +1585,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     if (!sfApplyVersionFields((uint8_t)id, fwCopy, f[2])) {
       DBG("[SF] rejecting corrupt all-fields response for module %d (sn:%s)\n", id, f[2] ? f[2] : "");
       sfParseRejects++;
+      sfSoakNoteReply((uint8_t)id, 'A', false);
       if (sfNoteCorruptVersionReply((uint8_t)id)) {
         DBG("[SF] *** possible DUPLICATE ID %d on the bus: %d corrupt version replies "
             "(framing intact, serial garbled) -- two modules may share this ID ***\n",
@@ -1425,6 +1596,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       }
       return;
     }
+    sfSoakNoteReply((uint8_t)id, 'A', !aTailBroken && f[4] && f[4][0] && f[7] != NULL);
     // Reconstruct the dump portion into the shared capture slot if a request is
     // waiting (handleApiAll arms it), so the existing wait machinery works. The
     // 'A'-only extras (autoHome, curIndex, self-reported id) ride along in
