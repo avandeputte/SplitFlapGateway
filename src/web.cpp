@@ -35,6 +35,8 @@ static void handleApiProbe();
 static void handleApiBus();
 static void handleApiSoak();
 static void handleApiSoakCancel();
+static void handleApiSoakSnapshot();
+static void handleApiSoakRollback();
 static void handleApiSoakStatus();
 static void handleApiBusHold();
 static void handleApiBusRelease();
@@ -2133,6 +2135,45 @@ static void handleApiSoak() {
            (int)gSoak.modules, minutes < 1 ? 1 : (minutes > 60 ? 60 : minutes));
   server.send(200, "application/json", out);
 }
+/* GET /api/flap/soak/snapshot -- the calibration the soak test read before it wrote anything.
+   With ?meta=1, just what is in the file; otherwise the file itself, as a download, so it can
+   be kept or replayed later through the ordinary restore upload. */
+static void handleApiSoakSnapshot() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  RestoreFileInfo info;
+  char err[64] = "";
+  bool ok = restoreValidateFile(SOAK_SNAPSHOT_FILE, &info, err, sizeof(err));
+  if (server.hasArg("meta")) {
+    char buf[224];
+    if (ok) snprintf(buf, sizeof(buf),
+              "{\"ok\":true,\"exists\":true,\"bytes\":%u,\"modules\":%d,\"entries\":%d,\"created\":\"%s\"}",
+              (unsigned)info.bytes, info.modules, info.entries, info.created);
+    else    snprintf(buf, sizeof(buf), "{\"ok\":true,\"exists\":false,\"error\":\"%s\"}", err);
+    server.send(200, "application/json", buf);
+    return;
+  }
+  if (!ok) { sendJsonError(404, err[0] ? err : "no snapshot stored"); return; }
+  File f = FFat.open(SOAK_SNAPSHOT_FILE, "r");
+  if (!f) { sendJsonError(500, "cannot open snapshot"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"splitflap-presoak.json\"");
+  server.streamFile(f, "application/json");
+  f.close();
+}
+
+/* POST /api/flap/soak/rollback -- put every module back to the calibration in that snapshot,
+   through the same per-entry restore the boot restore uses. For the case the report calls out:
+   a value the soak wrote that could not be confirmed put back. */
+static void handleApiSoakRollback() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (gSoak.active) { sendJsonError(409, "the soak test is still running"); return; }
+  char err[80] = "";
+  if (!restoreStartFrom(SOAK_SNAPSHOT_FILE, 0, "soak", err, sizeof(err))) {
+    sendJsonError(409, err[0] ? err : "cannot start");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"started\":true,\"source\":\"soak snapshot\"}");
+}
+
 static void handleApiSoakCancel() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (!gSoak.active) { sendJsonError(409, "no soak test running"); return; }
@@ -2157,13 +2198,16 @@ static void handleApiSoakStatus() {
   snprintf(head, sizeof(head),
     "{\"ok\":true,\"state\":\"%s\",\"modules\":%d,\"passes\":%d,\"queries\":%d,\"failures\":%d,"
     "\"elapsed\":%lu,\"remaining\":%ld,\"drops\":%lu,\"rejects\":%lu,"
-    "\"writes\":%d,\"restoreFail\":%d,\"dups\":%d,\"stray\":%d,\"rows\":[",
+    "\"writes\":%d,\"restoreFail\":%d,\"dups\":%d,\"stray\":%d,"
+    "\"snap\":{\"running\":%s,\"ok\":%s,\"done\":%d,\"total\":%d,\"modules\":%d,\"err\":\"%s\"},\"rows\":[",
     gSoak.active ? "running" : (gSoak.done ? (gSoak.cancel ? "cancelled" : "done") : "idle"),
     (int)gSoak.modules, (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures,
     (unsigned long)(gSoak.active ? now - gSoak.startedMs : gSoak.elapsedMs), remaining,
     (unsigned long)(gSoak.active ? rxDropped - gSoak.dropsBefore : gSoak.dropsDuring),
     (unsigned long)(gSoak.active ? sfParseRejects - gSoak.rejectsBefore : gSoak.rejectsDuring),
-    (int)gSoak.writes, (int)gSoak.restoreFail, (int)gSoak.dups, (int)gSoak.stray);
+    (int)gSoak.writes, (int)gSoak.restoreFail, (int)gSoak.dups, (int)gSoak.stray,
+    gSoak.snapRunning ? "true" : "false", gSoak.snapOkFlag ? "true" : "false",
+    (int)gSoak.snapDone, (int)gSoak.snapTotal, (int)gSoak.snapOk, gSoak.snapErr);
   put(head);
   if (gSoak.rows) {
     static char row[360];
@@ -2757,6 +2801,9 @@ void webInit() {
   server.on("/api/flap/soak",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/soak/cancel", HTTP_POST,    handleApiSoakCancel);
   server.on("/api/flap/soak/status", HTTP_GET,     handleApiSoakStatus);
+  server.on("/api/flap/soak/snapshot", HTTP_GET,    handleApiSoakSnapshot);
+  server.on("/api/flap/soak/rollback", HTTP_POST,   BUSGATED(handleApiSoakRollback));
+  server.on("/api/flap/soak/rollback", HTTP_OPTIONS, handleOptions);
   server.on("/api/bus",              HTTP_GET,     handleApiBus);
   server.on("/api/bus/hold",         HTTP_POST,    handleApiBusHold);
   server.on("/api/bus/hold",         HTTP_OPTIONS, handleOptions);

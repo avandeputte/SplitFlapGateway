@@ -247,6 +247,12 @@ struct SoakState {
   volatile int           dups      = 0;      // broadcast replies beyond the first from one id
   volatile int           stray     = 0;      // broadcast replies from ids not in the table
   volatile int           idLo      = 0, idHi = 0;   // broadcast range (provisioned ids)
+  // Safety snapshot: every module's calibration, read and stored before the test writes
+  // anything, so a run that cannot put a value back can be undone (SOAK_SNAPSHOT_FILE).
+  volatile bool          snapRunning = false;
+  volatile bool          snapOkFlag  = false;   // a usable snapshot exists for THIS run
+  volatile int           snapDone  = 0, snapTotal = 0, snapOk = 0;
+  char                   snapErr[48] = "";
   SoakRow*               rows      = NULL;   // MAX_MODULES, in PSRAM, allocated on first start
 };
 extern SoakState gSoak;

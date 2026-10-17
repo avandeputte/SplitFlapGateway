@@ -35,6 +35,13 @@ Maintenance that happens by itself, and a soak test for the whole wall.
   | Broadcast dump | `m*A<lo>-<hi>` — the longest replies, back to back | slot timing under the worst load the bus ever sees |
   | Write round trip | the home offset and one map entry, each nudged one half-step, read back, **put back**, and read back again | a write that does not land, or an EEPROM that no longer holds one |
 
+  **Before it writes anything it reads every module's calibration into the gateway's flash**,
+  so the run can be undone from the gateway alone: one button puts the whole wall back, through
+  the same per-entry restore the boot restore uses, and the snapshot can also be downloaded and
+  kept. It is a separate file from your own stored backup, which it never touches.
+  `GET /api/flap/soak/snapshot` (add `?meta=1` for just what is in it),
+  `POST /api/flap/soak/rollback`.
+
   Nothing it sends moves a flap, and display content is paused for the run. The report is a
   list of findings, not a scoreboard: each one names the modules, the evidence, and what to do
   about it — long frames lost but short ones fine reads as termination and cable; misses at
@@ -45,7 +52,8 @@ Maintenance that happens by itself, and a soak test for the whole wall.
   to run over one another.
 
   A module whose own values could not be confirmed restored keeps them in the report, so
-  nothing is lost silently. `tools/soak_sim.py` in the repo models a flaky bus — termination,
+  nothing is lost silently, and the rollback above covers the whole wall.
+  `tools/soak_sim.py` in the repo models a flaky bus — termination,
   contact, a duplicated ID, a worn EEPROM, a silent module — and prints the status JSON, so the
   report can be worked on without a wall to break.
 

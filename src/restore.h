@@ -56,6 +56,7 @@ struct RestoreFileInfo {
 };
 
 extern RestoreProgress gRestore;
+extern char gRestoreSrc[32];      // the backup file the current/next run replays
 extern RestoreFileInfo gRestoreFile;
 
 // True while the gateway must refuse other bus commands.
@@ -78,6 +79,17 @@ bool restoreValidateFile(const char* path, RestoreFileInfo* info, char* err, siz
 // Start a run `delayMs` from now. Returns false (and sets `err`) if one is already
 // running, there is no usable file, or the task could not be created.
 bool restoreStart(unsigned long delayMs, const char* trigger, char* err, size_t errLen);
+// The same, from a backup file other than the stored one -- the soak test's pre-run
+// snapshot (SOAK_SNAPSHOT_FILE). The file is validated before the bus is locked.
+bool restoreStartFrom(const char* path, unsigned long delayMs, const char* trigger,
+                      char* err, size_t errLen);
+// Read every provisioned module's calibration and write it to `path` in the backup format,
+// so it can be replayed by restoreStartFrom. Sends only read commands; nothing moves.
+// `done`/`total`/`okOut` (all optional) track progress for a caller polling from elsewhere.
+// Returns false, with a reason in `err`, only if NOTHING could be written; a module that
+// does not answer is left out of the file and counted in `okOut` versus `total`.
+bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* total,
+                          volatile int* okOut, char* err, size_t errLen);
 // Ask a running restore to stop after the current step. Returns false if none is running.
 bool restoreCancel();
 // Delete the stored backup. Returns false if a run is in progress.

@@ -771,6 +771,19 @@ static void soakBroadcast(char cmd, int k) {
 }
 
 static void taskSoak(void* pv) {
+  // 0. The safety net, before anything is written: every module's calibration to flash.
+  //    A module that will not answer here is simply not covered -- it is still soaked, and
+  //    the write leg keeps its own before-values in the row either way.
+  busHold("soak", BUS_BUSY, 180000UL);
+  gSoak.snapRunning = true;
+  gSoak.snapErr[0]  = 0;
+  gSoak.snapOkFlag  = restoreWriteSnapshot(SOAK_SNAPSHOT_FILE, &gSoak.snapDone, &gSoak.snapTotal,
+                                           &gSoak.snapOk, gSoak.snapErr, sizeof(gSoak.snapErr));
+  gSoak.snapRunning = false;
+  if (!gSoak.snapOkFlag)
+    printf("[SOAK] no safety snapshot (%s) -- writes will still record each module's "
+           "before-values, but there is nothing to roll back to\n", gSoak.snapErr);
+
   // Per-pass order. The quick single-module sizes come first so even a short run covers
   // them; the write leg closes the cycle. Index k into SoakRow.tries/ok: v Q d A W V B.
   static const struct { char cmd; int k; } kPass[SOAK_STEPS] =
@@ -868,6 +881,8 @@ bool sfSoakStart(int minutes) {
   gSoak.elapsedMs = 0; gSoak.dropsBefore = rxDropped; gSoak.rejectsBefore = sfParseRejects;
   gSoak.dropsDuring = 0; gSoak.rejectsDuring = 0;
   gSoak.cancel = false; gSoak.done = false; gSoak.active = true;
+  gSoak.snapRunning = false; gSoak.snapOkFlag = false;
+  gSoak.snapDone = 0; gSoak.snapTotal = 0; gSoak.snapOk = 0; gSoak.snapErr[0] = 0;
   busHold("soak", BUS_BUSY, 180000UL);
   if (xTaskCreatePinnedToCore(taskSoak, "Soak", 4096, NULL, 1, &hTaskSoak, 1) != pdPASS) {
     hTaskSoak = NULL; gSoak.active = false; busRelease("soak"); return false;

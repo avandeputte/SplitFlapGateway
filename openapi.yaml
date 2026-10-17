@@ -1709,6 +1709,11 @@ paths:
         deadline or on cancel, never in the middle of a write round trip. Refuses to start (409)
         while a probe, self-test or calibration owns the bus. The dashboard offers 5/10/20/30
         minutes; the API takes 1-60.
+
+        Before the first write it reads every provisioned module's calibration into a snapshot
+        file on the gateway (progress in `snap` on the status reply), so the run can be undone
+        with `/api/flap/soak/rollback`. The snapshot is separate from the stored restore backup
+        and never overwrites it.
       requestBody:
         required: false
         content:
@@ -1731,6 +1736,66 @@ paths:
                   minutes: { type: integer, example: 10 }
         "409":
           description: Something else owns the bus
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/flap/soak/snapshot:
+    get:
+      tags: [Status]
+      summary: The calibration the soak test read before it wrote anything (v3.15)
+      description: |
+        The pre-run snapshot, in the same format as a calibration backup, so it can be kept or
+        replayed later through the ordinary restore upload. With `?meta=1` it returns only what
+        is in the file. Separate from the stored restore backup.
+      parameters:
+        - name: meta
+          in: query
+          required: false
+          schema: { type: string }
+          description: Any value returns the summary instead of the file.
+      responses:
+        "200":
+          description: The snapshot file, or its summary with `?meta=1`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean }
+                  exists:  { type: boolean }
+                  bytes:   { type: integer }
+                  modules: { type: integer, description: "Usable entries" }
+                  entries: { type: integer }
+                  created: { type: string }
+        "404":
+          description: No snapshot stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/flap/soak/rollback:
+    post:
+      tags: [Status]
+      summary: Put every module back to the pre-soak snapshot (v3.15)
+      description: |
+        Replays the snapshot through the same per-entry restore the boot restore uses: writes
+        each module's calibration by serial number, reads it back, compares, and homes the wall.
+        Takes the EXCLUSIVE bus hold for its duration; follow it on `/api/restore`. For the case
+        the soak report calls out: a value it wrote that could not be confirmed put back.
+      responses:
+        "200":
+          description: Started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  started: { type: boolean, example: true }
+                  source:  { type: string, example: "soak snapshot" }
+        "409":
+          description: The soak is still running, a restore is already running, or there is no usable snapshot
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1776,6 +1841,16 @@ paths:
                   writes:      { type: integer, description: "Write round trips run" }
                   restoreFail: { type: integer, description: "Written values that could NOT be confirmed put back (see rows[].alt)" }
                   dups:        { type: integer, description: "Broadcast replies beyond the first from one id" }
+                  snap:
+                    type: object
+                    description: "The pre-run safety snapshot (v3.15)"
+                    properties:
+                      running: { type: boolean, description: "The snapshot sweep is in progress; the test itself has not begun" }
+                      ok:      { type: boolean, description: "A usable snapshot exists for this run" }
+                      done:    { type: integer, description: "Modules swept" }
+                      total:   { type: integer, description: "Modules to sweep" }
+                      modules: { type: integer, description: "Modules actually captured" }
+                      err:     { type: string,  description: "Why no snapshot was taken, when ok is false" }
                   stray:       { type: integer, description: "Broadcast replies from ids not in the module table" }
                   rows:
                     type: array

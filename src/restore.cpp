@@ -384,11 +384,11 @@ static void taskRestore(void* pv) {
   if (gRestoreCancel) { restoreFinish(RESTORE_CANCELLED); hTaskRestore = NULL; vTaskDelete(NULL); }
 
   gRestore.startedMs = millis();
-  printf("[RESTORE] starting (%s) from %s\n", gRestore.trigger, RESTORE_FILE);
+  printf("[RESTORE] starting (%s) from %s\n", gRestore.trigger, gRestoreSrc);
 
   // 2. Load the backup.
   JsonDocument doc(&gJsonAlloc);
-  const char* why = restoreLoadDoc(doc, RESTORE_FILE, NULL);
+  const char* why = restoreLoadDoc(doc, gRestoreSrc, NULL);
   if (why) {
     strlcpy(gRestore.lastError, why, sizeof(gRestore.lastError));
     printf("[RESTORE] cannot start: %s\n", why);
@@ -483,12 +483,132 @@ static void taskRestore(void* pv) {
   vTaskDelete(NULL);
 }
 
+// Which file the next/current run replays. Only ever written while no run is in flight.
+char gRestoreSrc[32] = RESTORE_FILE;
+
+// Read every provisioned module and write the backup JSON. One entry per module that
+// answers; the combined 'A' read is preferred (it carries the flap set) and a plain 'd'
+// read is the fallback, exactly as GET /api/flap/all does.
+bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* total,
+                          volatile int* okOut, char* err, size_t errLen) {
+  if (!sfFsReady) { strlcpy(err, "no filesystem", errLen); return false; }
+  // The module list is copied first: the sweep below takes seconds and must not hold the lock.
+  // static, not on the stack: MAX_MODULES entries are several KB and the soak task that calls
+  // this has 4 KB. Only one snapshot ever runs at a time (the soak holds the bus).
+  static struct { uint8_t id; char sn[21]; int fw; } list[MAX_MODULES];
+  int n = 0;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {
+    if (!sfModules[i].provisioned || sfModules[i].id == 255) continue;
+    list[n].id = sfModules[i].id;
+    strlcpy(list[n].sn, sfModules[i].serialNum, sizeof(list[n].sn));
+    const char* v = (sfModules[i].fwVersion[0] == 'v' || sfModules[i].fwVersion[0] == 'V')
+                    ? sfModules[i].fwVersion + 1 : sfModules[i].fwVersion;
+    list[n].fw = atoi(v);
+    n++;
+  }
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  if (total) *total = n;
+  if (done)  *done  = 0;
+  if (okOut) *okOut = 0;
+  if (!n) { strlcpy(err, "no provisioned modules", errLen); return false; }
+
+  FFat.remove(path);
+  File f = FFat.open(path, "w");
+  if (!f) { strlcpy(err, "cannot write snapshot", errLen); return false; }
+
+  char created[32] = "";
+  if (rtcNow.valid)
+    snprintf(created, sizeof(created), "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             rtcNow.year, rtcNow.month, rtcNow.day, rtcNow.hour, rtcNow.minute, rtcNow.second);
+  f.printf("{\"version\":1,\"created\":\"%s\",\"source\":\"soak\",\"modules\":[", created);
+
+  static char dump[TX_MAX_BYTES];
+  static char utf8[SF_MAX_FLAPS * 3 + 8];
+  int ok = 0;
+  for (int i = 0; i < n; i++) {
+    char frame[48];
+    bool got = false;
+    if (list[i].sn[0]) snprintf(frame, sizeof(frame), "mXA%s\n", list[i].sn);
+    else               snprintf(frame, sizeof(frame), "m%dA\n", list[i].id);
+    if (list[i].fw == 0 || list[i].fw >= 25)
+      got = sfSendAndCaptureDump(list[i].id, frame, 1400, dump, sizeof(dump));
+    if (!got) {                                  // 'A' refused or lost: the shorter read
+      if (list[i].sn[0] && list[i].fw >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", list[i].sn);
+      else                                   snprintf(frame, sizeof(frame), "m%dd\n", list[i].id);
+      got = sfSendAndCaptureDump(list[i].id, frame, 1400, dump, sizeof(dump));
+    }
+    if (got && dump[0]) {
+      // Only an 'A' read carries a flap set, and only a self-consistent one is written --
+      // the same rule the restore parser applies (a lost tail must not be replayed).
+      int  fc = gDump.flapCount;
+      utf8[0] = 0;
+      if (fc >= 1 && fc <= SF_MAX_FLAPS && gDump.flapChars[0] &&
+          (int)strlen((const char*)gDump.flapChars) == fc)
+        flapToJsonUtf8((const char*)gDump.flapChars, strlen((const char*)gDump.flapChars),
+                       utf8, sizeof(utf8));
+      else fc = 0;
+      f.printf("%s{\"id\":%d,\"sn\":\"%s\",\"dump\":\"%s\"", ok ? "," : "",
+               (int)list[i].id, list[i].sn, dump);
+      if (fc) f.printf(",\"flapCount\":%d,\"flapChars\":\"%s\"", fc, utf8);
+      f.print("}");
+      ok++;
+      if (okOut) *okOut = ok;
+    } else {
+      printf("[SOAK] snapshot: module %d did not answer -- left out of %s\n", (int)list[i].id, path);
+    }
+    if (done) *done = i + 1;
+    wdgWebMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(120));
+  }
+  f.print("]}");
+  size_t bytes = f.size();
+  f.close();
+  printf("[SOAK] snapshot: %d of %d module(s) written to %s (%u B)\n", ok, n, path, (unsigned)bytes);
+  if (!ok) {
+    FFat.remove(path);
+    strlcpy(err, "no module answered the snapshot read", errLen);
+    return false;
+  }
+  return true;
+}
+
+bool restoreStartFrom(const char* path, unsigned long delayMs, const char* trigger,
+                      char* err, size_t errLen) {
+  if (restoreBusy() || hTaskRestore) { strlcpy(err, "restore already running", errLen); return false; }
+  RestoreFileInfo info;
+  if (!restoreValidateFile(path, &info, err, errLen)) return false;
+  if (info.modules == 0) { strlcpy(err, "that backup is unusable", errLen); return false; }
+  strlcpy(gRestoreSrc, path, sizeof(gRestoreSrc));
+  gRestoreCancel = false;
+  gRestore.total = 0;      gRestore.done = 0;
+  gRestore.okCount = 0;    gRestore.mismatch = 0;
+  gRestore.missing = 0;    gRestore.skipped = 0;
+  gRestore.startedMs = 0;  gRestore.finishedMs = 0;
+  gRestore.lastError[0] = 0;
+  strlcpy(gRestore.trigger, trigger, sizeof(gRestore.trigger));
+  gRestore.startAtMs = millis() + delayMs;
+  gRestore.state     = RESTORE_WAITING;
+  busHold("restore", BUS_EXCLUSIVE, delayMs + 120000UL);
+  if (xTaskCreatePinnedToCore(taskRestore, "Restore", 8192, NULL, 1, &hTaskRestore, 1) != pdPASS) {
+    hTaskRestore = NULL;
+    gRestore.state = RESTORE_FAILED;
+    strlcpy(gRestore.lastError, "could not start restore task", sizeof(gRestore.lastError));
+    strlcpy(err, gRestore.lastError, errLen);
+    return false;
+  }
+  printf("[RESTORE] scheduled (%s) in %lu ms from %s: %d module(s), bus locked\n",
+         trigger, delayMs, path, info.modules);
+  return true;
+}
+
 bool restoreStart(unsigned long delayMs, const char* trigger, char* err, size_t errLen) {
   if (restoreBusy() || hTaskRestore) { strlcpy(err, "restore already running", errLen); return false; }
   if (!gRestoreFile.exists || gRestoreFile.modules == 0) {
     strlcpy(err, gRestoreFile.exists ? "stored backup is unusable" : "no backup stored", errLen);
     return false;
   }
+  strlcpy(gRestoreSrc, RESTORE_FILE, sizeof(gRestoreSrc));
   gRestoreCancel = false;
   gRestore.total = 0;      gRestore.done = 0;
   gRestore.okCount = 0;    gRestore.mismatch = 0;

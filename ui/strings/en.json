@@ -412,6 +412,7 @@
  "WiFi saved - reconnecting...": "WiFi saved - reconnecting...",
  "Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …). Each glyph is one flap, and index 0 is the blank/home flap.": "Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …). Each glyph is one flap, and index 0 is the blank/home flap.",
  "Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …). Each glyph is one flap.": "Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …). Each glyph is one flap.",
+ "Write the calibration from the pre-test snapshot back to every module? The wall is locked while it runs, and homes afterwards.": "Write the calibration from the pre-test snapshot back to every module? The wall is locked while it runs, and homes afterwards.",
  "Writing": "Writing",
  "Yes -- home is confirmed, start wizard": "Yes -- home is confirmed, start wizard",
  "Yes -- step count is confirmed": "Yes -- step count is confirmed",

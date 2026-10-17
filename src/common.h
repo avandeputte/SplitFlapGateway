@@ -298,6 +298,9 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 #define DEFAULT_STEP_MS           15
 #define STEP_MS_MAX               100
 #define RESTORE_FILE              "/restore.bak"
+// The soak test writes every module's calibration here before it touches anything, so a run
+// that cannot put a value back can be undone from the gateway alone (see restore.h).
+#define SOAK_SNAPSHOT_FILE        "/soakpre.bak"
 #define RESTORE_TMP               "/restore.tmp"
 #define RESTORE_MAX_BYTES         (256UL * 1024UL)
 #define RESTORE_DEFAULT_DELAY_S   10       // seconds after boot before the replay starts
