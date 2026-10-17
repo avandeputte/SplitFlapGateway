@@ -215,7 +215,7 @@
  "Look at the module. If it is centered, confirm. If not, nudge until it is.": "Look at the module. If it is centered, confirm. If not, nudge until it is.",
  "Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.": "Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.",
  "Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.": "Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.",
- "MAINTENANCE MODE - external MQTT commands are being ignored": "MAINTENANCE MODE - external MQTT commands are being ignored",
+ "MAINTENANCE - display content is paused": "MAINTENANCE - display content is paused",
  "MQTT": "MQTT",
  "MQTT saved - reconnecting...": "MQTT saved - reconnecting...",
  "Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.": "Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.",

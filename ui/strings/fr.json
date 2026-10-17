@@ -186,7 +186,6 @@
  "Look at the module. If it is centered, confirm. If not, nudge until it is.": "Regardez le module. S'il est centré, confirmez. Sinon, ajustez jusqu'à ce qu'il le soit.",
  "Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.": "Regardez le mur. Cliquez sur tout module affichant la mauvaise palette pour l'ajuster (mêmes commandes que le réglage d'un seul module), puis passez à la palette suivante.",
  "Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.": "Plus petite pile libre jamais atteinte parmi les tâches. Une tendance vers 0 annonce un dépassement de pile avant le plantage.",
- "MAINTENANCE MODE - external MQTT commands are being ignored": "MODE MAINTENANCE - les commandes MQTT externes sont ignorées",
  "MQTT saved - reconnecting...": "MQTT enregistré - reconnexion...",
  "Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.": "Le mode maintenance est fortement recommandé avant le calibrage, afin que des commandes externes reçues via MQTT ne puissent pas déplacer les rouleaux en plein calibrage.",
  "Matches default -- cleared custom value.": "Identique à la valeur par défaut -- valeur personnalisée effacée.",

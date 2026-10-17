@@ -180,7 +180,6 @@
  "Look at the module. If it is centered, confirm. If not, nudge until it is.": "Katso moduulia. Jos se on keskellä, vahvista. Jos ei, hienosäädä kunnes se on.",
  "Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.": "Katso seinää. Napsauta mitä tahansa väärää läppää näyttävää moduulia hienosäätääksesi sitä (samat säätimet kuin yhden moduulin säädössä) ja siirry sitten seuraavaan läppään.",
  "Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.": "Pienin koskaan vapaana ollut pino kaikkien tehtävien kesken. Kohti nollaa laskeva arvo varoittaa pinon ylivuodosta ennen kaatumista.",
- "MAINTENANCE MODE - external MQTT commands are being ignored": "HUOLTOTILA - ulkoiset MQTT-komennot ohitetaan",
  "MQTT saved - reconnecting...": "MQTT tallennettu - yhdistetään uudelleen...",
  "Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.": "Huoltotila on erittäin suositeltavaa ottaa käyttöön ennen kalibrointia, jotta MQTT:n kautta saapuvat ulkoiset komennot eivät voi liikuttaa rullia kesken kalibroinnin.",
  "Matches default -- cleared custom value.": "Vastaa oletusta -- mukautettu arvo poistettiin.",

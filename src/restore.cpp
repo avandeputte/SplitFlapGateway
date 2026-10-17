@@ -367,6 +367,7 @@ static uint8_t restoreVerifyOne(const RestoreEntry& e) {
 
 static void restoreFinish(uint8_t state) {
   gDump.waitId       = -1;
+  busRelease("restore");
   gRestore.finishedMs = millis();
   gRestore.state      = state;
   printf("[RESTORE] %s: %d ok, %d mismatch, %d missing, %d skipped of %d (%lus)\n",
@@ -407,6 +408,7 @@ static void taskRestore(void* pv) {
   // 3. Write phase: fire-and-forget, paced.
   gRestore.state = RESTORE_WRITING;
   gRestore.done  = 0;
+  busHold("restore", BUS_EXCLUSIVE, 120000UL + 4000UL * (unsigned long)total);
   {
     int i = 0;
     for (JsonObjectConst o : mods) {
@@ -429,6 +431,7 @@ static void taskRestore(void* pv) {
 
   // 4. Verify phase, with one repair round for anything that did not match.
   gRestore.state = RESTORE_VERIFYING;
+  busHold("restore", BUS_EXCLUSIVE, 120000UL + 6000UL * (unsigned long)total);
   for (int round = 0; round <= RESTORE_REPAIR_ROUNDS && !gRestoreCancel; round++) {
     gRestore.done = 0;
     int i = 0;
@@ -495,6 +498,7 @@ bool restoreStart(unsigned long delayMs, const char* trigger, char* err, size_t 
   strlcpy(gRestore.trigger, trigger, sizeof(gRestore.trigger));
   gRestore.startAtMs = millis() + delayMs;
   gRestore.state     = RESTORE_WAITING;   // the lock is held from this moment
+  busHold("restore", BUS_EXCLUSIVE, delayMs + 120000UL);   // renewed at each phase below
   // Priority 1 (like the network task); core 1 so it never competes with the RS-485
   // receive task on core 0. 8 KB: the JSON lives in PSRAM, the frames are static.
   if (xTaskCreatePinnedToCore(taskRestore, "Restore", 8192, NULL, 1, &hTaskRestore, 1) != pdPASS) {

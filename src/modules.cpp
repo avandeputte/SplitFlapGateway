@@ -607,6 +607,7 @@ static void taskProbe(void* pv) {
   }
   gProbe.dropsDuring = rxDropped - gProbe.dropsBefore;
   gProbe.elapsedMs   = millis() - gProbe.startedMs;
+  busRelease("probe");
   gProbe.active      = false;
   gProbe.done        = true;
   printf("[PROBE] module %d: v %d/%d, Q %d/%d, d %d/%d (%dB), A %d/%d (%dB), %lu dropped frames\n",

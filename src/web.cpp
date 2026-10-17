@@ -32,6 +32,9 @@ static void handleApiFactoryReset();
 static void handleApiFactoryResetBySN();
 static void handleApiFlapConfig();
 static void handleApiProbe();
+static void handleApiBus();
+static void handleApiBusHold();
+static void handleApiBusRelease();
 static void handleApiProbeStatus();
 static void handleApiGoto();
 static void handleApiHome();
@@ -81,20 +84,35 @@ static void sendJsonError(int code, const char* msg) {
   server.send(code, "application/json", buf);
 }
 
-// Restore-on-boot lock (v3.12): while a stored backup is being replayed, every route that
-// would touch the bus answers 503 instead of running. webInit() applies it by wrapping
-// each such handler in BUSGATED(); read-only routes, settings, status and the page itself
-// are left alone so the dashboard keeps working and the run can be watched or cancelled.
-static bool restoreGate() {
-  if (!restoreBusy()) return false;
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  char buf[96];
-  snprintf(buf, sizeof(buf), "{\"error\":\"restore in progress\",\"restore\":\"%s\"}",
-           restoreStateName());
-  server.send(503, "application/json", buf);
-  return true;
+/* Bus gates (v3.15; see bus.h). Two strengths, applied per route in webInit():
+     BUSGATED(fn)      refused while the bus is EXCLUSIVE (a restore) -- every bus-touching route.
+     CONTENTGATED(fn)  additionally refused while the bus is BUSY, unless the caller is this
+                       gateway's own dashboard -- the display routes a content driver uses.
+   Read-only routes, settings, status and the page itself are never gated, so the operator can
+   always watch, cancel, or turn maintenance off. */
+static bool busIsOperator() {
+  // The dashboard tags every request it makes (a window.fetch wrapper in index.html). Anything
+  // without the tag -- the companion, a script, Home Assistant's REST calls -- is content.
+  return server.hasHeader("X-SF-Client") && server.header("X-SF-Client") == "dashboard";
 }
-#define BUSGATED(fn) ([]() { if (restoreGate()) return; fn(); })
+static void sendBusyError(const char* why) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  char buf[160];
+  snprintf(buf, sizeof(buf), "{\"error\":\"%s\",\"reason\":\"%s\",\"level\":%d,\"remaining\":%ld}",
+           why, busReason(), (int)busLevel(), busRemainingSec());
+  server.send(503, "application/json", buf);
+}
+static bool exclusiveGate() {
+  if (!busExclusive()) return false;
+  sendBusyError("bus is reserved"); return true;
+}
+static bool contentGate() {
+  if (busExclusive()) { sendBusyError("bus is reserved"); return true; }
+  if (busBusy() && !busIsOperator()) { sendBusyError("maintenance in progress -- display content is paused"); return true; }
+  return false;
+}
+#define BUSGATED(fn)     ([]() { if (exclusiveGate()) return; fn(); })
+#define CONTENTGATED(fn) ([]() { if (contentGate())   return; fn(); })
 
 // -- GET /  (main dashboard)
 // Browser tab icon (favicon): a split-flap tile -- two flaps, the signature
@@ -545,6 +563,7 @@ static void handleApiCalibrate() {
     return;
   }
 
+  busHold("calibration", BUS_BUSY, 25000);   // the reel measures a revolution (~6-15 s)
   // Arm the capture slot and the job, then send the calibrate command.
   gCalib.steps       = 0;
   gCalib.ts   = 0;
@@ -596,6 +615,7 @@ static void handleApiDiag() {
   gDiag.t.ts         = 0;
   gDiag.t.code       = -1;
   gDiag.t.waitId     = id;
+  busHold("diagnostics", BUS_BUSY, 150000);   // T ~20 s, M up to ~80 s at 20 rotations
   gDiag.jobActive   = true;
   gDiag.jobId       = id;
   gDiag.jobKind     = 'T';
@@ -653,6 +673,7 @@ static void handleApiDiagMech() {
   gDiag.m.code       = -1;
   gDiag.m.revs[0]    = 0;
   gDiag.m.waitId     = id;
+  busHold("diagnostics", BUS_BUSY, 150000);   // T ~20 s, M up to ~80 s at 20 rotations
   gDiag.jobActive   = true;
   gDiag.jobId       = id;
   gDiag.jobKind     = 'M';
@@ -849,6 +870,7 @@ static void handleApiProvision() {
   const char* sn = doc["sn"] | "";
   int newId = doc["id"] | -1;
   if (!sn[0] || newId < 0) { sendJsonError(400, "sn and id required"); return; }
+  busHold("provisioning", BUS_BUSY, 15000);   // the module restarts; keep content off it meanwhile
   sfProvision(sn, newId);
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1254,8 +1276,11 @@ static void handleApiStatus() {
   // v3.0: seconds since the companion last checked in (-1 = never / deregistered)
   long compAge = gCompanionSeenMs ? (long)((millis() - gCompanionSeenMs) / 1000UL) : -1;
   char rst[112];                       // v3.12: {"state","done","total","startsIn"}
+  char bst[96];                        // v3.15: {"level","reason","remaining"}
+  snprintf(bst, sizeof(bst), "{\"level\":%d,\"reason\":\"%s\",\"remaining\":%ld}",
+           (int)busLevel(), busReason(), busRemainingSec());
   restoreStatusJson(rst, sizeof(rst), false);
-  char out[1024];
+  char out[1152];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
@@ -1263,7 +1288,7 @@ static void handleApiStatus() {
     "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
     "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s,"
-    "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu}}",
+    "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu,\"lock\":%s}}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -1277,7 +1302,7 @@ static void handleApiStatus() {
     gMaintenanceMode?"true":"false",
     gQuietTime?"true":"false",
     gCompanionStatus, compAge, rst,
-    sfParseRejects, rxDropped, rxDropBytes, rxMaxLen);
+    sfParseRejects, rxDropped, rxDropBytes, rxMaxLen, bst);
   server.send(200, "application/json", out);
 }
 
@@ -2012,6 +2037,7 @@ static void handleApiProbe() {
     return;
   }
   if (!sfProbeStart(id, rounds)) { sendJsonError(500, "could not start probe"); return; }
+  busHold("probe", BUS_BUSY, 60000);          // the task renews and releases it
   char out[64];
   snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d}", id);
   server.send(200, "application/json", out);
@@ -2038,10 +2064,56 @@ static void handleApiProbeStatus() {
   server.send(200, "application/json", out);
 }
 
+/* GET /api/bus -- who holds the bus. POST /api/bus/hold {"reason":"backup","seconds":30}
+   takes or renews a BUSY lease (the dashboard renews one during a backup sweep and while the
+   Calibration tab is open); POST /api/bus/release {"reason":"backup"} drops it. Leases are
+   capped so a forgotten renewal expires on its own. Reasons the firmware owns cannot be taken
+   or released this way. */
+static bool busReasonIsClientOwned(const char* r) {
+  return strcmp(r, "restore") && strcmp(r, "maintenance") && strcmp(r, "probe") &&
+         strcmp(r, "soak") && strcmp(r, "diagnostics") && strcmp(r, "identify");
+}
+static void handleApiBus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  static char out[384];
+  busStatusJson(out, sizeof(out));
+  server.send(200, "application/json", out);
+}
+static void handleApiBusHold() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
+  const char* reason = doc["reason"] | "";
+  int secs = doc["seconds"] | 30;
+  if (!reason[0] || strlen(reason) >= BUS_REASON_MAX) { sendJsonError(400, "reason required (1-19 chars)"); return; }
+  if (!busReasonIsClientOwned(reason)) { sendJsonError(400, "that reason is owned by the firmware"); return; }
+  if (secs < 5) secs = 5;
+  if (secs > 300) secs = 300;        // a client must keep renewing; nothing is held forever by accident
+  if (!busHold(reason, BUS_BUSY, (unsigned long)secs * 1000UL)) { sendJsonError(503, "no free hold slot"); return; }
+  static char out[384];
+  busStatusJson(out, sizeof(out));
+  server.send(200, "application/json", out);
+}
+static void handleApiBusRelease() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
+  const char* reason = doc["reason"] | "";
+  if (!reason[0]) { sendJsonError(400, "reason required"); return; }
+  if (!busReasonIsClientOwned(reason)) { sendJsonError(400, "that reason is owned by the firmware"); return; }
+  busRelease(reason);
+  static char out[384];
+  busStatusJson(out, sizeof(out));
+  server.send(200, "application/json", out);
+}
+
 // POST /api/flap/identify
 static void handleApiIdentify() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   DBG("[API] identify all -- clearing registry and broadcasting m*v\n");
+  busHold("identify", BUS_BUSY, 20000);       // the staggered reply train must not be stepped on
   // Wipe both the in-memory list and the persisted copy, then re-discover.
   sfModulesClear();
   rs485SendStr("m*v\n");
@@ -2126,6 +2198,9 @@ static void handleApiMaintenance() {
     }
     if (!doc["on"].is<bool>()) { sendJsonError(400, "'on' (bool) required"); return; }
     gMaintenanceMode = doc["on"].as<bool>();
+    // The manual switch is one hold among the automatic ones (bus.h): busy, with no expiry,
+    // for a long session no single operation covers. Turning it off releases only this hold.
+    if (gMaintenanceMode) busHold("maintenance", BUS_BUSY, 0); else busRelease("maintenance");
     printf("[MAINT] Maintenance mode %s\n", gMaintenanceMode ? "ENABLED" : "disabled");
     mqttPublishStateTopics();
   }
@@ -2139,7 +2214,7 @@ static void handleApiMaintenance() {
 static void handleApiQuiet() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (server.method() == HTTP_POST) {
-    if (restoreGate()) return;     // quiet ON homes the wall: a bus command
+    if (contentGate()) return;     // quiet ON homes the wall: content, by any other name
     if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
@@ -2556,8 +2631,8 @@ static void handleApiRestoreBackupPut() {
 }
 
 void webInit() {
-  static const char* COLLECT_HDRS[] = { "If-None-Match" };
-  server.collectHeaders(COLLECT_HDRS, 1);   // so handleRoot can honour conditional GETs
+  static const char* COLLECT_HDRS[] = { "If-None-Match", "X-SF-Client" };
+  server.collectHeaders(COLLECT_HDRS, 2);   // conditional GETs, and the dashboard's X-SF-Client tag
   server.on("/",                     HTTP_GET,     handleRoot);
   server.on("/favicon.svg",          HTTP_GET,     handleFavicon);
   server.on("/logo.svg",             HTTP_GET,     handleLogo);
@@ -2571,23 +2646,23 @@ void webInit() {
   server.on("/ota",                  HTTP_GET,     handleOTAPage);
   server.on("/api/ota/upload",       HTTP_POST,    sendOTAUploadResult, handleOTAUpload);
   server.on("/api/rs485/messages",   HTTP_GET,     handleApiMessages);
-  server.on("/api/rs485/send",       HTTP_POST,    BUSGATED(handleApiSend));
+  server.on("/api/rs485/send",       HTTP_POST,    CONTENTGATED(handleApiSend));
   server.on("/api/rs485/send",       HTTP_OPTIONS, handleOptions);
-  server.on("/api/rs485/batch",      HTTP_POST,    BUSGATED(handleApiSendBatch));
+  server.on("/api/rs485/batch",      HTTP_POST,    CONTENTGATED(handleApiSendBatch));
   server.on("/api/rs485/batch",      HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/modules",     HTTP_GET,     handleApiModules);
   server.on("/api/display/state",    HTTP_GET,     handleApiDisplayState);
-  server.on("/api/display/cells",    HTTP_POST,    BUSGATED(handleApiDisplayCells));
+  server.on("/api/display/cells",    HTTP_POST,    CONTENTGATED(handleApiDisplayCells));
   server.on("/api/display/cells",    HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/identify",    HTTP_POST,    BUSGATED(handleApiIdentify));
   server.on("/api/flap/identify",    HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/char",        HTTP_POST,    BUSGATED(handleApiChar));
+  server.on("/api/flap/char",        HTTP_POST,    CONTENTGATED(handleApiChar));
   server.on("/api/flap/char",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/index",       HTTP_POST,    BUSGATED(handleApiIndex));
+  server.on("/api/flap/index",       HTTP_POST,    CONTENTGATED(handleApiIndex));
   server.on("/api/flap/index",       HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/text",        HTTP_POST,    BUSGATED(handleApiText));
+  server.on("/api/flap/text",        HTTP_POST,    CONTENTGATED(handleApiText));
   server.on("/api/flap/text",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/home",        HTTP_POST,    BUSGATED(handleApiHome));
+  server.on("/api/flap/home",        HTTP_POST,    CONTENTGATED(handleApiHome));
   server.on("/api/flap/home",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/calibrate",   HTTP_POST,    BUSGATED(handleApiCalibrate));
   server.on("/api/flap/calibrate",   HTTP_OPTIONS, handleOptions);
@@ -2600,6 +2675,11 @@ void webInit() {
   server.on("/api/flap/probe",       HTTP_POST,    BUSGATED(handleApiProbe));
   server.on("/api/flap/probe",       HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/probe/status",HTTP_GET,     handleApiProbeStatus);
+  server.on("/api/bus",              HTTP_GET,     handleApiBus);
+  server.on("/api/bus/hold",         HTTP_POST,    handleApiBusHold);
+  server.on("/api/bus/hold",         HTTP_OPTIONS, handleOptions);
+  server.on("/api/bus/release",      HTTP_POST,    handleApiBusRelease);
+  server.on("/api/bus/release",      HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/version",     HTTP_POST,    BUSGATED(handleApiVersion));
   server.on("/api/flap/version",     HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/provision",   HTTP_POST,    BUSGATED(handleApiProvision));

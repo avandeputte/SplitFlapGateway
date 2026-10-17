@@ -269,6 +269,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     snprintf(ctl, sizeof(ctl), "%s/maintenance/set", cfg.mqttPrefix);
     if (strcmp(topic, ctl) == 0) {
       gMaintenanceMode = on;
+      if (on) busHold("maintenance", BUS_BUSY, 0); else busRelease("maintenance");
       printf("[MAINT] Maintenance mode %s (MQTT)\n", on ? "ENABLED" : "disabled");
       mqttPublishStateTopics();
       return;
@@ -284,9 +285,9 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
         mqttPublishStateTopics();
         return;
       }
-      // Quiet ON homes the wall, which is a bus command: refused while a restore runs.
-      if (restoreBusy()) {
-        printf("[QUIET] MQTT quiet/set ignored -- restore in progress\n");
+      // Quiet ON homes the wall: content by another name, refused while the bus is held.
+      if (busBusy()) {
+        printf("[QUIET] MQTT quiet/set ignored -- bus held by '%s'\n", busReason());
         mqttPublishStateTopics();
         return;
       }
@@ -295,17 +296,10 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
       return;
     }
   }
-  // Restore-on-boot lock (v3.12): NOTHING reaches the bus until the replay is done.
-  // Unlike maintenance mode this also applies to the gateway's own REST API.
-  if (restoreBusy()) {
-    DBG("[MQTT] ignored (restore in progress): %s\n", topic);
-    return;
-  }
-  // Maintenance mode: ignore all externally-originated DISPLAY commands. Nothing
-  // from MQTT is relayed to the bus while this is on; only the gateway's own web
-  // UI / REST API can drive the display.
-  if (gMaintenanceMode) {
-    DBG("[MQTT] ignored (maintenance mode): %s\n", topic);
+  // Everything from MQTT is content, so any bus hold at all -- a restore, a running probe or
+  // self-test, a calibration session, the manual Maintenance switch -- drops it here (bus.h).
+  if (busBusy()) {
+    DBG("[MQTT] ignored (bus held by '%s'): %s\n", busReason(), topic);
     return;
   }
   if (length >= MQTT_BUF_SIZE) return;

@@ -167,7 +167,6 @@
  "Look at the module. If it is centered, confirm. If not, nudge until it is.": "Kig på modulet. Hvis det er centreret, så bekræft. Hvis ikke, så finjustér, indtil det er.",
  "Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.": "Kig på væggen. Klik på et modul, der viser den forkerte flap, for at finjustere det (samme kontroller som i enkeltmodul-justeringen), og gå derefter videre til næste flap.",
  "Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.": "Laveste frie stak nogensinde på tværs af opgaver. Nærmer den sig 0, advarer det om et stak-overløb, før det crasher.",
- "MAINTENANCE MODE - external MQTT commands are being ignored": "VEDLIGEHOLDELSESTILSTAND - eksterne MQTT-kommandoer ignoreres",
  "MQTT saved - reconnecting...": "MQTT gemt - genopretter forbindelse...",
  "Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.": "Vedligeholdelsestilstand anbefales kraftigt før kalibrering, så eksterne kommandoer via MQTT ikke kan flytte rullerne midt i kalibreringen.",
  "Matches default -- cleared custom value.": "Matcher standard -- brugerdefineret værdi ryddet.",
