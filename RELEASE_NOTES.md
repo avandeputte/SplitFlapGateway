@@ -18,6 +18,13 @@
   Affected the Status page clock and the `wt` wall-clock field on bus-monitor and MQTT frames.
   The Monitor tab was never wrong — it renders the UTC epoch in your browser's timezone.
 
+- **The Home, Info and Diagnostics icons on a module card were invisible in light mode**
+  ([#4](https://github.com/avandeputte/SplitFlapGateway/issues/4)). The dashboard's generic
+  button rule sets white text, and `.micon` overrode the background, border and padding but
+  never the colour — so the icons were white on a white card, a contrast ratio of 1.00. Only the
+  destructive-actions icon was visible, because it sets its own red. They now take the theme's
+  text colour, which also covers their SVGs (drawn with `currentColor`). Dark mode is unchanged.
+
 ## v3.13.1 — 2026-09-25
 
 ### Fixed
