@@ -1262,9 +1262,13 @@ paths:
       tags: [Status]
       summary: Enable or disable maintenance mode
       description: |
-        When enabled, the gateway ignores all commands arriving via MQTT and
-        does not relay them to the RS-485 bus. The web UI / REST API continue to
-        work normally. Always resets to off on reboot (not persisted).
+        A manual hold on the bus with no expiry (v3.15; see `/api/bus`). While it is on, display
+        content is paused: MQTT display commands are dropped, and the display endpoints
+        (`/api/flap/char|index|text|home`, `/api/rs485/send|batch`, `/api/display/cells`, quiet ON)
+        answer `503` to any caller that does not send `X-SF-Client: dashboard`. Maintenance
+        operations themselves -- provisioning, calibration, dumps, self-tests -- keep working.
+        Since v3.15 those operations take the same hold **automatically** for their own duration,
+        so this switch is for a long session no single operation covers. Resets to off on reboot.
       requestBody:
         required: true
         content:
@@ -1553,6 +1557,227 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Bus hold & diagnostics (v3.14 / v3.15) ─────────────────────────
+
+  /api/bus:
+    get:
+      tags: [Status]
+      summary: Who holds the bus, and how hard
+      description: |
+        Every maintenance operation -- provisioning, calibration, self-tests, the probe and
+        soak, a backup sweep, a restore -- takes a hold on the bus automatically. While any
+        BUSY hold is in force, external display content is paused (the display endpoints answer
+        503 to callers without `X-SF-Client: dashboard`; MQTT display commands are dropped);
+        an EXCLUSIVE hold (a restore) refuses every bus route. Each hold has a reason and a
+        lease and expires on its own; only the manual Maintenance switch has no expiry.
+      responses:
+        "200":
+          description: The holds in force
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BusHolds" }
+
+  /api/bus/hold:
+    post:
+      tags: [Status]
+      summary: Take or renew a BUSY lease on the bus
+      description: |
+        For a client that runs a multi-step maintenance job of its own (the dashboard holds one
+        during a backup sweep and while its Calibration tab is open). The same reason renews in
+        place; a lease is capped at 300 s so a client must keep renewing -- nothing is held
+        forever by accident. Reasons the firmware owns (`restore`, `maintenance`, `probe`,
+        `soak`, `diagnostics`, `identify`) are refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:  { type: string, maxLength: 19, example: "backup" }
+                seconds: { type: integer, minimum: 5, maximum: 300, default: 30, example: 60 }
+      responses:
+        "200":
+          description: The holds in force after this one
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BusHolds" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/bus/release:
+    post:
+      tags: [Status]
+      summary: Release a lease taken with /api/bus/hold
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, example: "backup" }
+      responses:
+        "200":
+          description: The holds remaining
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BusHolds" }
+
+  /api/flap/probe:
+    post:
+      tags: [Status]
+      summary: Reply-size probe for one module (v3.14)
+      description: |
+        Asks the module for four replies of increasing size -- `v` (~32 B), `Q` (~19 B), `d`
+        (the EEPROM dump) and `A` (the combined dump, the longest reply a module sends) --
+        `rounds` times each, and records which came back and how big they were. Short replies
+        answering while long ones fail points at the bus (termination, length) rather than the
+        module. Runs on its own task; poll `/api/flap/probe/status`. Holds the bus (BUSY) for
+        the run, and refuses to start while a self-test, calibration or soak owns it (409).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:     { type: integer, minimum: 0, maximum: 254 }
+                rounds: { type: integer, minimum: 1, maximum: 10, default: 3 }
+      responses:
+        "200":
+          description: Started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  started: { type: boolean, example: true }
+                  id:      { type: integer, example: 11 }
+        "409":
+          description: Something else owns the bus
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/flap/probe/status:
+    get:
+      tags: [Status]
+      summary: Progress and result of the reply-size probe
+      responses:
+        "200":
+          description: Running progress, or the finished result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:   { type: string, enum: [idle, running, done] }
+                  id:      { type: integer }
+                  step:    { type: integer, description: "Steps completed" }
+                  total:   { type: integer, description: "rounds x 4" }
+                  elapsed: { type: integer, description: "ms" }
+                  drops:   { type: integer, description: "Frames discarded during the probe" }
+                  steps:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        cmd:   { type: string, enum: [v, Q, d, A] }
+                        tries: { type: integer }
+                        ok:    { type: integer }
+                        bytes: { type: integer, description: "Longest reply seen for this step; 0 = never answered" }
+
+  /api/flap/soak:
+    post:
+      tags: [Status]
+      summary: Whole-wall soak test (v3.15)
+      description: |
+        Asks every provisioned module, pass after pass, for replies of four different sizes
+        (`v`, `Q`, `d`, `A`, one size per pass) for `minutes`, keeping a tally per module per
+        size and counting discarded and corrupt frames over the run. Nothing it sends moves a
+        flap. Holds the bus (BUSY) for the run so content cannot interleave; stops at the
+        deadline or on cancel. Refuses to start (409) while a probe, self-test or calibration
+        owns the bus. The dashboard offers 5/10/20/30 minutes; the API takes 1-60.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                minutes: { type: integer, minimum: 1, maximum: 60, default: 10 }
+      responses:
+        "200":
+          description: Started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:      { type: boolean, example: true }
+                  started: { type: boolean, example: true }
+                  modules: { type: integer, example: 15 }
+                  minutes: { type: integer, example: 10 }
+        "409":
+          description: Something else owns the bus
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/flap/soak/cancel:
+    post:
+      tags: [Status]
+      summary: Stop the soak test after its current query
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "409":
+          description: No soak test running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/flap/soak/status:
+    get:
+      tags: [Status]
+      summary: Progress and per-module tally of the soak test
+      description: Streamed; the `rows` array has one entry per provisioned module.
+      responses:
+        "200":
+          description: Running progress, or the finished result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:     { type: string, enum: [idle, running, done, cancelled] }
+                  modules:   { type: integer }
+                  passes:    { type: integer }
+                  queries:   { type: integer }
+                  failures:  { type: integer }
+                  elapsed:   { type: integer, description: "ms" }
+                  remaining: { type: integer, description: "seconds, while running" }
+                  drops:     { type: integer, description: "Frames discarded during the run" }
+                  rejects:   { type: integer, description: "Frames that arrived corrupt during the run" }
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:     { type: integer }
+                        v:      { type: array, items: { type: integer }, description: "[ok, tries]" }
+                        Q:      { type: array, items: { type: integer }, description: "[ok, tries]" }
+                        d:      { type: array, items: { type: integer }, description: "[ok, tries]" }
+                        A:      { type: array, items: { type: integer }, description: "[ok, tries]" }
+                        max:    { type: integer, description: "Longest reply seen from this module" }
+                        streak: { type: integer, description: "Consecutive misses right now" }
+                        worst:  { type: integer, description: "Longest run of consecutive misses" }
 
   /api/companion:
     get:
@@ -1921,6 +2146,22 @@ components:
           description: "What the nav shows for it"
           example: "Calibration"
 
+    BusHolds:
+      type: object
+      description: The bus holds in force (v3.15).
+      properties:
+        level:     { type: integer, enum: [0, 1, 2], description: "Strongest hold: 0 free, 1 busy, 2 exclusive", example: 1 }
+        reason:    { type: string, example: "calibration" }
+        remaining: { type: integer, description: "Seconds left on the strongest hold; -1 = no expiry", example: 52 }
+        holds:
+          type: array
+          items:
+            type: object
+            properties:
+              reason:    { type: string, example: "calibration" }
+              level:     { type: integer, example: 1 }
+              remaining: { type: integer, example: 52 }
+
     RestoreStatus:
       type: object
       description: Restore-on-boot status (v3.12), as returned by every /api/restore endpoint.
@@ -2013,6 +2254,21 @@ components:
         ntpSynced: { type: boolean, example: true }
         maint:     { type: boolean, description: "true if maintenance mode is on (external MQTT commands ignored)", example: false }
         quiet:     { type: boolean, description: "true if quiet time is on (flaps do not move for display updates)", example: false }
+        bus:
+          type: object
+          description: "Bus health (v3.14) and the bus hold (v3.15)"
+          properties:
+            rejects:   { type: integer, description: "Frames that arrived complete but would not parse", example: 0 }
+            dropped:   { type: integer, description: "Frames discarded: longer than the receive buffer, or never terminated. Used to be silent", example: 0 }
+            dropBytes: { type: integer, description: "Size of the most recently discarded frame", example: 0 }
+            maxLen:    { type: integer, description: "Longest complete frame received since boot (limit 768)", example: 447 }
+            lock:
+              type: object
+              description: "Who holds the bus (v3.15). level 1 = busy: external display content is refused with 503, the dashboard (X-SF-Client: dashboard) is not; level 2 = exclusive: every bus route is refused"
+              properties:
+                level:     { type: integer, enum: [0, 1, 2], example: 0 }
+                reason:    { type: string, description: "maintenance, provisioning, calibration, diagnostics, probe, soak, backup, identify, restore, or a client's own", example: "" }
+                remaining: { type: integer, description: "Seconds left on the lease; -1 = no expiry (the manual switch); 0 = free", example: 0 }
         restore:
           type: object
           description: "Restore-on-boot progress (v3.12). While state is waiting/writing/verifying/homing every bus endpoint answers 503"
