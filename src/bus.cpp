@@ -12,7 +12,7 @@ static bool expired(const BusHold& h, unsigned long now) {
   return h.untilMs != 0 && (long)(now - h.untilMs) >= 0;
 }
 
-bool busHold(const char* reason, BusLevel level, unsigned long leaseMs) {
+bool busHold(const char* reason, BusLevel level, unsigned long leaseMs, uint32_t ownerIp) {
   if (!reason || !reason[0]) return false;
   unsigned long now = millis();
   unsigned long until = leaseMs ? now + leaseMs : 0;
@@ -22,6 +22,7 @@ bool busHold(const char* reason, BusLevel level, unsigned long leaseMs) {
     if (h.reason[0] && strcmp(h.reason, reason) == 0) {        // renew in place
       if (level > h.level) h.level = level;
       h.untilMs = until;
+      if (ownerIp) h.ownerIp = ownerIp;
       return true;
     }
     if (!h.reason[0] || expired(h, now)) { if (freeSlot < 0) freeSlot = i; }
@@ -29,10 +30,34 @@ bool busHold(const char* reason, BusLevel level, unsigned long leaseMs) {
   if (freeSlot < 0) { printf("[BUS] no free hold slot for '%s'\n", reason); return false; }
   BusHold& h = gHolds[freeSlot];
   strlcpy(h.reason, reason, sizeof(h.reason));
-  h.level = level; h.sinceMs = now; h.untilMs = until;
+  h.level = level; h.sinceMs = now; h.untilMs = until; h.ownerIp = ownerIp;
   printf("[BUS] held by '%s' (%s%s)\n", reason, level == BUS_EXCLUSIVE ? "exclusive" : "busy",
          leaseMs ? "" : ", no expiry");
   return true;
+}
+
+void busReleaseFirmware(const char* reason) {
+  if (!reason) return;
+  for (int i = 0; i < BUS_HOLD_SLOTS; i++)
+    if (gHolds[i].reason[0] && !gHolds[i].ownerIp && strcmp(gHolds[i].reason, reason) == 0) {
+      printf("[BUS] '%s' released by the sweep: its job is not running\n", reason);
+      gHolds[i].reason[0] = 0;
+    }
+}
+
+/* The safety net under every hold the firmware takes for itself.
+   A hold is a promise to release, and the release sits at the end of a task: a crash, an
+   early return or a long wind-down after a cancel all break that promise, and the wall then
+   stays paused until the lease runs out -- up to three minutes for the soak, which is what a
+   user saw and power-cycled the gateway to clear. This checks the other way round, once a
+   second: if the job that justifies a hold is not running, the hold goes. Leases taken by a
+   client over REST are left alone; those expire by themselves. */
+void busSweep() {
+  if (!gSoak.active)                      busReleaseFirmware("soak");
+  if (!gProbe.active)                     busReleaseFirmware("probe");
+  if (!gDiag.jobActive)                   busReleaseFirmware("diagnostics");
+  if (!gCalib.jobActive)                  busReleaseFirmware("calibration");
+  if (!restoreBusy())                     busReleaseFirmware("restore");
 }
 
 void busRelease(const char* reason) {
@@ -62,6 +87,29 @@ static const BusHold* strongest() {
 }
 
 BusLevel busLevel()        { const BusHold* b = strongest(); return b ? (BusLevel)b->level : BUS_FREE; }
+
+bool busOwnedByIp(uint32_t ip) {
+  if (!ip) return false;
+  unsigned long now = millis();
+  for (int i = 0; i < BUS_HOLD_SLOTS; i++) {
+    const BusHold& h = gHolds[i];
+    if (h.reason[0] && !expired(h, now) && h.ownerIp == ip) return true;
+  }
+  return false;
+}
+
+// The reasons the firmware uses for a measurement it is running itself. Kept as one list so
+// the gates and the dashboard agree on what "a test is running" means.
+bool busTestRunning() {
+  unsigned long now = millis();
+  for (int i = 0; i < BUS_HOLD_SLOTS; i++) {
+    const BusHold& h = gHolds[i];
+    if (!h.reason[0] || expired(h, now)) continue;
+    if (!strcmp(h.reason, "probe") || !strcmp(h.reason, "soak") ||
+        !strcmp(h.reason, "diagnostics") || !strcmp(h.reason, "restore")) return true;
+  }
+  return false;
+}
 const char* busReason()    { const BusHold* b = strongest(); return b ? b->reason : ""; }
 long busRemainingSec() {
   const BusHold* b = strongest();

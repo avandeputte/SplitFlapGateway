@@ -13,6 +13,13 @@
 //                  working. Used by provisioning, calibration, diagnostics, probes, backups,
 //                  and the manual Maintenance switch.
 //
+//                  A BUSY hold pauses CONTENT -- characters, text, raw frames. It does NOT
+//                  pause homing, which is itself a maintenance action and the one an operator
+//                  reaches for most while calibrating (issue #7: homing from the Calibration
+//                  tab answered 503 because the tab's own hold was in force). Only the
+//                  machine-run tests below, where one extra frame invalidates the result,
+//                  pause homing as well.
+//
 //   BUS_EXCLUSIVE  NOTHING else reaches the bus, dashboard included. Used by the boot restore,
 //                  where an interleaved frame corrupts an EEPROM write.
 //
@@ -37,11 +44,28 @@ struct BusHold {
   uint8_t       level;
   unsigned long sinceMs;
   unsigned long untilMs;                  // 0 = no expiry (manual maintenance only)
+  uint32_t      ownerIp;                  // client that took it over REST (0 = the firmware)
 };
 
 // Take or renew a hold. The same reason renews in place (level may be raised, never lowered
 // by a renew). leaseMs 0 = no expiry. Returns false only if every slot is taken.
-bool busHold(const char* reason, BusLevel level, unsigned long leaseMs);
+// `ownerIp` records the client that asked for it, so that client is recognised as the
+// operator afterwards even if its request tag does not survive the path to us (a proxy that
+// drops unknown headers, an older page, a second operator UI). 0 = taken by the firmware.
+bool busHold(const char* reason, BusLevel level, unsigned long leaseMs, uint32_t ownerIp = 0);
+// True if `ip` holds one of the holds in force. Never true for 0.
+bool busOwnedByIp(uint32_t ip);
+// True while a machine-run test owns the bus -- the probe, the soak, the module self-tests, a
+// restore. These measure the bus itself, so ANY extra frame (even the operator's) spoils them,
+// and they refuse homing as well as content.
+bool busTestRunning();
+// Release a hold only if the FIRMWARE took it (never a client's lease).
+void busReleaseFirmware(const char* reason);
+// Called about once a second: drop any firmware hold whose job is no longer running, so a
+// hold can never outlive its reason (issue: a cancelled soak left the wall paused until the
+// lease ran out or the gateway was power-cycled). Client leases are not touched -- they
+// expire on their own.
+void busSweep();
 // Release the hold with this reason. Safe to call when there is none.
 void busRelease(const char* reason);
 // The strongest hold in force right now (expired leases are reaped here).

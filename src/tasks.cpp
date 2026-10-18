@@ -436,6 +436,10 @@ void taskNetwork(void* pv) {
       lastSched = millis();
       quietScheduleTick();
     }
+    // Drop any firmware hold whose job has stopped, once a second (see bus.h). Cheap, and it
+    // is what keeps a cancelled or crashed job from leaving the wall paused.
+    static unsigned long lastSweepMs = 0;
+    if (millis() - lastSweepMs > 1000UL) { lastSweepMs = millis(); busSweep(); }
     // Periodically prune stale modules (once a minute is plenty).
     static unsigned long lastPruneMs = 0;
     if (!busBusy() && millis() - lastPruneMs > 60000UL) {   // no probes while a restore owns the bus

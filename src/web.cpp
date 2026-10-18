@@ -98,7 +98,11 @@ static void sendJsonError(int code, const char* msg) {
 static bool busIsOperator() {
   // The dashboard tags every request it makes (a window.fetch wrapper in index.html). Anything
   // without the tag -- the companion, a script, Home Assistant's REST calls -- is content.
-  return server.hasHeader("X-SF-Client") && server.header("X-SF-Client") == "dashboard";
+  if (server.hasHeader("X-SF-Client") && server.header("X-SF-Client") == "dashboard") return true;
+  // A tag can be lost on the way here: a reverse proxy that drops unknown headers, a page
+  // served from cache before the tag existed, an operator UI that does not send it. So the
+  // client that TOOK the hold counts as the operator too, for as long as it holds it.
+  return busOwnedByIp((uint32_t)server.client().remoteIP());
 }
 static void sendBusyError(const char* why) {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -113,11 +117,26 @@ static bool exclusiveGate() {
 }
 static bool contentGate() {
   if (busExclusive()) { sendBusyError("bus is reserved"); return true; }
+  // While a machine-run test is measuring the bus, content is refused even to the operator's
+  // own dashboard: a character painted mid-run is a frame the test did not account for, and
+  // it comes back as a result nobody can trust.
+  if (busTestRunning()) { sendBusyError("a bus test is running -- display content is paused until it finishes"); return true; }
   if (busBusy() && !busIsOperator()) { sendBusyError("maintenance in progress -- display content is paused"); return true; }
+  return false;
+}
+/* Homing is maintenance, not content: it paints nothing, and it is what an operator reaches
+   for constantly while calibrating. A hold taken FOR that work must not block it -- which it
+   did, for any client whose request tag did not reach us (issue #7). So homing is refused only
+   when the bus is reserved outright, or while a machine-run test is measuring it, where one
+   extra frame would spoil the result. */
+static bool maintGate() {
+  if (busExclusive())  { sendBusyError("bus is reserved"); return true; }
+  if (busTestRunning()) { sendBusyError("a bus test is running -- homing is paused until it finishes"); return true; }
   return false;
 }
 #define BUSGATED(fn)     ([]() { if (exclusiveGate()) return; fn(); })
 #define CONTENTGATED(fn) ([]() { if (contentGate())   return; fn(); })
+#define MAINTGATED(fn)   ([]() { if (maintGate())     return; fn(); })
 
 // -- GET /  (main dashboard)
 // Browser tab icon (favicon): a split-flap tile -- two flaps, the signature
@@ -2095,7 +2114,10 @@ static void handleApiBusHold() {
   if (!busReasonIsClientOwned(reason)) { sendJsonError(400, "that reason is owned by the firmware"); return; }
   if (secs < 5) secs = 5;
   if (secs > 300) secs = 300;        // a client must keep renewing; nothing is held forever by accident
-  if (!busHold(reason, BUS_BUSY, (unsigned long)secs * 1000UL)) { sendJsonError(503, "no free hold slot"); return; }
+  // The client's address goes with the hold: it is what identifies this client as the
+  // operator afterwards when its request tag does not reach us (see busIsOperator).
+  if (!busHold(reason, BUS_BUSY, (unsigned long)secs * 1000UL,
+               (uint32_t)server.client().remoteIP())) { sendJsonError(503, "no free hold slot"); return; }
   static char out[384];
   busStatusJson(out, sizeof(out));
   server.send(200, "application/json", out);
@@ -2107,7 +2129,17 @@ static void handleApiBusRelease() {
   if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
   const char* reason = doc["reason"] | "";
   if (!reason[0]) { sendJsonError(400, "reason required"); return; }
-  if (!busReasonIsClientOwned(reason)) { sendJsonError(400, "that reason is owned by the firmware"); return; }
+  // A client may drop its own lease freely. It may also FORCE a firmware hold open -- the way
+  // out when something has left the wall paused and the operator is looking at a banner with
+  // no end in sight. A restore is the exception: interrupting one mid-write corrupts a
+  // module's EEPROM, and it has its own cancel endpoint that stops it safely.
+  bool force = doc["force"] | false;
+  if (!busReasonIsClientOwned(reason)) {
+    if (!force) { sendJsonError(400, "that reason is owned by the firmware (send force to override)"); return; }
+    if (!strcmp(reason, "restore")) { sendJsonError(409, "a restore cannot be released -- cancel it instead"); return; }
+    if (!strcmp(reason, "soak") && gSoak.active) sfSoakCancel();   // stop the job, not just its hold
+    printf("[BUS] '%s' force-released by %s\n", reason, server.client().remoteIP().toString().c_str());
+  }
   busRelease(reason);
   static char out[384];
   busStatusJson(out, sizeof(out));
@@ -2784,7 +2816,7 @@ void webInit() {
   server.on("/api/flap/index",       HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/text",        HTTP_POST,    CONTENTGATED(handleApiText));
   server.on("/api/flap/text",        HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/home",        HTTP_POST,    CONTENTGATED(handleApiHome));
+  server.on("/api/flap/home",        HTTP_POST,    MAINTGATED(handleApiHome));
   server.on("/api/flap/home",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/calibrate",   HTTP_POST,    BUSGATED(handleApiCalibrate));
   server.on("/api/flap/calibrate",   HTTP_OPTIONS, handleOptions);
@@ -2814,7 +2846,7 @@ void webInit() {
   server.on("/api/flap/provision",   HTTP_POST,    BUSGATED(handleApiProvision));
   server.on("/api/flap/deprovision", HTTP_POST,    BUSGATED(handleApiDeprovision));
   server.on("/api/flap/deprovision", HTTP_OPTIONS, handleOptions);
-  server.on("/api/flap/homebysn",        HTTP_POST,    BUSGATED(handleApiHomeBySN));
+  server.on("/api/flap/homebysn",        HTTP_POST,    MAINTGATED(handleApiHomeBySN));
   server.on("/api/flap/homebysn",        HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/provision",       HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/homeoffset",      HTTP_POST,    BUSGATED(handleApiHomeOffset));

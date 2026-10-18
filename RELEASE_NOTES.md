@@ -1,5 +1,60 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.15.1 — 2026-10-18
+
+Two fixes to the bus hold that 3.15.0 introduced. Both were reported within a day of the
+release, and both come down to the same thing: a hold meant to protect the operator's work got
+in the way of it instead.
+
+### Fixed
+
+- **Homing was refused from the Calibration tab**
+  ([#7](https://github.com/avandeputte/SplitFlapGateway/issues/7)). Opening that tab holds the
+  bus, and homing was classified as display content, so *Home All* and *Home Motor* answered
+  `503 maintenance in progress -- display content is paused` — on the one screen where homing is
+  needed most. Homing is maintenance, not content: it paints nothing and it is how you check a
+  home offset. It is now allowed whenever the bus is held for operator work, and refused only
+  while the bus is reserved outright (a restore) or while a machine-run test is measuring it,
+  where an extra frame would spoil the result.
+
+  The dashboard tags its own requests so the gateway can tell the operator from a content
+  driver, and that tag not reaching the firmware is what made the failure look arbitrary. The
+  gateway no longer depends on it alone: **the client that took a hold is remembered by
+  address**, so whoever holds the bus keeps working even behind a proxy that drops unknown
+  headers, from a page served before the tag existed, or from a second operator tool.
+
+- **A cancelled soak test could leave the wall paused.** The hold was released at the end of the
+  soak task, so anything that kept the task from reaching that line — a cancel with a long
+  wind-down, an early return — left the bus held until the lease ran out, up to three minutes,
+  which one user cleared by power-cycling the gateway. Every hold the firmware takes for itself
+  is now checked once a second against the job that justifies it: no job, no hold. Cancelling a
+  soak frees the bus in well under a second, and the snapshot sweep that runs before a soak
+  stops at the cancel instead of finishing the wall first.
+
+### Changed
+
+- **The banner says whose hold it is.** While your own Calibration tab holds the bus it reads
+  *"while this tab is open, display content from elsewhere is paused. Homing and calibration
+  still work."* — 3.15.0 said maintenance was in progress, which read as the gateway deciding to
+  go into maintenance mode on its own.
+- **There is a way out of any hold**: the banner carries a **Release the bus** button for every
+  hold except a restore, which must be cancelled instead. Over REST,
+  `POST /api/bus/release {"reason":"…","force":true}`; forcing the soak's hold cancels the soak
+  rather than orphaning it.
+- **A tab nobody is using stops holding the bus.** The dashboard renews its lease only while the
+  tab is visible and has been touched in the last ten minutes, and releases it when the page
+  goes away.
+- **Display content is paused for everyone, the dashboard included, while the probe, the soak or
+  a module self-test is running.** Those measure the bus; a character painted mid-run is a frame
+  the measurement did not account for.
+
+### For anyone maintaining this
+
+`tools/bus_gate_test.py <gateway-ip>` runs the whole matrix against a live gateway: which
+requests are allowed under each kind of hold, that a lease expires on its own, that a cancelled
+soak frees the bus within seconds, and that a stuck hold can always be cleared. It homes module
+0 a few times and writes nothing. Both bugs above are in it as named checks.
+
 ## v3.15.0 — 2026-10-18
 
 Maintenance that happens by itself, and a soak test for the whole wall.

@@ -88,8 +88,11 @@ bool restoreStartFrom(const char* path, unsigned long delayMs, const char* trigg
 // `done`/`total`/`okOut` (all optional) track progress for a caller polling from elsewhere.
 // Returns false, with a reason in `err`, only if NOTHING could be written; a module that
 // does not answer is left out of the file and counted in `okOut` versus `total`.
+// `abort` (optional) is polled between modules: set it and the sweep stops and returns false,
+// so a cancel does not have to wait out a whole wall.
 bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* total,
-                          volatile int* okOut, char* err, size_t errLen);
+                          volatile int* okOut, char* err, size_t errLen,
+                          volatile bool* abort = NULL);
 // Ask a running restore to stop after the current step. Returns false if none is running.
 bool restoreCancel();
 // Delete the stored backup. Returns false if a run is in progress.

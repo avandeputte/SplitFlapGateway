@@ -490,7 +490,8 @@ char gRestoreSrc[32] = RESTORE_FILE;
 // answers; the combined 'A' read is preferred (it carries the flap set) and a plain 'd'
 // read is the fallback, exactly as GET /api/flap/all does.
 bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* total,
-                          volatile int* okOut, char* err, size_t errLen) {
+                          volatile int* okOut, char* err, size_t errLen,
+                          volatile bool* abort) {
   if (!sfFsReady) { strlcpy(err, "no filesystem", errLen); return false; }
   // The module list is copied first: the sweep below takes seconds and must not hold the lock.
   // static, not on the stack: MAX_MODULES entries are several KB and the soak task that calls
@@ -560,6 +561,10 @@ bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* to
     if (done) *done = i + 1;
     wdgWebMs = millis();
     vTaskDelay(pdMS_TO_TICKS(120));
+    if (abort && *abort) {                      // cancelled: stop here, keep what was read
+      printf("[SOAK] snapshot cancelled after %d of %d module(s)\n", i + 1, n);
+      break;
+    }
   }
   f.print("]}");
   size_t bytes = f.size();

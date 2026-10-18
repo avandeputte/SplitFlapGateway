@@ -1620,6 +1620,13 @@ paths:
               required: [reason]
               properties:
                 reason: { type: string, example: "backup" }
+                force:
+                  type: boolean
+                  default: false
+                  description: >
+                    Release a hold the FIRMWARE owns -- the way out when something has left the
+                    wall paused (v3.15.1). Forcing the soak's hold cancels the soak itself; a
+                    restore can never be forced, it has its own cancel endpoint.
       responses:
         "200":
           description: The holds remaining
@@ -2365,7 +2372,14 @@ components:
             maxLen:    { type: integer, description: "Longest complete frame received since boot (limit 768)", example: 447 }
             lock:
               type: object
-              description: "Who holds the bus (v3.15). level 1 = busy: external display content is refused with 503, the dashboard (X-SF-Client: dashboard) is not; level 2 = exclusive: every bus route is refused"
+              description: >
+                Who holds the bus (v3.15). level 1 = busy: external display content is refused
+                with 503, the dashboard is not; level 2 = exclusive: every bus route is refused.
+                Homing is maintenance, not content, so it is allowed at level 1 (v3.15.1).
+                While a machine-run test holds the bus (probe, soak, self-tests) content AND
+                homing are refused to every caller, measurement being the point of them. A
+                caller counts as the operator by the header `X-SF-Client: dashboard` or by being
+                the address that took the hold.
               properties:
                 level:     { type: integer, enum: [0, 1, 2], example: 0 }
                 reason:    { type: string, description: "maintenance, provisioning, calibration, diagnostics, probe, soak, backup, identify, restore, or a client's own", example: "" }

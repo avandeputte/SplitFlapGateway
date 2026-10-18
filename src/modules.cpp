@@ -778,7 +778,8 @@ static void taskSoak(void* pv) {
   gSoak.snapRunning = true;
   gSoak.snapErr[0]  = 0;
   gSoak.snapOkFlag  = restoreWriteSnapshot(SOAK_SNAPSHOT_FILE, &gSoak.snapDone, &gSoak.snapTotal,
-                                           &gSoak.snapOk, gSoak.snapErr, sizeof(gSoak.snapErr));
+                                           &gSoak.snapOk, gSoak.snapErr, sizeof(gSoak.snapErr),
+                                           &gSoak.cancel);
   gSoak.snapRunning = false;
   if (!gSoak.snapOkFlag)
     printf("[SOAK] no safety snapshot (%s) -- writes will still record each module's "
