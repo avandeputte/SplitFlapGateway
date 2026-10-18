@@ -624,6 +624,21 @@ static void taskProbe(void* pv) {
    GET /api/flap/soak/status. The per-module table lives in PSRAM: 255 rows x 26 B. */
 static TaskHandle_t hTaskSoak = NULL;
 
+/* Sleep, but notice a cancel. Every wait inside the soak goes through this: the longest one
+   is a broadcast reply window, which on a wide wall is half a minute (one 700 ms slot per
+   module for a combined dump). Sleeping it in one call is what made "cancel" mean "cancel,
+   eventually" -- the bus stayed held until the window ran out. Returns false if the run was
+   cancelled while waiting. */
+static bool soakWait(unsigned long ms) {
+  const unsigned long end = millis() + ms;
+  while ((long)(millis() - end) < 0) {
+    if (gSoak.cancel) return false;
+    unsigned long left = end - millis();
+    vTaskDelay(pdMS_TO_TICKS(left > 50 ? 50 : left));
+  }
+  return !gSoak.cancel;
+}
+
 /* Broadcast roll call: replies per id while a window is open (taskRS485 writes, taskSoak
    reads; a byte each way, no lock needed). */
 static volatile bool gSoakBcArmed = false;
@@ -704,6 +719,10 @@ static bool soakWriteRoundTrip(SoakRow& r, const char* sn, int fwNum, char* out,
   char frame[48];
   for (int L = 0; L < 2; L++) {
     if (L == 1 && idx < 0) break;
+    // A cancel stops the NEXT value being touched. The one in hand always runs to its
+    // put-back below -- leaving a module changed because somebody pressed cancel would be
+    // the worst outcome of the two.
+    if (L == 1 && gSoak.cancel) break;
     const int orig = L ? pos : ho;
     const int alt  = orig > 1 ? orig - 1 : orig + 1;
     const uint8_t bit = L ? 2 : 1;
@@ -736,7 +755,14 @@ static void soakBroadcast(char cmd, int k) {
   rs485SendStr(frame);
   const unsigned long slot = (cmd == 'A') ? 700UL : 100UL;            // the module's reply slots
   const unsigned long waitMs = 30 + (unsigned long)(gSoak.idHi - gSoak.idLo + 1) * slot + (cmd == 'A' ? 1500 : 600);
-  vTaskDelay(pdMS_TO_TICKS(waitMs));
+  if (!soakWait(waitMs)) {
+    // Cancelled mid-window: modules are still answering into their slots, so give the line a
+    // moment to go quiet before anyone else may transmit, then drop this window's scores --
+    // they are incomplete by definition.
+    vTaskDelay(pdMS_TO_TICKS(400));
+    gSoakBcArmed = false;
+    return;
+  }
   gSoakBcArmed = false;
   static bool inTable[256];
   memset(inTable, 0, sizeof(inTable));
@@ -797,7 +823,7 @@ static void taskSoak(void* pv) {
     if (cmd == 'V' || cmd == 'B') {
       soakBroadcast(cmd == 'V' ? 'v' : 'A', k);
       gSoak.passes = pass + 1;
-      vTaskDelay(pdMS_TO_TICKS(150));
+      soakWait(150);
       continue;
     }
     for (int i = 0; i < gSoak.modules && !gSoak.cancel; i++) {
@@ -837,7 +863,7 @@ static void taskSoak(void* pv) {
         if (r.streak < 255) r.streak++;
         if (r.streak > r.worstStreak) r.worstStreak = r.streak;
       }
-      vTaskDelay(pdMS_TO_TICKS(150));                    // gentle: ~1 query per 150 ms + reply time
+      soakWait(150);                                     // gentle: ~1 query per 150 ms + reply time
     }
     gSoak.passes = pass + 1;
   }

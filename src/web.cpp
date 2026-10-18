@@ -2206,11 +2206,24 @@ static void handleApiSoakRollback() {
   server.send(200, "application/json", "{\"ok\":true,\"started\":true,\"source\":\"soak snapshot\"}");
 }
 
+/* POST /api/flap/soak/cancel
+   Answers once the bus is actually free, not merely once the flag is set: "cancelled" should
+   mean the wall is yours again. The task wakes out of whatever it was waiting on and releases
+   the hold on its way out; all this does is wait for that, briefly, so the reply can say so.
+   The one thing it waits through is a write that has to be put back. */
 static void handleApiSoakCancel() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (!gSoak.active) { sendJsonError(409, "no soak test running"); return; }
+  const unsigned long t0 = millis();
   sfSoakCancel();
-  server.send(200, "application/json", "{\"ok\":true,\"cancelling\":true}");
+  while (gSoak.active && millis() - t0 < 5000UL) { wdgWebMs = millis(); delay(20); }
+  // `heldBy` matters: the soak's own hold is gone by now, but the bus can still be held by
+  // something else entirely (an open Calibration tab, the manual switch), and "not free"
+  // without saying by what reads like the cancel failed.
+  char out[128];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"cancelled\":true,\"busFree\":%s,\"heldBy\":\"%s\",\"ms\":%lu}",
+           busBusy() ? "false" : "true", busReason(), millis() - t0);
+  server.send(200, "application/json", out);
 }
 static void handleApiSoakStatus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");

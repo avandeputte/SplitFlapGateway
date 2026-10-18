@@ -23,13 +23,28 @@ in the way of it instead.
   address**, so whoever holds the bus keeps working even behind a proxy that drops unknown
   headers, from a page served before the tag existed, or from a second operator tool.
 
-- **A cancelled soak test could leave the wall paused.** The hold was released at the end of the
-  soak task, so anything that kept the task from reaching that line — a cancel with a long
-  wind-down, an early return — left the bus held until the lease ran out, up to three minutes,
-  which one user cleared by power-cycling the gateway. Every hold the firmware takes for itself
-  is now checked once a second against the job that justifies it: no job, no hold. Cancelling a
-  soak frees the bus in well under a second, and the snapshot sweep that runs before a soak
-  stops at the cancel instead of finishing the wall first.
+- **A cancelled soak test could leave the wall paused.** Cancel only set a flag, and the hold
+  was released at the end of the soak task, so the wall stayed paused for as long as the task
+  took to notice — and the task slept through whole waits at a time. The worst of them is a
+  broadcast reply window, one slot per module, which on a wide wall is half a minute. Anything
+  that stopped the task reaching its release at all left the bus held until the lease ran out,
+  up to three minutes, which one user cleared by power-cycling the gateway.
+
+  **Cancelling now frees the bus before the call returns.** Every wait inside a run is
+  cancel-aware, so the task wakes out of a reply window or a pacing delay at once, lets the
+  line go quiet, and releases. `POST /api/flap/soak/cancel` answers only once that has
+  happened, and reports `busFree`, with `heldBy` naming anything else that still holds the bus
+  (an open Calibration tab, the manual switch) so "not free" is never a mystery. Measured on a
+  15-module wall: **under 400 ms**, including a cancel in the middle of a broadcast dump.
+
+  The one thing a cancel waits for is a value being written back. The soak nudges a
+  calibration value and puts it back; the put-back always completes, because leaving a module
+  changed is a worse outcome than a cancel that takes another moment.
+
+  Underneath, every hold the firmware takes for itself is also checked once a second against
+  the job that justifies it: no job, no hold. That is the backstop for a job that crashes
+  rather than cancels. The snapshot sweep that runs before a soak stops at the cancel too,
+  instead of finishing the wall first.
 
 ### Changed
 

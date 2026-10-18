@@ -17,8 +17,9 @@ The matrix it pins down, and why each row exists:
   restore (exclusive)   everything is refused -- not exercised here, it rewrites EEPROM
   hold ownership        the client that took a lease counts as the operator afterwards even
                          without the tag, so a proxy that drops headers cannot lock it out
-  hold lifetime         a lease expires by itself; a cancelled soak frees the bus within
-                         seconds (a stuck hold once forced a user to power-cycle the gateway)
+  hold lifetime         a lease expires by itself; cancelling a soak frees the bus before the
+                         call returns -- every wait inside the run is cancel-aware, so this
+                         holds even mid-way through a broadcast reply window, the longest one
   force release         an operator can always clear a stuck hold from the banner
 """
 import json, sys, time, urllib.error, urllib.request
@@ -101,13 +102,14 @@ check("homing is refused, untagged", home(False), 503)
 check("another test is refused", call("POST", "/api/flap/probe", {"id": 0}, tag=True)[0], 409)
 
 print("\n5. cancelling frees the bus promptly (the stuck-hold report)")
-check("cancel accepted", call("POST", "/api/flap/soak/cancel", tag=True)[0], 200)
 t0 = time.time()
-freed = wait_free(20)
+st, j = call("POST", "/api/flap/soak/cancel", tag=True)
 took = time.time() - t0
-check("bus free again", freed, True)
-print("   it took %.1f s" % took)
-if took > 15: fails.append("cancel freed the bus only after %.0f s" % took)
+check("cancel accepted", st, 200)
+check("the reply itself says the bus is free", j.get("busFree"), True)
+check("cancel answered in under 2 s", took < 2, True)
+print("   it took %.0f ms, firmware measured %s ms" % (took * 1000, j.get("ms")))
+check("bus free", bus().get("level"), 0)
 check("the soak reports itself cancelled", call("GET", "/api/flap/soak/status")[1].get("state"), "cancelled")
 
 print("\n6. an operator can always clear a stuck hold")
