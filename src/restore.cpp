@@ -281,7 +281,7 @@ static void restoreWriteOne(const RestoreEntry& e, unsigned long* readyAt) {
   }
   if (!perEntry && e.map[0])
     printf("[RESTORE] %s: no id known -- map sent inline (the module may drop entries)\n", e.sn);
-  rs485SendStr(frame);
+  if (wId >= 0) sfSendToModule(wId, frame); else rs485SendStr(frame);
   vTaskDelay(pdMS_TO_TICKS(RESTORE_MXW_SETTLE_MS));   // map erase + flap-set write on the module
 
   if (e.id >= 0 && (!known || curId != (uint8_t)e.id)) {

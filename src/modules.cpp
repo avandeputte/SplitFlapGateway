@@ -438,11 +438,14 @@ void sfGoto(int addr, int step) {
   else           snprintf(buf, sizeof(buf), "m%dg%d\n", addr, step);
   rs485SendStr(buf);
 }
+/* A write nobody reads back is the frame most worth checksumming: a corrupted display command
+   is overwritten a second later, a corrupted calibration value stays wrong until someone
+   notices a flap landing off. */
 void sfWritePos(int addr, int idx, int pos) {
   char buf[32];
-  if (addr < 0) snprintf(buf, sizeof(buf), "m*w%d:%d\n", idx, pos);
-  else           snprintf(buf, sizeof(buf), "m%dw%d:%d\n", addr, idx, pos);
-  rs485SendStr(buf);
+  if (addr < 0) { snprintf(buf, sizeof(buf), "m*w%d:%d\n", idx, pos); rs485SendStr(buf); return; }
+  snprintf(buf, sizeof(buf), "m%dw%d:%d\n", addr, idx, pos);
+  sfSendToModule(addr, buf);
 }
 void sfAutoHome(int addr, int enable) {
   char buf[24];
@@ -1114,6 +1117,24 @@ void sfCalibrate(int addr) {
 // (Belt and suspenders: rs485Send() now normalizes framing for EVERY sender, so
 // even a hand-typed "m<id>v\n" from the bus monitor or a REST/MQTT raw send is
 // shipped bare. This helper still emits the bare form directly to document intent.)
+bool sfModuleChecksums(int id) {
+  if (id < 0 || id > 254) return false;
+  int fw = 0;
+  if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  SFModule* m = sfFindById((uint8_t)id);
+  if (m) {
+    const char* v = (m->fwVersion[0] == 'v' || m->fwVersion[0] == 'V') ? m->fwVersion + 1 : m->fwVersion;
+    fw = atoi(v);
+  }
+  if (sfMutex) xSemaphoreGive(sfMutex);
+  return fw >= MODULE_FW_CHECKSUM;
+}
+
+void sfSendToModule(int id, const char* frame) {
+  if (sfModuleChecksums(id)) rs485SendChecked(frame);
+  else                       rs485SendStr(frame);
+}
+
 void sfBusResync() {
   static const uint8_t nl[1] = { '\n' };
   rs485Send(nl, 1, true);          // raw: the normal path drops a frame that is only a terminator
@@ -1138,6 +1159,11 @@ bool sfReadDump(int id, const char* frame, unsigned long timeoutMs,
 
 void sfQueryVersion(int addr) {
   char buf[16];
+  if (sfModuleChecksums(addr)) {              // v33+: checksummed and terminated, no race
+    snprintf(buf, sizeof(buf), "m%dv", addr);
+    rs485SendChecked(buf);
+    return;
+  }
   snprintf(buf, sizeof(buf), "m%dv", addr);   // no '\n' -- gateway turnaround workaround, see note
   rs485SendStr(buf);
 }
@@ -1156,7 +1182,7 @@ bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs,
   gDump.autoHome = gDump.curIndex = gDump.reportedId = -99;  // A-only; cleared per attempt
   gDump.flapCount = -99; gDump.flapChars[0] = 0;             // v31+ 'A' tail; cleared per attempt
   gDump.waitId     = id;
-  rs485SendStr(frame);
+  sfSendToModule(id, frame);     // checksummed if this module verifies them
   unsigned long deadline = millis() + timeoutMs;
   while (millis() < deadline) {
     wdgWebMs = millis();
@@ -1181,7 +1207,7 @@ bool sfSendAndCaptureQ(int id, unsigned long timeoutMs) {
   gDiag.q.waitId = id;
   char frame[16];
   snprintf(frame, sizeof(frame), "m%dQ\n", id);
-  rs485SendStr(frame);
+  sfSendToModule(id, frame);
   unsigned long deadline = millis() + timeoutMs;
   while (millis() < deadline) {
     wdgWebMs = millis();
@@ -1803,8 +1829,8 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     char qb[48];
     strlcpy(qb, p + 1, sizeof(qb));
     for (int k = (int)strlen(qb)-1; k >= 0 && (qb[k]=='\n'||qb[k]=='\r'||qb[k]==' '); k--) qb[k] = 0;
-    char* qf[8] = {0}; qf[0] = qb; int qi = 1;
-    for (char* cp = qb; *cp && qi < 8; cp++) { if (*cp == ':') { *cp = 0; qf[qi++] = cp + 1; } }
+    char* qf[9] = {0}; qf[0] = qb; int qi = 1;
+    for (char* cp = qb; *cp && qi < 9; cp++) { if (*cp == ':') { *cp = 0; qf[qi++] = cp + 1; } }
     int rc   = (qf[0] && qf[0][0]) ? atoi(qf[0]) : 0;
     int boot = (qf[1] && qf[1][0]) ? atoi(qf[1]) : 0;
     int vcc  = (qf[2] && qf[2][0]) ? atoi(qf[2]) : 0;
@@ -1814,11 +1840,12 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     int rxOv = (qf[5] && qf[5][0]) ? atoi(qf[5]) : -1;
     int bcS  = (qf[6] && qf[6][0]) ? atoi(qf[6]) : -1;
     int bcL  = (qf[7] && qf[7][0]) ? atoi(qf[7]) : -1;
+    int crcE = (qf[8] && qf[8][0]) ? atoi(qf[8]) : -1;   // v33: checksummed frames it dropped
     DBG("[SF] Module %d diag Q: rc=%d boot=%d vcc=%d ee=%d cur=%d rxOv=%d bcast=%d/%d\n",
         id, rc, boot, vcc, ee, cur, rxOv, bcS, bcL);
     if (gDiag.q.waitId == (int)id) {
       gDiag.q.reset = rc; gDiag.q.boot = boot; gDiag.q.vcc = vcc; gDiag.q.ee = ee; gDiag.q.cur = cur;
-      gDiag.q.rxOv = rxOv; gDiag.q.bcSent = bcS; gDiag.q.bcLate = bcL;
+      gDiag.q.rxOv = rxOv; gDiag.q.bcSent = bcS; gDiag.q.bcLate = bcL; gDiag.q.crcErr = crcE;
       gDiag.q.ts = millis();
     }
     char payload[96];

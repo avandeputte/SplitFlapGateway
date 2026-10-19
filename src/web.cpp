@@ -37,6 +37,7 @@ static void handleApiSoak();
 static void handleApiSoakCancel();
 static void handleApiSoakSnapshot();
 static void handleApiIncidents();
+static void handleApiStats();
 static void handleApiSoakLog();
 static void handleApiIncidentsClear();
 static void handleApiSoakRollback();
@@ -656,9 +657,9 @@ static void handleApiDiag() {
     snprintf(out, sizeof(out),
       "{\"ok\":true,\"started\":true,\"id\":%d,"
       "\"q\":{\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d,"
-      "\"rxOverflows\":%d,\"bcastSent\":%d,\"bcastLate\":%d}}",
+      "\"rxOverflows\":%d,\"bcastSent\":%d,\"bcastLate\":%d,\"crcErrors\":%d}}",
       id, gDiag.q.reset, gDiag.q.boot, gDiag.q.vcc, gDiag.q.ee, gDiag.q.cur,
-      gDiag.q.rxOv, gDiag.q.bcSent, gDiag.q.bcLate);
+      gDiag.q.rxOv, gDiag.q.bcSent, gDiag.q.bcLate, gDiag.q.crcErr);
   } else {
     snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d,\"q\":null}", id);
   }
@@ -1322,7 +1323,8 @@ static void handleApiStatus() {
     "\"reset\":\"%s\",\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u,\"soak\":%u,\"probe\":%u},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
     "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s,"
-    "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu,\"lock\":%s}}",
+    "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu,"
+    "\"crcOk\":%lu,\"crcFail\":%lu,\"lock\":%s}}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
     (WiFi.status()==WL_CONNECTED)?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
@@ -1338,7 +1340,7 @@ static void handleApiStatus() {
     gMaintenanceMode?"true":"false",
     gQuietTime?"true":"false",
     gCompanionStatus, compAge, rst,
-    sfParseRejects, rxDropped, rxDropBytes, rxMaxLen, bst);
+    sfParseRejects, rxDropped, rxDropBytes, rxMaxLen, rxCrcOk, rxCrcFail, bst);
   server.send(200, "application/json", out);
 }
 
@@ -2217,6 +2219,29 @@ static void handleApiSoakLog() {
   server.sendContent("");
 }
 
+/* POST /api/flap/stats {"id":N} -- the module's own snapshot, and nothing else.
+   /api/flap/diag returns the same figures but starts a Hall self-test with them, which spins
+   the reel for twenty seconds. Since module firmware v33 the snapshot carries the counters
+   that matter most for chasing a bus problem -- receive overflows, broadcast replies sent and
+   late, checksum failures -- and reading those should not cost a motor test. Nothing here
+   moves a flap. */
+static void handleApiStats() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
+  int id = doc["id"] | -1;
+  if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
+  if (!sfSendAndCaptureQ(id, 1000)) { sendJsonError(504, "no snapshot from that module"); return; }
+  char out[300];
+  snprintf(out, sizeof(out),
+    "{\"ok\":true,\"id\":%d,\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,"
+    "\"curIndex\":%d,\"rxOverflows\":%d,\"bcastSent\":%d,\"bcastLate\":%d,\"crcErrors\":%d}",
+    id, gDiag.q.reset, gDiag.q.boot, gDiag.q.vcc, gDiag.q.ee, gDiag.q.cur,
+    gDiag.q.rxOv, gDiag.q.bcSent, gDiag.q.bcLate, gDiag.q.crcErr);
+  server.send(200, "application/json", out);
+}
+
 /* GET /api/bus/incidents?max=50 -- the last anomalies the bus produced, newest first.
    A counter tells you six frames were discarded; this tells you which module had the bus, what
    it was being asked, how big the frame was and when -- the difference between a number and a
@@ -2920,6 +2945,8 @@ void webInit() {
   server.on("/api/flap/soak/cancel", HTTP_POST,    handleApiSoakCancel);
   server.on("/api/flap/soak/status", HTTP_GET,     handleApiSoakStatus);
   server.on("/api/flap/soak/snapshot", HTTP_GET,    handleApiSoakSnapshot);
+  server.on("/api/flap/stats",         HTTP_POST,    BUSGATED(handleApiStats));
+  server.on("/api/flap/stats",         HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/soak/log",      HTTP_GET,     handleApiSoakLog);
   server.on("/api/bus/incidents",      HTTP_GET,     handleApiIncidents);
   server.on("/api/bus/incidents",      HTTP_DELETE,  handleApiIncidentsClear);

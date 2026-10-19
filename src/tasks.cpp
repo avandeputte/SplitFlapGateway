@@ -58,16 +58,24 @@ void taskRS485(void* pv) {
       wdgRS485Ms = millis();
       gLastRxMs  = wdgRS485Ms;   // bus activity marker for TX collision avoidance
 
-      // If we see an 'm' and the buffer already has content that doesn't
-      // start with 'm', discard the stale partial frame and start fresh.
-      if (c == 'm' && lineLen > 0 && lineBuf[0] != 'm') {
+      // A checksummed frame (module firmware v33+) arrives as ~HHHH<frame>\n. Accumulate from
+      // the '~' so the prefix can be verified; without this the loop below would skip it and
+      // the frame would be parsed as if it had never been checked.
+      const bool inCrcPrefix = (lineLen > 0 && lineBuf[0] == '~' && lineLen < CRC_PREFIX_BYTES);
+
+      // If we see an 'm' and the buffer already has content that doesn't start with 'm',
+      // discard the stale partial frame and start fresh -- unless what it holds is exactly a
+      // checksum prefix, which is what legitimately precedes an 'm'.
+      if (c == 'm' && lineLen > 0 && lineBuf[0] != 'm' &&
+          !(lineBuf[0] == '~' && lineLen == CRC_PREFIX_BYTES)) {
         lineLen = 0;
       }
 
-      // Start accumulating only once we've seen the leading 'm'.
-      if (lineLen == 0 && c != 'm') {
+      // Start accumulating at the leading 'm', or at the '~' of a checksummed frame.
+      if (lineLen == 0 && c != 'm' && c != '~') {
         continue;  // skip noise / framing bytes before the message start
       }
+      (void)inCrcPrefix;
 
       // Append byte, guarding against overflow.
       if (lineLen < TX_MAX_BYTES - 1) {
@@ -92,6 +100,32 @@ void taskRS485(void* pv) {
       // Newline = end of message.  Commit to ring buffer.
       if (c == '\n') {
         rxCount++;
+        /* Verify and strip a checksum prefix before anything else looks at the frame. A frame
+           that fails is dropped, not parsed: acting on it is exactly what the checksum exists
+           to prevent. The monitor and the trace still see the frame as it arrived. */
+        size_t parseOff = 0;
+        rxLastChecked = false;
+        if (lineLen > CRC_PREFIX_BYTES + 1 && lineBuf[0] == '~') {
+          char hex[5] = { (char)lineBuf[1], (char)lineBuf[2], (char)lineBuf[3], (char)lineBuf[4], 0 };
+          char* end = NULL;
+          const unsigned long want = strtoul(hex, &end, 16);
+          const size_t bodyLen = lineLen - CRC_PREFIX_BYTES - 1;      // minus prefix and '\n'
+          const uint16_t got = sfCrc16(lineBuf + CRC_PREFIX_BYTES, bodyLen);
+          if (end && *end == 0 && (uint16_t)want == got) {
+            rxCrcOk++;
+            rxLastChecked = true;
+            parseOff = CRC_PREFIX_BYTES;
+          } else {
+            rxCrcFail++;
+            int fid = -1;                                   // whose frame it was, if it says so
+            if (bodyLen > 1 && lineBuf[CRC_PREFIX_BYTES] == 'm') fid = atoi((const char*)lineBuf + CRC_PREFIX_BYTES + 1);
+            printf("[RX] checksum failed on a %u-byte frame (wanted %04lX, got %04X)\n",
+                   (unsigned)lineLen, want, got);
+            incidentLog(fid >= 0 && fid < 255 ? (uint8_t)fid : 255, 'C', 0, (uint16_t)lineLen);
+            if (traceActive()) { traceNote("! checksum failed"); traceFrame('!', lineBuf, lineLen, lineLen); }
+            // still logged to the monitor below, then dropped
+          }
+        }
         RS485Msg m;
         m.timestamp = millis();
         m.dir       = 'R';
@@ -114,7 +148,10 @@ void taskRS485(void* pv) {
           DBG("[RX] %s  (%s)\n", dbg, m.wallTime); }
         ringPush(m);
         mqttPublishMsg(m);
-        sfParseResponse(lineBuf, lineLen);   // full frame, not the truncated copy
+        // parseOff skips a verified checksum prefix; a frame whose checksum FAILED is not
+        // parsed at all, only recorded.
+        if (!(lineBuf[0] == '~' && !rxLastChecked))
+          sfParseResponse(lineBuf + parseOff, lineLen - parseOff);
         lineLen = 0;
       }
     }

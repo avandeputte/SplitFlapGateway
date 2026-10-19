@@ -143,7 +143,7 @@ struct DiagState {                   // self-diagnostics (module fw v26+/v28+)
   // 'Q' snapshot -- instant, captured synchronously (no motor)
   struct { volatile int waitId = -1; volatile unsigned long ts = 0;
            volatile int reset = 0, boot = 0, vcc = 0, ee = 0, cur = -1;
-           volatile int rxOv = -1, bcSent = -1, bcLate = -1; } q;
+           volatile int rxOv = -1, bcSent = -1, bcLate = -1, crcErr = -1; } q;
   // 'T' Hall test -- motor ~2 revolutions
   struct { volatile int waitId = -1; volatile unsigned long ts = 0;
            volatile int code = -1, rising = 0, active = 0, falling = 0; } t;
@@ -347,6 +347,15 @@ void sfQueryVersion(int addr);
    until it sees one, so without this the next command addressed to it is what gets eaten and
    the module looks silent when it is only resyncing. Costs one byte. */
 void sfBusResync();
+/* True when this module's firmware verifies checksummed frames (v33+). The registry's version
+   is the source; an unknown version is treated as old, so nothing changes until a module has
+   actually told the gateway what it runs. */
+bool sfModuleChecksums(int id);
+/* Send one frame to a module, checksummed when that module verifies them and plain when it
+   does not. Use this for anything whose corruption costs something: reads, writes, restores.
+   Display content stays on the plain path -- five extra bytes on a six-byte command is 80%
+   more traffic for a frame the next update overwrites anyway. */
+void sfSendToModule(int id, const char* frame);
 bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs, char* out, size_t outLen,
                           volatile bool* abort = NULL);
 /* The same, but asks twice: a module that ate the first command while resyncing answers the

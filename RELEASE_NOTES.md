@@ -1,5 +1,58 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.18.0 — 2026-10-19
+
+Module firmware **v33** adds a checksummed frame format and four counters of its own. This is
+the gateway side of both. A wall can be mixed: the gateway decides per module, from the version
+that module reported, and v32 modules see exactly the traffic they saw before.
+
+### Added
+
+- **Checksummed frames.** A frame can be sent as `~HHHH<frame>`, where `HHHH` is the
+  CRC-16/CCITT-FALSE of the frame. A v33 module verifies it before acting, drops it if it does
+  not match, and answers with checksummed replies; older firmware skips the prefix and runs the
+  frame unchecked, so the same frame is safe on a mixed wall.
+
+  The gateway uses it where a corrupted frame does damage or costs a retry — **reads, writes,
+  restores and the version query** — and leaves **display content plain**, because five extra
+  bytes on a six-byte display command is 80% more traffic for a frame the next update
+  overwrites anyway.
+
+  **Every reply that arrives with a checksum is verified**, and one that fails is dropped
+  rather than parsed, which is the entire point. It is counted, logged as an incident naming
+  the module, and recorded in the soak trace byte for byte. Our implementation was checked
+  against the module firmware's own check value and against Python's `crc_hqx`.
+
+  Note for anyone reading the monitor: the receive path previously began at the `m` of a frame,
+  so a checksum prefix was skipped and the frame was parsed as though it had never been
+  checked. It now starts at the `~`.
+
+- **The counters a v33 module keeps about itself** — receive overflows, broadcast replies sent,
+  how many went out late, and checksummed frames it dropped — are read and shown in the
+  module's Info dialog and returned by the API. Older modules report them as unavailable.
+
+- **`POST /api/flap/stats` {"id":N}** returns that snapshot **without starting a self-test**.
+  The existing diagnostics endpoint returns the same figures but spins the reel for twenty
+  seconds with them, and reading a counter should not cost a motor test. Nothing it sends
+  moves a flap.
+
+- **Bus Health counts checksummed traffic**: frames verified against frames dropped as corrupt.
+  Failures should be zero.
+
+### Measured on a mixed wall
+
+Seven modules on v32, eight on v33:
+
+| | |
+|---|---|
+| Soak | 18 passes, 256 queries, **0 failures**, 0 discards, 0 rejects, 0 retries |
+| Checksummed frames | **165 verified, 0 failed** |
+| v32 modules | plain traffic throughout, unchanged |
+
+And the cross-check the module firmware authors suggested, which is only possible now that both
+sides count: modules 11 and 13 each reported sending **3** broadcast replies over a run, and the
+gateway heard **3** from each. Receive overflows, late slots and checksum errors were all zero.
+
 ## v3.17.1 — 2026-10-19
 
 ### Changed

@@ -34,6 +34,7 @@ struct BusIncident {
 //   'M'  a long read was never answered, after both asks
 //   'F'  a long read failed and a shorter one succeeded in its place -- the module is there,
 //        the LENGTH is the problem. Logged by the caller that recovered, because only it knows
+//   'C'  a checksummed frame arrived and its checksum did not match -- the wire corrupted it
 //   'X'  two modules appear to share one id
 
 void incidentsInit();                                            // once, from setup()

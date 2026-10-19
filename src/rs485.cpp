@@ -21,6 +21,29 @@ static void sfTrackFromFrame(const uint8_t* data, size_t len);
 // any task that pushes to the ring is started.
 // Allocate a large buffer in PSRAM (preferred) or internal RAM (fallback),
 // zeroed. Logs where it landed. Returns NULL only if both allocations fail.
+uint16_t sfCrc16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+void rs485SendChecked(const char* frame) {
+  if (!frame || !frame[0]) return;
+  size_t n = strlen(frame);
+  while (n && (frame[n-1] == '\n' || frame[n-1] == '\r')) n--;   // the CRC covers the frame only
+  if (!n || n + CRC_PREFIX_BYTES + 2 > TX_MAX_BYTES) return;
+  static uint8_t out[TX_MAX_BYTES];
+  const uint16_t crc = sfCrc16((const uint8_t*)frame, n);
+  int w = snprintf((char*)out, sizeof(out), "~%04X", crc);
+  memcpy(out + w, frame, n);
+  w += (int)n;
+  out[w++] = '\n';                                   // always terminated, by the format's rule
+  rs485Send(out, (size_t)w, true);                   // raw: the framing is ours, not the normalizer's
+}
+
 void* psramAlloc(const char* name, size_t bytes) {
   void* p = NULL;
   if (psramFound()) p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);

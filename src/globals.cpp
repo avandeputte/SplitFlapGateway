@@ -132,6 +132,8 @@ Preferences prefs;
 // heap as receive buffers pile up). Allocated in setup() via ringInit(); falls
 // back to internal RAM if PSRAM is unavailable. Never freed.
 RS485Msg*         msgRing       = NULL;
+volatile unsigned long rxCrcOk = 0, rxCrcFail = 0;
+volatile bool     rxLastChecked = false;
 volatile int      msgHead       = 0;
 volatile uint32_t msgSeq        = 0;
 volatile uint32_t msgPollSeq    = 0;

@@ -63,6 +63,16 @@ void ringPushCommand(char origin, const char* desc);  // log an inbound REST/MQT
 void ringDrain(void (*emit)(const char* chunk));
 void rs485Begin();
 void rs485Send(const uint8_t* data, size_t len, bool raw = false);
+/* CRC-16/CCITT-FALSE: polynomial 0x1021, initial value 0xFFFF, no reflection, no final XOR.
+   The check value for "123456789" is 0x29B1. This is the module firmware's definition. */
+uint16_t sfCrc16(const uint8_t* data, size_t len);
+/* Send `frame` (no terminator) as ~HHHH<frame>\n. A checksummed frame must always carry its
+   terminator: the module decides where the frame ends before it checks it. */
+void rs485SendChecked(const char* frame);
+// Checksummed traffic, counted for the Status tab: frames verified, and frames dropped because
+// their checksum did not match. rxCrcFail climbing means the wire is corrupting frames.
+extern volatile unsigned long rxCrcOk, rxCrcFail;
+extern volatile bool rxLastChecked;      // was the most recently parsed reply checksummed?
 void rs485SendStr(const char* s);
 
 // ---- scheduled (paced) outbound frames ----

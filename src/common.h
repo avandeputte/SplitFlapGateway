@@ -130,7 +130,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.17.1"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.18.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -212,6 +212,16 @@ extern char gResetReason[12];   // why the board last rebooted, for /api/status
 #define BUS_GAP_SHORT_MS          150UL   // between short queries (v, Q)
 #define BUS_GAP_LONG_MS           260UL   // after a long reply (d, A) -- over the module's 200 ms resync
 #define BUS_RETRY_GAP_MS          300UL   // before a second attempt at a long read
+
+/* Module firmware v33 added an optional checksummed frame: ~HHHH<frame>\n, where HHHH is the
+   CRC-16/CCITT-FALSE of the frame. A module that supports it verifies before acting, drops a
+   frame that fails, and answers with checksummed replies; older firmware skips the prefix and
+   runs the frame unchecked, so a checksummed frame is safe to send to a mixed wall. The
+   gateway uses it for the exchanges where a corrupted frame does damage or costs a retry --
+   reads, writes, restores -- and leaves display content plain, because five extra bytes on a
+   six-byte display command is 80% more traffic for a frame that the next update overwrites. */
+#define MODULE_FW_CHECKSUM        33     // first module firmware that verifies ~HHHH frames
+#define CRC_PREFIX_BYTES          5      // '~' + four hex digits
 
 #define MODULE_REPROBE_BACKOFF_MS 3600000UL // after MODULE_PROBE_MAX_TRIES unanswered re-queries, leave the module alone for this long before asking again (it stays in the registry throughout)
 #define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before the next probe attempt

@@ -1652,6 +1652,7 @@ paths:
                             R a frame arrived complete and would not parse;
                             L a long read answered only when asked a second time;
                             M a long read was never answered;
+                            C a checksummed frame arrived and its checksum did not match;
                             F a long read failed and a shorter one succeeded in its place
                               -- the module is there, its reply LENGTH is the problem;
                             X two modules appear to share one id
@@ -1800,6 +1801,51 @@ paths:
                   minutes: { type: integer, example: 10 }
         "409":
           description: Something else owns the bus
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/flap/stats:
+    post:
+      tags: [Status]
+      summary: A module's own snapshot, without starting a self-test (v3.18)
+      description: |
+        The same figures as `/api/flap/diag` returns, but it does not start a Hall test with
+        them, so nothing moves. Since module firmware v33 the snapshot carries the counters that
+        matter for chasing a bus problem: receive overflows, broadcast replies sent and how many
+        went out late, and checksummed frames the module dropped as corrupt. Comparing
+        `bcastSent` with what the gateway heard separates a reply lost on the wire from one that
+        was never sent. Older firmware reports the four as -1.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, minimum: 0, maximum: 254 }
+      responses:
+        "200":
+          description: The snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:          { type: boolean }
+                  id:          { type: integer }
+                  resetCause:  { type: integer }
+                  bootCount:   { type: integer }
+                  vcc:         { type: integer, description: "Supply in millivolts" }
+                  eepromOk:    { type: integer }
+                  curIndex:    { type: integer }
+                  rxOverflows: { type: integer }
+                  bcastSent:   { type: integer }
+                  bcastLate:   { type: integer }
+                  crcErrors:   { type: integer }
+        "504":
+          description: The module did not answer
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2490,7 +2536,9 @@ components:
             rejects:   { type: integer, description: "Frames that arrived complete but would not parse", example: 0 }
             dropped:   { type: integer, description: "Frames discarded: longer than the receive buffer, or never terminated. Used to be silent", example: 0 }
             dropBytes: { type: integer, description: "Size of the most recently discarded frame", example: 0 }
-            maxLen:    { type: integer, description: "Longest complete frame received since boot (limit 768)", example: 447 }
+            maxLen:    { type: integer, description: "Longest complete frame received since boot (limit 1024)", example: 447 }
+            crcOk:     { type: integer, description: "Checksummed frames verified (v3.18; module firmware v33+)", example: 165 }
+            crcFail:   { type: integer, description: "Checksummed frames dropped because the wire corrupted them. Should be zero", example: 0 }
             lock:
               type: object
               description: >
