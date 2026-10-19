@@ -31,6 +31,7 @@
 #include "capset.h"
 #include "bus.h"
 #include "incidents.h"
+#include "trace.h"
 #include "restore.h"
 #include "mqtt.h"
 #include "ota.h"

@@ -37,6 +37,7 @@ static void handleApiSoak();
 static void handleApiSoakCancel();
 static void handleApiSoakSnapshot();
 static void handleApiIncidents();
+static void handleApiSoakLog();
 static void handleApiIncidentsClear();
 static void handleApiSoakRollback();
 static void handleApiSoakStatus();
@@ -2176,6 +2177,40 @@ static void handleApiSoak() {
            (int)gSoak.modules, minutes < 1 ? 1 : (minutes > 60 ? 60 : minutes));
   server.send(200, "application/json", out);
 }
+/* GET /api/flap/soak/log -- the raw bus traffic of the last soak test, as a text file.
+   Always there after a run, clean or not: a trace from a healthy wall is the baseline a broken
+   one is read against. ?meta=1 reports what is stored without sending it. */
+static void handleApiSoakLog() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  size_t bytes = 0;
+  char first[160] = "";
+  const bool have = traceFileInfo(&bytes, first, sizeof(first));
+  if (server.hasArg("meta")) {
+    char buf[260];
+    if (have) {
+      char esc[180]; size_t e = 0;
+      for (const char* p = first; *p && e < sizeof(esc) - 2; p++) {   // it is a header line, but quote it safely
+        if (*p == '"' || *p == '\\') esc[e++] = '\\';
+        esc[e++] = *p;
+      }
+      esc[e] = 0;
+      snprintf(buf, sizeof(buf), "{\"ok\":true,\"exists\":true,\"bytes\":%u,\"header\":\"%s\"}",
+               (unsigned)bytes, esc);
+    } else {
+      snprintf(buf, sizeof(buf), "{\"ok\":true,\"exists\":false}");
+    }
+    server.send(200, "application/json", buf);
+    return;
+  }
+  if (!have) { sendJsonError(404, "no soak trace stored"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"splitflap-soak-trace.txt\"");
+  server.client().setConnectionTimeout(2000);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain", "");
+  traceEmitFile([](const char* c) { server.sendContent(c); wdgWebMs = millis(); });
+  server.sendContent("");
+}
+
 /* GET /api/bus/incidents?max=50 -- the last anomalies the bus produced, newest first.
    A counter tells you six frames were discarded; this tells you which module had the bus, what
    it was being asked, how big the frame was and when -- the difference between a number and a
@@ -2879,6 +2914,7 @@ void webInit() {
   server.on("/api/flap/soak/cancel", HTTP_POST,    handleApiSoakCancel);
   server.on("/api/flap/soak/status", HTTP_GET,     handleApiSoakStatus);
   server.on("/api/flap/soak/snapshot", HTTP_GET,    handleApiSoakSnapshot);
+  server.on("/api/flap/soak/log",      HTTP_GET,     handleApiSoakLog);
   server.on("/api/bus/incidents",      HTTP_GET,     handleApiIncidents);
   server.on("/api/bus/incidents",      HTTP_DELETE,  handleApiIncidentsClear);
   server.on("/api/bus/incidents",      HTTP_OPTIONS, handleOptions);

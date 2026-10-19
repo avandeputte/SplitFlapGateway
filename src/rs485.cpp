@@ -93,6 +93,7 @@ void ringPush(const RS485Msg& m) {
   msgRing[msgHead] = m;
   msgHead = (msgHead + 1) % MSG_RING_SIZE;
   msgSeq  = msgSeq + 1;
+  if (traceActive()) traceFrame(m.dir, m.data, m.len, m.fullLen ? m.fullLen : m.len);
   xSemaphoreGive(msgMutex);
 }
 

@@ -266,12 +266,16 @@ function soakRender(s){var out=document.getElementById("soakOut");if(!out)return
   t1+="<tr>"+td(id)+td(r.fw?("v"+r.fw):"-","var(--dim)")+td(r._why,r._c)+cell(r,SHORT)+cell(r,LONG)+cell(r,WR)+lg+wr+"</tr>";
   t2+="<tr>"+td(id)+["v","Q","d","A","V","B","W"].map(function(k){return cell(r,[k]);}).join("")+lg+wr+"</tr>";});
  h+=t1+"</table>"+t2+"</table>";
+ h+="<p id='traceLine' style='font-size:.75rem;color:var(--dim);margin:8px 0 0'></p>";
  if(s.snap&&(s.snap.ok||s.snap.modules))h+="<p style='font-size:.75rem;color:var(--dim);margin:8px 0 0'>"+t("Before the test wrote anything it read the calibration of ")+s.snap.modules+t(" of ")+s.snap.total+t(" modules into the gateway's flash. ")+"<a href='/api/flap/soak/snapshot' download>"+t("Download that snapshot")+"</a> &middot; <a href='#' onclick='soakRollback();return false;'>"+t("restore the wall from it")+"</a></p>";
  else if(s.snap&&s.snap.err)h+="<p style='font-size:.75rem;color:var(--ylw);margin:8px 0 0'>"+t("No pre-test snapshot was taken: ")+s.snap.err+t(". Each module's own before-values are still in the report above.")+"</p>";
  h+="<p style='font-size:.75rem;color:var(--dim);margin:6px 0 0'><a href='#' onclick=\"var a=document.getElementById('soakT1'),b=document.getElementById('soakT2'),s=a.style.display==='none';a.style.display=s?'':'none';b.style.display=s?'none':'';this.textContent=s?'"+t("Show every kind of traffic")+"':'"+t("Show the summary")+"';return false;\">"+t("Show every kind of traffic")+"</a> &middot; "+t("Short = version, snapshot, roll call. Long = dump, combined dump, broadcast dump, each asked twice before it counts as a miss. Writes = a home offset and a map entry, each nudged and put back.")+"</p>";
  if(s.drops&&fx.length)h+="<p style='font-size:.78rem;color:var(--bad);margin-top:6px'>"+s.drops+t(" frame(s) were discarded during the test: replies arrived that were too long or never terminated.")+"</p>";
  if(s.rejects&&!F.dup.length)h+="<p style='font-size:.78rem;color:var(--ylw)'>"+s.rejects+t(" frame(s) arrived corrupt.")+"</p>";
- out.innerHTML=h;}
+ out.innerHTML=h;traceInfo();}
+function traceInfo(){fetch("/api/flap/soak/log?meta=1").then(function(r){return r.json();}).then(function(j){var e=document.getElementById("traceLine");if(!e)return;
+ if(!j.exists){e.textContent=t("No trace stored yet.");return;}
+ e.innerHTML=t("Every frame of this run was recorded: ")+"<a href='/api/flap/soak/log' download>"+t("download the trace")+"</a> ("+Math.round(j.bytes/1024)+" KB). "+t("It is kept until the next run, clean or not, and it is what to send with a bug report.");}).catch(function(){});}
 function soakPoll(){fetch("/api/flap/soak/status").then(function(r){return r.json();}).then(function(s){var c=document.getElementById("soakCancel"),b=document.getElementById("soakBtn");
  if(s.state==="running"&&s.snap&&s.snap.running){if(c)c.style.display="";if(b)b.disabled=true;soakSay(t("Reading every module's calibration first, so the test can be undone: ")+s.snap.done+" / "+s.snap.total,"var(--warn)");if(!_soakTimer)_soakTimer=setInterval(function(){pollGated(soakPoll);},3000);return;}
  if(s.state==="running"){if(c)c.style.display="";if(b)b.disabled=true;var left=Math.ceil((s.remaining||0)/60);soakSay(t("Running: pass ")+s.passes+", "+s.queries+t(" queries, ")+s.failures+t(" missed, about ")+left+t(" min left"),"var(--warn)");soakRender(s);if(!_soakTimer)_soakTimer=setInterval(soakPoll,3000);return;}

@@ -821,6 +821,7 @@ static void taskSoak(void* pv) {
   //    A module that will not answer here is simply not covered -- it is still soaked, and
   //    the write leg keeps its own before-values in the row either way.
   busHold("soak", BUS_BUSY, 180000UL);
+  traceBegin("soak test");
   gSoak.snapRunning = true;
   gSoak.snapErr[0]  = 0;
   gSoak.snapOkFlag  = restoreWriteSnapshot(SOAK_SNAPSHOT_FILE, &gSoak.snapDone, &gSoak.snapTotal,
@@ -839,6 +840,7 @@ static void taskSoak(void* pv) {
   for (int pass = 0; !gSoak.cancel && (long)(millis() - gSoak.deadlineMs) < 0; pass++) {
     const char cmd = kPass[pass % SOAK_STEPS].cmd;
     const int  k   = kPass[pass % SOAK_STEPS].k;
+    traceNote("# pass %d: %c", pass + 1, cmd);
     busHold("soak", BUS_BUSY, 180000UL);
     if (cmd == 'V' || cmd == 'B') {
       soakBroadcast(cmd == 'V' ? 'v' : 'A', k);
@@ -903,6 +905,15 @@ static void taskSoak(void* pv) {
   gSoak.rejectsDuring = sfParseRejects - gSoak.rejectsBefore;
   gSoak.elapsedMs     = millis() - gSoak.startedMs;
   busRelease("soak");
+  {   // the bus is free again, so the flash write cannot perturb anything it measured
+    char sum[160];
+    snprintf(sum, sizeof(sum),
+             "%s after %lus: %d passes, %d queries, %d failures, %d writes, %lu dropped, %lu rejected",
+             gSoak.cancel ? "cancelled" : "finished", gSoak.elapsedMs / 1000UL,
+             (int)gSoak.passes, (int)gSoak.queries, (int)gSoak.failures, (int)gSoak.writes,
+             (unsigned long)gSoak.dropsDuring, (unsigned long)gSoak.rejectsDuring);
+    traceEnd(sum);
+  }
   gSoak.active = false;
   gSoak.done   = true;
   printf("[SOAK] %s after %lus: %d passes, %d queries, %d failures, %d writes (%d not put back), "

@@ -1,5 +1,35 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.17.0 — 2026-10-19
+
+### Added
+
+- **The soak test records every frame, and the trace is downloadable.** A report says what
+  happened; a trace says what was on the wire — which reply came back short, what the bytes
+  were, how long the gap before the retry was. That is the difference between guessing at
+  someone else's wall and reading it.
+
+  The trace is kept after every run, **clean or not**, because a trace from a healthy wall is
+  the baseline a broken one is read against. Download it from the Status tab under the soak
+  result, or `GET /api/flap/soak/log` (add `?meta=1` for its size without fetching it). It
+  survives a reboot and a firmware update, and is replaced by the next run.
+
+  The file opens with the gateway version, the time, the bus settings and **every module with
+  its firmware version and serial number**, so it stands on its own for someone who has never
+  seen that wall. Then one line per frame: milliseconds since the start, direction, and the
+  frame. A 15-module two-minute run is about 40 KB.
+
+  Two things shape how it works. **Nothing is written to flash while the test runs** — flash
+  writes stall the cache and the test is measuring milliseconds — so the trace accumulates in
+  PSRAM and is written once, after the bus is released. And **memory is bounded with the
+  newest data winning**: a 64-module half-hour run is around 144,000 frames, so the buffer
+  holds 2 MB, evicts whole lines from the front, and says in the file how many it dropped.
+
+  Long healthy replies are stored cut to their first 96 bytes with the real length noted,
+  because a successful dump's content is predictable. Anything anomalous is stored whole: a
+  frame the gateway discarded for having no terminator goes into the trace byte for byte,
+  since those bytes are the evidence.
+
 ## v3.16.0 — 2026-10-18
 
 The board carries 8 MB of PSRAM and was using 2.8% of it, while the things that matter when

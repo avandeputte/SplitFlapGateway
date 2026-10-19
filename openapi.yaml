@@ -1799,6 +1799,47 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /api/flap/soak/log:
+    get:
+      tags: [Status]
+      summary: The raw bus traffic of the last soak test (v3.17)
+      description: |
+        Every frame the last soak put on the wire, as a text file: a header with the gateway
+        version, the bus settings and every module with its firmware and serial number, then
+        one line per frame (milliseconds since the start, direction, the frame itself). Kept
+        after every run, clean or not, and replaced by the next one; it survives a reboot.
+
+        Long healthy replies are cut to their first 96 bytes with the true length noted; frames
+        the gateway discarded are kept whole. The capture is held in PSRAM during the run and
+        written to flash only once the bus is released, so it cannot perturb what it measures.
+        The buffer is 2 MB and evicts whole lines from the front, noting in the file how many
+        were dropped.
+      parameters:
+        - name: meta
+          in: query
+          required: false
+          schema: { type: string }
+          description: Any value returns what is stored instead of the file.
+      responses:
+        "200":
+          description: The trace, or its metadata with `?meta=1`
+          content:
+            text/plain:
+              schema: { type: string }
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:     { type: boolean }
+                  exists: { type: boolean }
+                  bytes:  { type: integer }
+                  header: { type: string, description: "The first line of the stored trace" }
+        "404":
+          description: No trace stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/flap/soak/snapshot:
     get:
       tags: [Status]
