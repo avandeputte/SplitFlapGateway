@@ -17,18 +17,25 @@
   The file opens with the gateway version, the time, the bus settings and **every module with
   its firmware version and serial number**, so it stands on its own for someone who has never
   seen that wall. Then one line per frame: milliseconds since the start, direction, and the
-  frame. A 15-module two-minute run is about 40 KB.
+  frame, recorded **whole** — a full combined dump with its entire calibration map appears in
+  the trace exactly as it arrived.
+
+  Coverage was checked against the gateway's own frame counters: **every frame on the wire is
+  in the file**, 453 of 453 in a one-minute run.
 
   Two things shape how it works. **Nothing is written to flash while the test runs** — flash
   writes stall the cache and the test is measuring milliseconds — so the trace accumulates in
   PSRAM and is written once, after the bus is released. And **memory is bounded with the
-  newest data winning**: a 64-module half-hour run is around 144,000 frames, so the buffer
-  holds 2 MB, evicts whole lines from the front, and says in the file how many it dropped.
+  newest data winning**: the ring holds 4 MB, evicts whole lines from the front, and records in
+  the file how many it dropped.
 
-  Long healthy replies are stored cut to their first 96 bytes with the real length noted,
-  because a successful dump's content is predictable. Anything anomalous is stored whole: a
-  frame the gateway discarded for having no terminator goes into the trace byte for byte,
-  since those bytes are the evidence.
+  Measured rather than estimated: a soak costs about **2 KB per module-minute**, so the biggest
+  run most people will do — 64 modules for half an hour, around 58,000 frames — comes to
+  **3.6 MB and fits whole**. A full hour, or a wall past a hundred modules, keeps the most
+  recent 4 MB and says so in the file.
+
+  Cutting long replies was tried first and dropped: measured against a real run it saved 29%,
+  while costing the one thing a trace is for.
 
 ## v3.16.0 — 2026-10-18
 

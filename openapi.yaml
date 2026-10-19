@@ -1809,11 +1809,12 @@ paths:
         one line per frame (milliseconds since the start, direction, the frame itself). Kept
         after every run, clean or not, and replaced by the next one; it survives a reboot.
 
-        Long healthy replies are cut to their first 96 bytes with the true length noted; frames
-        the gateway discarded are kept whole. The capture is held in PSRAM during the run and
-        written to flash only once the bus is released, so it cannot perturb what it measures.
-        The buffer is 2 MB and evicts whole lines from the front, noting in the file how many
-        were dropped.
+        Frames are recorded whole, including a full combined dump with its calibration map, and
+        coverage is complete: every frame the gateway's counters see is in the file. The capture
+        is held in PSRAM during the run and written to flash only once the bus is released, so
+        it cannot perturb what it measures. The ring is 4 MB and evicts whole lines from the
+        front, noting in the file how many were dropped -- about 2 KB per module-minute, so a
+        64-module half-hour run (~3.6 MB) fits whole.
       parameters:
         - name: meta
           in: query

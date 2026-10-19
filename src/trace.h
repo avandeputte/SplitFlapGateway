@@ -11,27 +11,30 @@
 //   * Nothing is written to flash while the test runs. Flash writes stall the cache and add
 //     milliseconds of jitter, and the test is measuring milliseconds. The trace accumulates in
 //     PSRAM and is written out once, after the bus is released.
-//   * Memory is bounded and the NEWEST data wins. A 64-module half-hour run is ~144,000 frames;
-//     no board holds that. The ring evicts whole lines from the front and counts what it
-//     dropped, so the file is always chronological and always says what is missing.
+//   * Memory is bounded and the NEWEST data wins. The ring evicts whole lines from the front
+//     and counts what it dropped, so the file is always chronological and always says what is
+//     missing.
 //
-// Long healthy replies are stored truncated (their first TRACE_PAYLOAD_MAX bytes plus the real
-// length) because a successful dump's content is predictable; anything anomalous is stored
-// whole, because its bytes are the evidence.
+// Frames are stored WHOLE. Cutting long replies was measured against a real run and saved only
+// 29% -- most frames on this bus are short -- while costing the one thing a trace is for: the
+// bytes of the reply that went wrong. At full fidelity a 64-module half-hour soak is ~3.6 MB,
+// which the ring holds. The format line buffer lives in PSRAM too, since a whole frame escaped
+// for text is 4 KB and internal RAM is the scarce memory here.
 
 #ifndef SFGW_TRACE_H
 #define SFGW_TRACE_H
 
 #include "common.h"
 
-#define TRACE_BYTES        (2UL * 1024UL * 1024UL)   // PSRAM ring (of 8 MB, ~7.3 free)
-#define TRACE_PAYLOAD_MAX  96                        // bytes kept from a healthy long reply
+#define TRACE_BYTES        (4UL * 1024UL * 1024UL)   // PSRAM ring: a 64-module 30-min run is ~3.6 MB
+#define TRACE_PAYLOAD_MAX  RING_FRAME_BYTES          // whole frames: the longest the bus can carry
 #define TRACE_FILE         "/soaktrace.txt"
 
 void traceInit();                       // once, from setup()
 // Begin a capture. Everything until traceEnd() is recorded. `what` goes in the header.
 void traceBegin(const char* what);
 bool traceActive();
+uint32_t traceFrames();      // frames captured in the current (or last) run
 // One frame, as seen on the wire. dir 'T' sent, 'R' received, 'C' a command from REST/MQTT.
 void traceFrame(char dir, const uint8_t* data, size_t len, size_t fullLen);
 // Anything worth a line of its own: a pass boundary, a discarded frame, an incident.
