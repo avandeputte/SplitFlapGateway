@@ -589,10 +589,8 @@ static void taskProbe(void* pv) {
         ok = sfSendAndCaptureQ(id, 900);
       } else {
         static char out[TX_MAX_BYTES];
-        if (cmd == 'A' && sn[0]) snprintf(frame, sizeof(frame), "mXA%s\n", sn);
-        else if (cmd == 'A')     snprintf(frame, sizeof(frame), "m%dA\n", id);
-        else if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
-        else                     snprintf(frame, sizeof(frame), "m%dd\n", id);
+        if (cmd == 'A') snprintf(frame, sizeof(frame), "m%dA\n", id);
+        else            snprintf(frame, sizeof(frame), "m%dd\n", id);
         ok = sfSendAndCaptureDump(id, frame, 1400, out, sizeof(out));
       }
       gProbe.s[k].tries = gProbe.s[k].tries + 1;
@@ -685,10 +683,10 @@ static bool soakMapLookup(const char* d, int idx, int* pos) {
   return false;
 }
 static bool soakDump(int id, const char* sn, int fwNum, char* out, size_t outLen) {
-  char frame[48];
-  if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
-  else                      snprintf(frame, sizeof(frame), "m%dd\n", id);
-  return sfSendAndCaptureDump(id, frame, 1400, out, outLen);
+  char frame[48], alt[48] = "";
+  snprintf(frame, sizeof(frame), "m%dd\n", id);                       // 6 bytes, not 24
+  if (sn[0] && fwNum >= 15) snprintf(alt, sizeof(alt), "mXD%s\n", sn);  // only if that is ignored
+  return sfReadDump(id, frame, 1400, out, outLen, NULL, &gSoak.cancel, alt[0] ? alt : NULL);
 }
 // Send a write, read the dump back, compare. 1 = the value is there; 0 = read back, but
 // different; -1 = the read-back got no reply.
@@ -870,12 +868,17 @@ static void taskSoak(void* pv) {
       else if (cmd == 'v') ok = sfSendVersionAndWait(r.id, 700, NULL, 0, NULL, 0, NULL);
       else if (cmd == 'Q') ok = sfSendAndCaptureQ(r.id, 900);
       else {
-        if (cmd == 'A' && sn[0])       snprintf(frame, sizeof(frame), "mXA%s\n", sn);
-        else if (cmd == 'A')           snprintf(frame, sizeof(frame), "m%dA\n", r.id);
-        else if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
-        else                           snprintf(frame, sizeof(frame), "m%dd\n", r.id);
+        char alt[48] = "";
+        if (cmd == 'A') {
+          snprintf(frame, sizeof(frame), "m%dA\n", r.id);
+          if (sn[0]) snprintf(alt, sizeof(alt), "mXA%s\n", sn);
+        } else {
+          snprintf(frame, sizeof(frame), "m%dd\n", r.id);
+          if (sn[0] && fwNum >= 15) snprintf(alt, sizeof(alt), "mXD%s\n", sn);
+        }
         bool late = false;
-        ok = sfReadDump(r.id, frame, 1400, out, sizeof(out), &late, &gSoak.cancel);
+        ok = sfReadDump(r.id, frame, 1400, out, sizeof(out), &late, &gSoak.cancel,
+                        alt[0] ? alt : NULL);
         if (late && r.late < 255) r.late++;
         (void)0;   // the miss is logged inside sfReadDump, for every caller
       }
@@ -1089,11 +1092,12 @@ void sfBusResync() {
 }
 
 bool sfReadDump(int id, const char* frame, unsigned long timeoutMs,
-                char* out, size_t outLen, bool* late, volatile bool* abort) {
+                char* out, size_t outLen, bool* late, volatile bool* abort, const char* alt) {
   if (late) *late = false;
   if (sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) return true;
   if (abort && *abort) return false;      // cancelled: do not spend another read winding down
   vTaskDelay(pdMS_TO_TICKS(BUS_RETRY_GAP_MS));
+  if (alt) frame = alt;                   // second ask: the unambiguous form, whatever it cost
   if (!sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) {
     if (!(abort && *abort)) incidentLog((uint8_t)id, 'M', frame && frame[2] == 'A' ? 'A' : 'd', 0);
     return false;

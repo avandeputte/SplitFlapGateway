@@ -1,5 +1,38 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.17.1 — 2026-10-19
+
+### Changed
+
+- **The gateway stops shouting serial numbers at a wall that knows its own IDs.** Reading a
+  module's calibration was addressed by serial number whenever one was known —
+  `mXD304C55333832E686300D` at 24 bytes where `m12d` does the same job in 6. Every module on
+  the bus receives every command, so those 20 extra bytes were spent by the whole wall, on
+  every read, to disambiguate something that is almost never ambiguous.
+
+  Measured on the trace of a two-minute soak, before and after:
+
+  | | Command frames | Bytes on the wire |
+  |---|---|---|
+  | Before | 575 | 5,742 |
+  | After | 590 | 2,058 |
+
+  **64% fewer command bytes**, with the same 240 queries answered and no retries needed.
+
+  The serial-number form has not gone away; it has moved to where it earns its length. A read
+  is asked by ID first, and only if that goes unanswered is it asked again by serial number,
+  which no other module can answer by mistake. That is also exactly when a stale or duplicated
+  ID is a plausible explanation, so the expensive form is now used in the one case it helps.
+
+  It matters beyond tidiness: shorter commands mean fewer bytes every other module has to
+  receive while it is busy, and an overrun receive buffer on a module is the mechanism behind
+  the silent-module reports this series of releases has been chasing.
+
+  Provisioning (`mXI`, `mXH`), restores (`mXW`), the by-serial API endpoints and the soak's
+  pre-run snapshot still address by serial number, each for a reason: the module has no usable
+  ID yet, the ID is being changed, or pairing the right calibration with the right serial is
+  the point of the operation.
+
 ## v3.17.0 — 2026-10-19
 
 ### Added

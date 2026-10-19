@@ -1897,20 +1897,21 @@ static void handleApiDump() {
   const char* verStr = (fwVer[0] == 'v' || fwVer[0] == 'V') ? fwVer + 1 : fwVer;
   int fwVerNum = atoi(verStr);
 
-  // Read fresh: prefer the serial-number dump mXD<sn> for fw>=15 with a known
-  // SN; fall back to m<id>d if that gets no reply. A full 64-flap dump is ~565
-  // bytes (~590ms to transmit at 9600 baud) plus the module's EEPROM-read time,
-  // so the wait must be well over 500ms; 1200ms lets mXD fully respond before any
-  // fallback, avoiding a half-duplex collision with a late reply.
+  // Ask by id, which is six bytes; keep the serial-number form for the second ask, where it
+  // is worth its twenty-four. Every module on the wall receives every command, so the long
+  // form was costing the whole bus to disambiguate something that is rarely ambiguous.
+  // A full 64-flap dump is ~565 bytes (~590 ms at 9600 baud) plus the module's EEPROM-read
+  // time, so the wait must be well over 500 ms.
   char rawDump[TX_MAX_BYTES] = "";
   bool gotReply = false;
-  if (fwVerNum >= 15 && sn[0]) {
-    DBG("[API] dump module %d via SN %s (fw=%d)\n", id, sn, fwVerNum);
-    char f[40]; snprintf(f, sizeof(f), "mXD%s\n", sn);
-    gotReply = sfReadDump(id, f, 1200, rawDump, sizeof(rawDump));
+  {
+    char f[16];  snprintf(f, sizeof(f), "m%dd\n", id);
+    char alt[40] = "";
+    if (fwVerNum >= 15 && sn[0]) snprintf(alt, sizeof(alt), "mXD%s\n", sn);
+    gotReply = sfReadDump(id, f, 1200, rawDump, sizeof(rawDump), NULL, NULL, alt[0] ? alt : NULL);
   }
   if (!gotReply) {
-    DBG("[API] dump module %d via ID (fw=%d)\n", id, fwVerNum);
+    DBG("[API] dump module %d: no answer either way (fw=%d)\n", id, fwVerNum);
     char f[16]; snprintf(f, sizeof(f), "m%dd\n", id);
     gotReply = sfReadDump(id, f, 1200, rawDump, sizeof(rawDump));
   }
@@ -1971,10 +1972,10 @@ static void handleApiAll() {
 
   if (fwVerNum >= 25) {
     // Known v25+: one combined 'A' transaction.
-    char f[64];
-    if (sn[0]) { DBG("[API] all via mXA %s\n", sn); snprintf(f, sizeof(f), "mXA%s\n", sn); }
-    else       { DBG("[API] all via m%dA\n", id);   snprintf(f, sizeof(f), "m%dA\n", id); }
-    gotReply = sfReadDump(id, f, 1300, rawDump, sizeof(rawDump));  // 'A' ~570ms + assembly
+    char f[16]; snprintf(f, sizeof(f), "m%dA\n", id);          // six bytes, not twenty-four
+    char alt[64] = "";
+    if (sn[0]) snprintf(alt, sizeof(alt), "mXA%s\n", sn);      // the second ask, if the first is ignored
+    gotReply = sfReadDump(id, f, 1300, rawDump, sizeof(rawDump), NULL, NULL, alt[0] ? alt : NULL);
     // v3.14: fall back to v+d when 'A' does not come back. This used to return stale on the
     // assumption that a timeout means the module is offline -- which is wrong whenever the
     // failure depends on reply LENGTH. 'A' is the longest reply a module ever sends (it grows
@@ -1985,10 +1986,10 @@ static void handleApiAll() {
       printf("[API] module %d: 'A' did not answer -- retrying with the shorter v+d\n", id);
       mode = "A>vd";
       sfSendVersionAndWait(id, 700, fwVer, sizeof(fwVer), sn, sizeof(sn), NULL);
-      char f2[40];
-      if (sn[0]) snprintf(f2, sizeof(f2), "mXD%s\n", sn);
-      else       snprintf(f2, sizeof(f2), "m%dd\n", id);
-      gotReply = sfReadDump(id, f2, 1300, rawDump, sizeof(rawDump));
+      char f2[16]; snprintf(f2, sizeof(f2), "m%dd\n", id);
+      char alt2[40] = "";
+      if (sn[0]) snprintf(alt2, sizeof(alt2), "mXD%s\n", sn);   // only if the short ask is ignored
+      gotReply = sfReadDump(id, f2, 1300, rawDump, sizeof(rawDump), NULL, NULL, alt2[0] ? alt2 : NULL);
       if (gotReply) printf("[API] module %d: v+d succeeded where 'A' did not\n", id);
     }
   } else {
@@ -1998,10 +1999,10 @@ static void handleApiAll() {
     sfSendVersionAndWait(id, 700, fwVer, sizeof(fwVer), sn, sizeof(sn), NULL);
     verStr   = (fwVer[0] == 'v' || fwVer[0] == 'V') ? fwVer + 1 : fwVer;
     fwVerNum = atoi(verStr);
-    char f[40];
-    if (fwVerNum >= 15 && sn[0]) snprintf(f, sizeof(f), "mXD%s\n", sn);
-    else                         snprintf(f, sizeof(f), "m%dd\n", id);
-    gotReply = sfReadDump(id, f, 1300, rawDump, sizeof(rawDump));
+    char f[16]; snprintf(f, sizeof(f), "m%dd\n", id);
+    char alt[40] = "";
+    if (fwVerNum >= 15 && sn[0]) snprintf(alt, sizeof(alt), "mXD%s\n", sn);
+    gotReply = sfReadDump(id, f, 1300, rawDump, sizeof(rawDump), NULL, NULL, alt[0] ? alt : NULL);
   }
   gDump.waitId = -1;  // disarm capture
   // Snapshot the 'A'-only extras the parse left behind (n/a == -99 for the v+d

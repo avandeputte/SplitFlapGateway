@@ -343,9 +343,15 @@ bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs, ch
                           volatile bool* abort = NULL);
 /* The same, but asks twice: a module that ate the first command while resyncing answers the
    second. `late` (optional) is set when only the retry worked -- worth recording, it means
-   something on the bus is overflowing module receivers. */
+   something on the bus is overflowing module receivers.
+   `alt` (optional) is a DIFFERENT frame for the second ask. That is how the serial-number
+   forms earn their keep: ask by id first, which is 6 bytes, and only if that goes unanswered
+   ask by serial number, which is 24 and cannot be answered by the wrong module. Addressing
+   everything by serial put 20 needless bytes on the bus for every read -- 78% of all command
+   bytes in a soak -- and every module on the wall has to receive them. */
 bool sfReadDump(int id, const char* frame, unsigned long timeoutMs,
-                char* out, size_t outLen, bool* late = NULL, volatile bool* abort = NULL);
+                char* out, size_t outLen, bool* late = NULL, volatile bool* abort = NULL,
+                const char* alt = NULL);
 bool sfSendAndCaptureQ(int id, unsigned long timeoutMs);
 bool sfSendVersionAndWait(int id, unsigned long timeoutMs, char* fwOut, size_t fwLen, char* snOut, size_t snLen, unsigned long* lastSeenOut);
 void sfDeprovision(int addr);
