@@ -1308,11 +1308,12 @@ static void handleApiStatus() {
   snprintf(bst, sizeof(bst), "{\"level\":%d,\"reason\":\"%s\",\"remaining\":%ld}",
            (int)busLevel(), busReason(), busRemainingSec());
   restoreStatusJson(rst, sizeof(rst), false);
-  char out[1152];
+  char out[1280];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
-    "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
+    "\"heap\":%u,\"minheap\":%u,\"psram\":{\"size\":%u,\"free\":%u},"
+    "\"flash\":{\"sketch\":%u,\"free\":%u},\"mqtt\":%s,\"modules\":%d,"
     "\"reset\":\"%s\",\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u,\"soak\":%u,\"probe\":%u},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
     "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s,"
@@ -1322,6 +1323,8 @@ static void handleApiStatus() {
     lip[0],lip[1],lip[2],lip[3],
     aip[0],aip[1],aip[2],aip[3],
     ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+    (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
+    (unsigned)ESP.getSketchSize(), (unsigned)ESP.getFreeSketchSpace(),
     mqtt.connected()?"true":"false",
     sfModuleCount,
     gResetReason, stk485, stkWeb, stkNet, stkOta, stkRtc, stkSoak, stkProbe,
