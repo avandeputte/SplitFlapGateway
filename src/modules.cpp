@@ -875,6 +875,7 @@ static void taskSoak(void* pv) {
         bool late = false;
         ok = sfReadDump(r.id, frame, 1400, out, sizeof(out), &late, &gSoak.cancel);
         if (late && r.late < 255) r.late++;
+        (void)0;   // the miss is logged inside sfReadDump, for every caller
       }
       if (r.tries[k] < 255) r.tries[k]++;
       gSoak.queries = gSoak.queries + 1;
@@ -1082,8 +1083,12 @@ bool sfReadDump(int id, const char* frame, unsigned long timeoutMs,
   if (sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) return true;
   if (abort && *abort) return false;      // cancelled: do not spend another read winding down
   vTaskDelay(pdMS_TO_TICKS(BUS_RETRY_GAP_MS));
-  if (!sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) return false;
+  if (!sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) {
+    if (!(abort && *abort)) incidentLog((uint8_t)id, 'M', frame && frame[2] == 'A' ? 'A' : 'd', 0);
+    return false;
+  }
   if (late) *late = true;
+  incidentLog((uint8_t)id, 'L', frame && frame[2] == 'A' ? 'A' : 'd', 0);
   DBG("[SF] module %d answered the dump only on the second ask\n", id);
   return true;
 }
@@ -1571,6 +1576,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       DBG("[SF] rejecting corrupt version response for module %d (sn:%s)\n",
           id, field[2] ? field[2] : "");
       sfParseRejects++;
+      incidentLog((uint8_t)id, 'R', 'v', (uint16_t)strlen(verBuf));
       sfSoakNoteReply((uint8_t)id, 'v', false);
       if (sfNoteCorruptVersionReply((uint8_t)id)) {
         DBG("[SF] *** possible DUPLICATE ID %d on the bus: %d corrupt version replies "
@@ -1579,6 +1585,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
         char wpl[72];
         snprintf(wpl, sizeof(wpl), "{\"id\":%d,\"reason\":\"duplicate_id_suspected\"}", id);
         mqttPublishSFEvent("warning", wpl);
+        incidentLog((uint8_t)id, 'X', 'v', 0);
       }
       return;
     }
@@ -1685,6 +1692,7 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     if (!sfApplyVersionFields((uint8_t)id, fwCopy, f[2])) {
       DBG("[SF] rejecting corrupt all-fields response for module %d (sn:%s)\n", id, f[2] ? f[2] : "");
       sfParseRejects++;
+      incidentLog((uint8_t)id, 'R', 'A', (uint16_t)strlen(aBuf));
       sfSoakNoteReply((uint8_t)id, 'A', false);
       if (sfNoteCorruptVersionReply((uint8_t)id)) {
         DBG("[SF] *** possible DUPLICATE ID %d on the bus: %d corrupt version replies "

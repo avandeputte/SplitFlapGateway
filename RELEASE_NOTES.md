@@ -1,5 +1,47 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.16.0 — 2026-10-18
+
+The board carries 8 MB of PSRAM and was using 2.8% of it, while the things that matter when
+something goes wrong — the bus history, the record of what failed — were sized for a board
+without any. This spends that memory where it buys evidence.
+
+### Added
+
+- **The bus monitor keeps 512 frames instead of 64.** A minute or more of heavy traffic rather
+  than a few seconds, so an intermittent fault leaves a record whether or not anyone had the
+  Monitor tab open. It costs 550 KB of PSRAM.
+
+  A reader is handed at most 64 frames per request and resumes where it left off, so a long
+  history never turns into a half-megabyte response or a stalled web task. If frames were
+  overwritten before a reader came back, the log says so in its own row rather than leaving a
+  silent hole.
+
+- **A record of what the bus got wrong**, on the Status tab under Bus Health and at
+  `GET /api/bus/incidents` (`DELETE` to clear). A counter says six frames were discarded; this
+  says which module had the bus, what it was being asked, how big the frame was and when.
+  Discarded frames, replies that would not parse, reads that only answered on the second ask,
+  reads never answered, and IDs that look like two modules are all recorded, 1024 of them, in
+  PSRAM. That is the question I could not answer for a 64-module wall last week without
+  reading two firmwares.
+
+- **`GET /api/status` reports the memory** the board actually has: PSRAM size and free, the
+  sketch size and the space left in the OTA slot, beside the existing heap figures and task
+  stacks. All of it was visible only on a USB console before.
+
+### Changed
+
+- **A backup may now be 1 MB** rather than 256 KB. A fully calibrated module dumps around 700
+  bytes, so a 255-module wall produces roughly 180 KB and the old ceiling was within sight of a
+  real installation. The file is parsed in PSRAM; a board without PSRAM keeps the old limit.
+- **Dumps asked for over REST now resync and retry** like the soak's do, which is the path the
+  dashboard's own Backup Calibration sweep uses.
+
+### Fixed
+
+- **The clock task had the thinnest stack in the gateway**, about 750 bytes spare, and it has
+  overflowed once before. It now has a kilobyte more.
+
 ## v3.15.2 — 2026-10-18
 
 Hardening of the bus reads, from a 64-module wall whose soak test reported two modules that

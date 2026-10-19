@@ -36,6 +36,8 @@ static void handleApiBus();
 static void handleApiSoak();
 static void handleApiSoakCancel();
 static void handleApiSoakSnapshot();
+static void handleApiIncidents();
+static void handleApiIncidentsClear();
 static void handleApiSoakRollback();
 static void handleApiSoakStatus();
 static void handleApiBusHold();
@@ -1904,12 +1906,12 @@ static void handleApiDump() {
   if (fwVerNum >= 15 && sn[0]) {
     DBG("[API] dump module %d via SN %s (fw=%d)\n", id, sn, fwVerNum);
     char f[40]; snprintf(f, sizeof(f), "mXD%s\n", sn);
-    gotReply = sfSendAndCaptureDump(id, f, 1200, rawDump, sizeof(rawDump));
+    gotReply = sfReadDump(id, f, 1200, rawDump, sizeof(rawDump));
   }
   if (!gotReply) {
     DBG("[API] dump module %d via ID (fw=%d)\n", id, fwVerNum);
     char f[16]; snprintf(f, sizeof(f), "m%dd\n", id);
-    gotReply = sfSendAndCaptureDump(id, f, 1200, rawDump, sizeof(rawDump));
+    gotReply = sfReadDump(id, f, 1200, rawDump, sizeof(rawDump));
   }
   gDump.waitId = -1;  // disarm capture
 
@@ -1971,7 +1973,7 @@ static void handleApiAll() {
     char f[64];
     if (sn[0]) { DBG("[API] all via mXA %s\n", sn); snprintf(f, sizeof(f), "mXA%s\n", sn); }
     else       { DBG("[API] all via m%dA\n", id);   snprintf(f, sizeof(f), "m%dA\n", id); }
-    gotReply = sfSendAndCaptureDump(id, f, 1300, rawDump, sizeof(rawDump));  // 'A' ~570ms + assembly
+    gotReply = sfReadDump(id, f, 1300, rawDump, sizeof(rawDump));  // 'A' ~570ms + assembly
     // v3.14: fall back to v+d when 'A' does not come back. This used to return stale on the
     // assumption that a timeout means the module is offline -- which is wrong whenever the
     // failure depends on reply LENGTH. 'A' is the longest reply a module ever sends (it grows
@@ -1985,7 +1987,7 @@ static void handleApiAll() {
       char f2[40];
       if (sn[0]) snprintf(f2, sizeof(f2), "mXD%s\n", sn);
       else       snprintf(f2, sizeof(f2), "m%dd\n", id);
-      gotReply = sfSendAndCaptureDump(id, f2, 1300, rawDump, sizeof(rawDump));
+      gotReply = sfReadDump(id, f2, 1300, rawDump, sizeof(rawDump));
       if (gotReply) printf("[API] module %d: v+d succeeded where 'A' did not\n", id);
     }
   } else {
@@ -1998,7 +2000,7 @@ static void handleApiAll() {
     char f[40];
     if (fwVerNum >= 15 && sn[0]) snprintf(f, sizeof(f), "mXD%s\n", sn);
     else                         snprintf(f, sizeof(f), "m%dd\n", id);
-    gotReply = sfSendAndCaptureDump(id, f, 1300, rawDump, sizeof(rawDump));
+    gotReply = sfReadDump(id, f, 1300, rawDump, sizeof(rawDump));
   }
   gDump.waitId = -1;  // disarm capture
   // Snapshot the 'A'-only extras the parse left behind (n/a == -99 for the v+d
@@ -2174,6 +2176,27 @@ static void handleApiSoak() {
            (int)gSoak.modules, minutes < 1 ? 1 : (minutes > 60 ? 60 : minutes));
   server.send(200, "application/json", out);
 }
+/* GET /api/bus/incidents?max=50 -- the last anomalies the bus produced, newest first.
+   A counter tells you six frames were discarded; this tells you which module had the bus, what
+   it was being asked, how big the frame was and when -- the difference between a number and a
+   lead. DELETE clears it, for after a repair. */
+static void handleApiIncidents() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int max = server.hasArg("max") ? server.arg("max").toInt() : 50;
+  if (max < 1)   max = 1;
+  if (max > 300) max = 300;
+  server.client().setConnectionTimeout(1500);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  incidentsEmit([](const char* c) { server.sendContent(c); wdgWebMs = millis(); }, max);
+  server.sendContent("");
+}
+static void handleApiIncidentsClear() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  incidentsClear();
+  server.send(200, "application/json", "{\"ok\":true,\"cleared\":true}");
+}
+
 /* GET /api/flap/soak/snapshot -- the calibration the soak test read before it wrote anything.
    With ?meta=1, just what is in the file; otherwise the file itself, as a download, so it can
    be kept or replayed later through the ordinary restore upload. */
@@ -2856,6 +2879,9 @@ void webInit() {
   server.on("/api/flap/soak/cancel", HTTP_POST,    handleApiSoakCancel);
   server.on("/api/flap/soak/status", HTTP_GET,     handleApiSoakStatus);
   server.on("/api/flap/soak/snapshot", HTTP_GET,    handleApiSoakSnapshot);
+  server.on("/api/bus/incidents",      HTTP_GET,     handleApiIncidents);
+  server.on("/api/bus/incidents",      HTTP_DELETE,  handleApiIncidentsClear);
+  server.on("/api/bus/incidents",      HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/soak/rollback", HTTP_POST,   BUSGATED(handleApiSoakRollback));
   server.on("/api/flap/soak/rollback", HTTP_OPTIONS, handleOptions);
   server.on("/api/bus",              HTTP_GET,     handleApiBus);

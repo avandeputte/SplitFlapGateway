@@ -133,7 +133,8 @@ Preferences prefs;
 // back to internal RAM if PSRAM is unavailable. Never freed.
 RS485Msg*         msgRing       = NULL;
 volatile int      msgHead       = 0;
-volatile int      msgPollCursor = 0;
+volatile uint32_t msgSeq        = 0;
+volatile uint32_t msgPollSeq    = 0;
 StaticSemaphore_t msgMutexBuf;
 SemaphoreHandle_t msgMutex = NULL;
 /* ----------------------------------------------------------

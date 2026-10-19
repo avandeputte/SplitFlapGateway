@@ -132,10 +132,11 @@ void setup() {
   // the modules have finished their own power-up homing. The lock always releases: see
   // restore.cpp. (Moved ahead of the tasks in v3.13.1: it used to follow them, and the
   // first schedule tick could assert Quiet Time in the gap.)
+  incidentsInit();
   restoreInit();
 
   // 8. Spawn tasks after WiFi stack is ready
-  xTaskCreatePinnedToCore(taskRTC,     "RTC",     2048, NULL, 2, &hTaskRTC,   0);
+  xTaskCreatePinnedToCore(taskRTC,     "RTC",     3072, NULL, 2, &hTaskRTC,   0);   // 2048 left only ~750 B spare
   xTaskCreatePinnedToCore(taskRS485,   "RS485",   6144, NULL, 3, &hTaskRS485, 0);
   xTaskCreatePinnedToCore(taskOTA,     "OTA",     4096, NULL, 1, &hTaskOTA,   1);
   xTaskCreatePinnedToCore(taskWeb,     "Web",     8192, NULL, 2, &hTaskWeb,   0);

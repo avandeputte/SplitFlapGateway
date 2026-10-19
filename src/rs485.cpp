@@ -92,6 +92,7 @@ void ringPush(const RS485Msg& m) {
   xSemaphoreTake(msgMutex, portMAX_DELAY);
   msgRing[msgHead] = m;
   msgHead = (msgHead + 1) % MSG_RING_SIZE;
+  msgSeq  = msgSeq + 1;
   xSemaphoreGive(msgMutex);
 }
 
@@ -118,12 +119,22 @@ void ringPushCommand(char origin, const char* desc) {
 void ringDrain(void (*emit)(const char* chunk)) {
   if (!msgMutex || !msgRing) { emit("[]"); return; }
   xSemaphoreTake(msgMutex, portMAX_DELAY);
-  int head = msgHead;
+  const uint32_t head = msgSeq;
   xSemaphoreGive(msgMutex);
 
+  // Where this reader is, what it missed, and how much of the backlog to hand over now.
+  uint32_t cur    = msgPollSeq;
+  uint32_t missed = 0;
+  if (head - cur > MSG_RING_SIZE) {          // the producer lapped us: those frames are gone
+    missed = head - cur - MSG_RING_SIZE;
+    cur    = head - MSG_RING_SIZE;
+  }
+  uint32_t avail = head - cur;
+  uint32_t take  = avail > RING_DRAIN_MAX ? RING_DRAIN_MAX : avail;
+
   // One static scratch for the escaped frame, one for the outgoing chunk. Static, not stack:
-  // a whole 768-byte frame expands to ~2.3 KB as UTF-8, and taskWeb (the only caller) has
-  // ~3.5 KB of headroom. Single caller, no reentrancy.
+  // a whole frame expands to ~3 KB as UTF-8, and taskWeb (the only caller) has ~4 KB of
+  // headroom. Single caller, no reentrancy.
   static char utf8[RING_FRAME_BYTES * 3 + 1];
   static char chunk[1400];        // ~ one TCP segment, like the module-list streamer
   size_t cl = 0;
@@ -135,10 +146,17 @@ void ringDrain(void (*emit)(const char* chunk)) {
 
   RING_PUT("[");
   bool first = true;
-  int i = msgPollCursor;
   char num[24];
-  while (i != head) {
-    const RS485Msg& m = msgRing[i];
+  if (missed) {      // say so in the log itself rather than leaving a silent hole
+    char gap[96];
+    snprintf(gap, sizeof(gap),
+             "{\"ts\":0,\"ep\":0,\"wt\":\"\",\"dir\":\"C\",\"src\":\"S\",\"command\":\"%lu frame(s) not shown -- the monitor was not being read\",\"len\":0}",
+             (unsigned long)missed);
+    RING_PUT(gap);
+    first = false;
+  }
+  for (uint32_t k = 0; k < take; k++) {
+    const RS485Msg& m = msgRing[(cur + k) % MSG_RING_SIZE];
     if (!first) RING_PUT(",");
     first = false;
     // JSON-safe UTF-8: escapes "/\, strips newlines, maps unprintable bytes to a space, and
@@ -155,13 +173,12 @@ void ringDrain(void (*emit)(const char* chunk)) {
     if (m.fullLen > m.len) RING_PUT(",\"trunc\":1");   // only if a frame ever exceeds the ring entry
     if (m.sanitized)       RING_PUT(",\"san\":1");
     RING_PUT("}");
-    i = (i + 1) % MSG_RING_SIZE;
   }
   RING_PUT("]");
   RING_FLUSH();
   #undef RING_PUT
   #undef RING_FLUSH
-  msgPollCursor = head;
+  msgPollSeq = cur + take;    // resume here next time; the rest of the backlog waits
 }
 static uint32_t buildSerialConfig() {
   struct Entry { uint8_t d, p, s; uint32_t c; };

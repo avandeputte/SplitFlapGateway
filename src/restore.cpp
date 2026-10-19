@@ -144,7 +144,8 @@ static const char* restoreLoadDoc(JsonDocument& doc, const char* path, size_t* b
   if (!f)                  return "cannot open backup";
   size_t n = f.size();
   if (n == 0)              { f.close(); return "backup file is empty"; }
-  if (n > RESTORE_MAX_BYTES) { f.close(); return "backup file too large"; }
+  const size_t cap = psramFound() ? RESTORE_MAX_BYTES : RESTORE_MAX_BYTES_NOPSRAM;
+  if (n > cap) { f.close(); return "backup file too large"; }
   char* buf = (char*)(psramFound() ? heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM) : NULL);
   if (!buf) buf = (char*)malloc(n + 1);
   if (!buf)                { f.close(); return "out of memory"; }

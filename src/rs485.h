@@ -27,7 +27,13 @@ extern SemaphoreHandle_t txMutex;
 extern StaticSemaphore_t txMutexBuf;
 extern RS485Msg* msgRing;
 extern volatile int msgHead;
-extern volatile int msgPollCursor;
+/* Sequence numbers, not slot indices: with a ring this size a reader that goes away for a
+   while must be able to tell that frames were overwritten before it came back, which a bare
+   index cannot express. msgSeq counts every frame ever pushed; msgPollSeq is the next one a
+   reader wants. The difference is the backlog, and a backlog larger than the ring is the
+   amount that was missed. */
+extern volatile uint32_t msgSeq;
+extern volatile uint32_t msgPollSeq;
 extern StaticSemaphore_t msgMutexBuf;
 extern SemaphoreHandle_t msgMutex;
 extern HardwareSerial rs485;

@@ -30,6 +30,7 @@
 #include "modules.h"
 #include "capset.h"
 #include "bus.h"
+#include "incidents.h"
 #include "restore.h"
 #include "mqtt.h"
 #include "ota.h"

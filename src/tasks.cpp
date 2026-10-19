@@ -78,6 +78,7 @@ void taskRS485(void* pv) {
         // answered at length and we threw it away" look identical from the outside.
         rxDropped++;
         rxDropBytes = lineLen;
+        incidentLog(255, 'D', 0, (uint16_t)lineLen);   // which module it was, nobody can say
         printf("[RX] discarded %u bytes with no terminator (frame too long or corrupt)\n",
                (unsigned)lineLen);
         lineLen = 0;

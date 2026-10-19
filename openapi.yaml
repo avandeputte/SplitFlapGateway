@@ -1607,6 +1607,58 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
+  /api/bus/incidents:
+    get:
+      tags: [Status]
+      summary: What the bus got wrong, newest first (v3.16)
+      description: |
+        A short history of bus anomalies with the module each belongs to, kept in PSRAM (1024
+        entries) until the gateway restarts. Counters say how many frames were discarded; this
+        says which module had the bus, what it was being asked and how big the frame was.
+        Streamed.
+      parameters:
+        - name: max
+          in: query
+          required: false
+          schema: { type: integer, default: 50, minimum: 1, maximum: 300 }
+      responses:
+        "200":
+          description: The newest incidents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:    { type: boolean }
+                  total: { type: integer, description: "Recorded since boot, including those since overwritten" }
+                  held:  { type: integer, description: "Still in the ring" }
+                  shown: { type: integer }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ms:    { type: integer, description: "millis() at capture" }
+                        ep:    { type: integer, description: "UTC epoch, 0 if the clock was not set" }
+                        id:    { type: integer, nullable: true, description: "Module it belongs to; null when it could not be attributed" }
+                        kind:
+                          type: string
+                          enum: [D, R, L, M, X]
+                          description: >
+                            D a frame was discarded (too long, or never terminated);
+                            R a frame arrived complete and would not parse;
+                            L a long read answered only when asked a second time;
+                            M a long read was never answered;
+                            X two modules appear to share one id
+                        cmd:   { type: string, description: "The command in flight (v, Q, d, A, W)" }
+                        bytes: { type: integer, description: "Size involved, when known" }
+    delete:
+      tags: [Status]
+      summary: Clear the incident log (v3.16)
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
   /api/bus/release:
     post:
       tags: [Status]
@@ -2352,6 +2404,18 @@ components:
       type: object
       properties:
         uptime:    { type: integer, description: "Seconds since boot", example: 3842 }
+        psram:
+          type: object
+          description: "On-board PSRAM in bytes (v3.16). The large runtime buffers live here, which is what keeps internal RAM free for WiFi and an OTA upload."
+          properties:
+            size: { type: integer, example: 8388608 }
+            free: { type: integer, example: 7643136 }
+        flash:
+          type: object
+          description: "Firmware image size and the room left in the OTA slot, in bytes (v3.16)"
+          properties:
+            sketch: { type: integer, example: 1529024 }
+            free:   { type: integer, example: 3145728 }
         reset:
           type: string
           description: >

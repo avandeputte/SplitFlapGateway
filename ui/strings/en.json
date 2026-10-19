@@ -295,6 +295,7 @@
  "Reading module #": "Reading module #",
  "Reading stats snapshot...": "Reading stats snapshot...",
  "Reads the EEPROM calibration from every known module (by serial number) and saves it to a JSON file you can download. Make sure all modules have been identified first (see the Modules tab).": "Reads the EEPROM calibration from every known module (by serial number) and saves it to a JSON file you can download. Make sure all modules have been identified first (see the Modules tab).",
+ "Recent anomalies": "Recent anomalies",
  "Refresh": "Refresh",
  "Release the bus": "Release the bus",
  "Release the bus hold for \"": "Release the bus hold for \"",

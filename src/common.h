@@ -130,7 +130,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.15.2"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.16.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -161,7 +161,14 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
    a full 64-flap restore command (mXW<sn>:<offset>:<steps>:<map>) can reach
    ~620 bytes. TX_MAX_BYTES bounds what rs485Send will transmit; the monitor
    ring still stores only the first MSG_MAX_BYTES for display. */
-#define MSG_RING_SIZE        64    // monitor ring: number of frames retained
+#define MSG_RING_SIZE        512   // monitor ring: frames retained (~550 KB of the 8 MB PSRAM)
+/* Why 512 and not 64: the ring is the only record of what the bus did, and the faults worth
+   chasing are intermittent. 64 frames is a few seconds of a busy wall -- gone long before
+   anyone opens the Monitor tab. At 512 the history covers a minute or more of heavy traffic,
+   and it costs PSRAM, which sits 97% empty.
+   A reader is handed at most RING_DRAIN_MAX frames per request and resumes where it left off,
+   so a bigger ring never turns into a half-megabyte response or a stalled web task. */
+#define RING_DRAIN_MAX       64    // frames one /api/rs485/messages call may return
 #define MSG_MAX_BYTES        256   // debug/command text buffers, and the MQTT frame payload cap
 /* What the monitor RING stores per frame. Sized to TX_MAX_BYTES so every frame the bus can
    carry is kept WHOLE: a fully calibrated module's 'A' reply runs 600-750 bytes, and storing
@@ -319,7 +326,11 @@ extern char gResetReason[12];   // why the board last rebooted, for /api/status
 // that cannot put a value back can be undone from the gateway alone (see restore.h).
 #define SOAK_SNAPSHOT_FILE        "/soakpre.bak"
 #define RESTORE_TMP               "/restore.tmp"
-#define RESTORE_MAX_BYTES         (256UL * 1024UL)
+/* A fully calibrated module dumps ~700 bytes, so a 255-module wall backs up to ~180 KB and
+   the old 256 KB ceiling was within sight of a real wall. The file is parsed in PSRAM, which
+   has megabytes free; without PSRAM the loader falls back to the old limit (see restore.cpp). */
+#define RESTORE_MAX_BYTES         (1024UL * 1024UL)
+#define RESTORE_MAX_BYTES_NOPSRAM (256UL * 1024UL)
 #define RESTORE_DEFAULT_DELAY_S   10       // seconds after boot before the replay starts
 #define RESTORE_MAX_DELAY_S       600
 #define RESTORE_STEP_MS           500UL    // silence after a provisioning frame
