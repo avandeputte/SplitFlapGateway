@@ -59,6 +59,7 @@ void setup() {
       case ESP_RST_DEEPSLEEP:rs = "DEEPSLEEP";break;
       default: break;
     }
+    strlcpy(gResetReason, rs, sizeof(gResetReason));   // also reported by /api/status
     printf("[Boot] reset=%s heap=%u psram=%u flash=%uKB sdk=%s\n",
            rs, ESP.getFreeHeap(), ESP.getPsramSize(),
            ESP.getFlashChipSize()/1024, ESP.getSdkVersion());

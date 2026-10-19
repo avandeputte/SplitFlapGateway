@@ -1,5 +1,57 @@
 # Split-Flap Gateway — Release Notes
 
+## v3.15.2 — 2026-10-18
+
+Hardening of the bus reads, from a 64-module wall whose soak test reported two modules that
+answered every short query and never once answered a dump.
+
+### The finding behind it
+
+A module hears every other module's traffic. A calibration dump is around 700 bytes and a
+module's receive ring is 64, so **every long reply overruns the receive buffer of every other
+module on the bus.** The module firmware handles that safely but bluntly: once bytes are lost
+it drops everything it reads until a line terminator arrives, which means the next command
+addressed to it is the one that gets eaten. The module then looks silent while it is merely
+resyncing, and a test that asks once and moves on records it as dead.
+
+### Changed
+
+- **A bare terminator goes out before every long read.** One byte, about a millisecond, and it
+  clears that discard state on every module listening, so the command that follows is parsed
+  rather than swallowed.
+- **A long read that goes unanswered is asked once more** before it counts as a miss, and the
+  soak reports how often the second ask was the one that worked. On a healthy wall that is
+  zero; a climbing count means the bus is overflowing module receivers.
+- **Longer gap after a long reply** (260 ms, over the module's 200 ms parser idle timeout)
+  where short queries keep the old 150 ms.
+- **Broadcasts are asked in chunks of sixteen IDs** rather than the whole wall at once. On 64
+  modules a combined-dump window was 45 seconds, long enough for slot timing to drift until
+  replies landed on each other; that is what the same report showed as collisions, and as
+  frames discarded with no terminator. Chunks also let a cancel out sooner.
+- **The receive ceiling is 1024 bytes**, up from 768. A module's longest possible reply is 720,
+  so 768 left nothing for a reply spliced onto the tail of another, and that wall was
+  discarding frames at exactly 767.
+- **The soak records evidence per module, not just a verdict**: the firmware version, how many
+  frames the gateway discarded while that module had the bus, and how many reads needed the
+  second ask. The report now states what was observed — every short reply arrived and no long
+  one did, with or without bytes being discarded — and offers the next diagnostic step instead
+  of asserting a cause. The earlier wording blamed the module's calibration map for being too
+  large to send, which the module firmware does not support: it assembles a dump into a fixed
+  720-byte buffer and would truncate, not fall silent.
+
+### Added
+
+- **`GET /api/status` reports why the board last rebooted** (`reset`: POWERON, SW, PANIC,
+  TASK_WDT, BROWNOUT and so on) and the stack headroom of the soak and probe tasks alongside
+  the permanent ones. Both were visible only on a USB serial console before, which is no use
+  when the board is on a wall.
+
+### Fixed
+
+- **The soak test could reboot the gateway.** Its task ran in 4 KB and the additions above took
+  the peak to about 4.2 KB, which overflows the stack and panics the board mid-run. It now has
+  6 KB, and the headroom is in `/api/status` so the next one is visible before it bites.
+
 ## v3.15.1 — 2026-10-18
 
 Two fixes to the bus hold that 3.15.0 introduced. Both were reported within a day of the

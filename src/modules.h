@@ -227,6 +227,9 @@ struct SoakRow {
   uint8_t  mangled;          // broadcast replies from this id that arrived but did not parse whole
   uint8_t  dup;              // broadcast windows in which this id answered more than once
   uint8_t  wWhy;             // why the write leg failed, OR of: 1 write did not read back, 2 restore
+  uint8_t  late;             // long reads that only answered when asked a second time
+  uint8_t  fw;               // the module's firmware version as a number (0 = unknown)
+  uint16_t drops;            // frames the gateway discarded while reading THIS module
   int8_t   origIdx;          // the map entry the write leg uses (-1 none) ...
   uint16_t origHo, origPos;  // ... and the values it found there before the first write
 };
@@ -262,6 +265,9 @@ void sfSoakNoteReply(uint8_t id, char cmd, bool whole);
 // Start a soak of `minutes` (1-60) over every provisioned module. False if something else
 // owns the bus (probe, self-test, calibration) or the task will not start.
 bool sfSoakStart(int minutes);
+// Minimum free stack the soak/probe tasks have ever had, in bytes; 0 when not running.
+unsigned sfSoakStackFree();
+unsigned sfProbeStackFree();
 void sfSoakCancel();
 
 // ---- owned globals (defined in globals.cpp) ----
@@ -329,7 +335,17 @@ void sfFactoryResetBySN(const char* sn);
 void sfHome(int addr);
 void sfCalibrate(int addr);
 void sfQueryVersion(int addr);
-bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs, char* out, size_t outLen);
+/* Put one bare terminator on the bus. A module whose receive ring overflowed drops bytes
+   until it sees one, so without this the next command addressed to it is what gets eaten and
+   the module looks silent when it is only resyncing. Costs one byte. */
+void sfBusResync();
+bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs, char* out, size_t outLen,
+                          volatile bool* abort = NULL);
+/* The same, but asks twice: a module that ate the first command while resyncing answers the
+   second. `late` (optional) is set when only the retry worked -- worth recording, it means
+   something on the bus is overflowing module receivers. */
+bool sfReadDump(int id, const char* frame, unsigned long timeoutMs,
+                char* out, size_t outLen, bool* late = NULL, volatile bool* abort = NULL);
 bool sfSendAndCaptureQ(int id, unsigned long timeoutMs);
 bool sfSendVersionAndWait(int id, unsigned long timeoutMs, char* fwOut, size_t fwLen, char* snOut, size_t snLen, unsigned long* lastSeenOut);
 void sfDeprovision(int addr);

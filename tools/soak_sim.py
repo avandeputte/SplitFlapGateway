@@ -36,7 +36,7 @@ def simulate(sc, minutes=10, seed=1):
     far = set(sc.get("far", []))
     term = sc.get("term", 0.0)                     # 0 = terminated properly
     rows = {i: {"id": i, **{k: [0, 0] for k in STEPS}, "max": 0, "streak": 0, "worst": 0,
-                "alt": 0, "bad": 0, "dup": 0, "ww": 0} for i in ids}
+                "alt": 0, "bad": 0, "dup": 0, "ww": 0, "fw": 32, "late": 0, "drops": 0} for i in ids}
     entries = {i: rnd.choice([0, 6, 20, 40, 64]) for i in ids}
     queries = failures = writes = drops = rejects = dups = stray = restore_fail = 0
     elapsed = 0.0
@@ -86,7 +86,8 @@ def simulate(sc, minutes=10, seed=1):
                 if got == 2:
                     # two replies in one slot: they collide; often one is damaged, both arrive
                     if rnd.random() < 0.7: bad += 1; rejects += 1
-                if got == 0 and term and length > 300 and rnd.random() < 0.5: drops += 1
+                if got == 0 and term and length > 300 and rnd.random() < 0.5:
+                    drops += 1; rows[i]["drops"] += 1
                 seen[i] = (got, bad)
             for extra in sc.get("stray", []):
                 if rnd.random() < 0.9: stray += 1
@@ -113,7 +114,8 @@ def simulate(sc, minutes=10, seed=1):
                 else:
                     ok = not lost(i, step, length)
                     if ok: r["max"] = max(r["max"], length)
-                    elif term and length > 300 and rnd.random() < 0.4: drops += 1
+                    elif term and length > 300 and rnd.random() < 0.4:
+                        drops += 1; r["drops"] += 1
                     score(r, step, ok)
         passes += 1
     for r in rows.values():

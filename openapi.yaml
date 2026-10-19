@@ -1879,6 +1879,9 @@ paths:
                         bad:    { type: integer, description: "Broadcast replies from this id that arrived but did not parse whole" }
                         dup:    { type: integer, description: "Broadcasts in which this id answered more than once -- two modules share it" }
                         ww:     { type: integer, description: "Why the write leg failed: bit0 a write did not read back, bit1 it could not be put back" }
+                        fw:     { type: integer, description: "The module's firmware version as a number (v3.15.2)" }
+                        late:   { type: integer, description: "Long reads that only answered when asked a second time (v3.15.2). Zero on a healthy bus; a climbing count means module receivers are overflowing" }
+                        drops:  { type: integer, description: "Frames the gateway discarded while THIS module had the bus (v3.15.2) -- the difference between a module that said nothing and one whose reply did not survive the trip" }
                         orig:
                           type: object
                           description: "Present when alt is set: the home offset, map index and position this module had before the test wrote to it"
@@ -2349,6 +2352,13 @@ components:
       type: object
       properties:
         uptime:    { type: integer, description: "Seconds since boot", example: 3842 }
+        reset:
+          type: string
+          description: >
+            Why the board last rebooted (v3.15.2): POWERON, SW (a clean restart or an OTA),
+            PANIC, INT_WDT, TASK_WDT, WDT, BROWNOUT, DEEPSLEEP or OTHER. PANIC and the
+            watchdogs point at firmware; BROWNOUT points at the supply.
+          example: "SW"
         rx:        { type: integer, description: "Frames received since boot", example: 124 }
         tx:        { type: integer, description: "Frames transmitted since boot", example: 37 }
         baud:      { type: integer, example: 9600 }

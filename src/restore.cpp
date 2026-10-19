@@ -533,11 +533,11 @@ bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* to
     if (list[i].sn[0]) snprintf(frame, sizeof(frame), "mXA%s\n", list[i].sn);
     else               snprintf(frame, sizeof(frame), "m%dA\n", list[i].id);
     if (list[i].fw == 0 || list[i].fw >= 25)
-      got = sfSendAndCaptureDump(list[i].id, frame, 1400, dump, sizeof(dump));
+      got = sfReadDump(list[i].id, frame, 1400, dump, sizeof(dump), NULL, abort);
     if (!got) {                                  // 'A' refused or lost: the shorter read
       if (list[i].sn[0] && list[i].fw >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", list[i].sn);
       else                                   snprintf(frame, sizeof(frame), "m%dd\n", list[i].id);
-      got = sfSendAndCaptureDump(list[i].id, frame, 1400, dump, sizeof(dump));
+      got = sfReadDump(list[i].id, frame, 1400, dump, sizeof(dump), NULL, abort);
     }
     if (got && dump[0]) {
       // Only an 'A' read carries a flap set, and only a self-consistent one is written --

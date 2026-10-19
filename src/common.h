@@ -130,7 +130,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "3.15.1"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "3.15.2"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -171,7 +171,13 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
    that one also sizes stack buffers on 6 KB tasks and the MQTT queue slot, neither of which
    can take a 768-byte frame (let alone its 3x UTF-8 expansion). -- v3.14 */
 #define RING_FRAME_BYTES     TX_MAX_BYTES
-#define TX_MAX_BYTES         768   // max bytes rs485Send will transmit in one frame
+#define TX_MAX_BYTES         1024  // max bytes rs485Send will transmit, and the RX accumulator
+/* Why 1024 and not the old 768: a module assembles its longest reply ('A', with a full flap
+   map and a 64-character set) into a 720-byte buffer, so 768 left almost nothing over -- and
+   a reply spliced onto the tail of another (two modules answering a broadcast at once) filled
+   the accumulator and was discarded at exactly 767 bytes, which is what a 64-module wall in
+   the field reported. The ring lives in PSRAM; the few static buffers that follow this
+   constant cost a few KB of internal RAM. */
 #define MQTT_BUF_SIZE        1024  // MQTT packet buffer + queue slot: holds a full
                                    // restore command AND the worst-case rx/tx monitor
                                    // JSON (256 wire bytes -> 3-byte UTF-8 glyphs =
@@ -189,6 +195,17 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 /* ---- Housekeeping cadences ---- */
 #define STATUS_INTERVAL_MS      60000UL   // MQTT status publish cadence (1/min)
 #define MODULE_STALE_SECS       86400UL   // 24h: a module not heard from in this long is RE-QUERIED (a bare version query) so its record stays current. It is never dropped for being quiet (v3.12): the registry is permanent -- only Identify All, De-provision, or a corrupt record removes an entry. Modules only speak when addressed, so a long-lived static message is not a sign of absence.
+/* Pacing around LONG replies. A module that loses bytes (its receive ring is 64 B and a
+   neighbour's dump is ~700) drops everything it reads until it sees a line terminator, or
+   until its parser idles out after 200 ms. So the gateway leaves a longer gap after a long
+   reply than after a short one, and sends a bare terminator before a long read: one byte that
+   costs ~1 ms and clears that state on every module listening, instead of the next command
+   being the one that gets eaten. */
+extern char gResetReason[12];   // why the board last rebooted, for /api/status
+#define BUS_GAP_SHORT_MS          150UL   // between short queries (v, Q)
+#define BUS_GAP_LONG_MS           260UL   // after a long reply (d, A) -- over the module's 200 ms resync
+#define BUS_RETRY_GAP_MS          300UL   // before a second attempt at a long read
+
 #define MODULE_REPROBE_BACKOFF_MS 3600000UL // after MODULE_PROBE_MAX_TRIES unanswered re-queries, leave the module alone for this long before asking again (it stays in the registry throughout)
 #define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before the next probe attempt
 #define MODULE_PROBE_SPACING_MS 150UL     // gap between consecutive stale probes: a module answers a bare 'v' INSTANTLY, so back-to-back queries make each reply collide with the next probe -- space them so every reply is received (and clears the probe) before the next query goes out

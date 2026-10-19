@@ -746,15 +746,24 @@ static bool soakWriteRoundTrip(SoakRow& r, const char* sn, int fwNum, char* out,
   return ok;
 }
 // One broadcast window: send m*<cmd><lo>-<hi>, wait for every slot, then score each row.
-static void soakBroadcast(char cmd, int k) {
+/* One broadcast window, in CHUNKS of ids rather than the whole wall at once.
+   A module answers a broadcast in its own timed slot, so a 64-module wall means a 45-second
+   window for combined dumps, during which any slot that drifts lands on its neighbour: that
+   is what shows up as "replies collide" and as frames discarded at the receive ceiling with
+   no terminator. Asking sixteen at a time keeps each window short, confines a collision to
+   the group it happened in, and lets a cancel out quickly. The ranged form is in the
+   protocol already (m*A<lo>-<hi>); this just uses it the way a wide wall needs. */
+#define SOAK_BCAST_CHUNK 16
+
+static void soakBroadcastWindow(char cmd, int k, int lo, int hi) {
   memset(gSoakBcSeen, 0, sizeof(gSoakBcSeen));
   memset(gSoakBcBad, 0, sizeof(gSoakBcBad));
   gSoakBcCmd = cmd; gSoakBcArmed = true;
   char frame[24];
-  snprintf(frame, sizeof(frame), "m*%c%d-%d\n", cmd, (int)gSoak.idLo, (int)gSoak.idHi);
+  snprintf(frame, sizeof(frame), "m*%c%d-%d\n", cmd, lo, hi);
   rs485SendStr(frame);
   const unsigned long slot = (cmd == 'A') ? 700UL : 100UL;            // the module's reply slots
-  const unsigned long waitMs = 30 + (unsigned long)(gSoak.idHi - gSoak.idLo + 1) * slot + (cmd == 'A' ? 1500 : 600);
+  const unsigned long waitMs = 30 + (unsigned long)(hi - lo + 1) * slot + (cmd == 'A' ? 1500 : 600);
   if (!soakWait(waitMs)) {
     // Cancelled mid-window: modules are still answering into their slots, so give the line a
     // moment to go quiet before anyone else may transmit, then drop this window's scores --
@@ -769,6 +778,7 @@ static void soakBroadcast(char cmd, int k) {
   for (int i = 0; i < gSoak.modules; i++) {
     SoakRow& r = gSoak.rows[i];
     inTable[r.id] = true;
+    if (r.id < lo || r.id > hi) continue;         // not asked in this window
     if (cmd == 'A') {                       // pre-v25 firmware cannot answer: not a failure
       char fw[8] = "";
       if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
@@ -794,6 +804,16 @@ static void soakBroadcast(char cmd, int k) {
   }
   for (int id = 0; id < 255; id++)
     if (!inTable[id] && gSoakBcSeen[id]) gSoak.stray = gSoak.stray + gSoakBcSeen[id];
+}
+
+static void soakBroadcast(char cmd, int k) {
+  for (int lo = gSoak.idLo; lo <= gSoak.idHi && !gSoak.cancel; lo += SOAK_BCAST_CHUNK) {
+    int hi = lo + SOAK_BCAST_CHUNK - 1;
+    if (hi > gSoak.idHi) hi = gSoak.idHi;
+    soakBroadcastWindow(cmd, k, lo, hi);
+    busHold("soak", BUS_BUSY, 180000UL);           // a wide wall takes several windows
+    if (!soakWait(BUS_GAP_LONG_MS)) return;        // let every receiver resync between windows
+  }
 }
 
 static void taskSoak(void* pv) {
@@ -823,7 +843,7 @@ static void taskSoak(void* pv) {
     if (cmd == 'V' || cmd == 'B') {
       soakBroadcast(cmd == 'V' ? 'v' : 'A', k);
       gSoak.passes = pass + 1;
-      soakWait(150);
+      soakWait(cmd == 'B' ? BUS_GAP_LONG_MS : BUS_GAP_SHORT_MS);
       continue;
     }
     for (int i = 0; i < gSoak.modules && !gSoak.cancel; i++) {
@@ -840,6 +860,8 @@ static void taskSoak(void* pv) {
       if (cmd == 'Q' && fwNum && fwNum < 26) continue;   // cannot answer: not a failure
       if (cmd == 'A' && fwNum && fwNum < 25) continue;
       rxLastLen = 0;
+      r.fw = (uint8_t)(fwNum > 255 ? 255 : fwNum);
+      const unsigned long dropsAtStart = rxDropped;
       bool ok;
       char frame[48];
       if (cmd == 'W')      ok = soakWriteRoundTrip(r, sn, fwNum, out, sizeof(out));
@@ -850,10 +872,17 @@ static void taskSoak(void* pv) {
         else if (cmd == 'A')           snprintf(frame, sizeof(frame), "m%dA\n", r.id);
         else if (sn[0] && fwNum >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", sn);
         else                           snprintf(frame, sizeof(frame), "m%dd\n", r.id);
-        ok = sfSendAndCaptureDump(r.id, frame, 1400, out, sizeof(out));
+        bool late = false;
+        ok = sfReadDump(r.id, frame, 1400, out, sizeof(out), &late, &gSoak.cancel);
+        if (late && r.late < 255) r.late++;
       }
       if (r.tries[k] < 255) r.tries[k]++;
       gSoak.queries = gSoak.queries + 1;
+      {   // what the gateway threw away while this module had the bus: the difference between
+          // "it said nothing" and "it answered and the frame did not survive the trip"
+        unsigned long d = rxDropped - dropsAtStart;
+        if (d && r.drops < 65000) r.drops += (uint16_t)d;
+      }
       if (ok) {
         if (r.ok[k] < 255) r.ok[k]++;
         if (cmd != 'W' && (int)rxLastLen > r.maxLen) r.maxLen = (uint16_t)rxLastLen;
@@ -863,7 +892,9 @@ static void taskSoak(void* pv) {
         if (r.streak < 255) r.streak++;
         if (r.streak > r.worstStreak) r.worstStreak = r.streak;
       }
-      soakWait(150);                                     // gentle: ~1 query per 150 ms + reply time
+      // A module that lost bytes while a neighbour answered drops everything until it sees a
+      // terminator or its parser idles out at 200 ms, so a long reply gets the longer gap.
+      soakWait((cmd == 'd' || cmd == 'A' || cmd == 'W') ? BUS_GAP_LONG_MS : BUS_GAP_SHORT_MS);
     }
     gSoak.passes = pass + 1;
   }
@@ -911,13 +942,15 @@ bool sfSoakStart(int minutes) {
   gSoak.snapRunning = false; gSoak.snapOkFlag = false;
   gSoak.snapDone = 0; gSoak.snapTotal = 0; gSoak.snapOk = 0; gSoak.snapErr[0] = 0;
   busHold("soak", BUS_BUSY, 180000UL);
-  if (xTaskCreatePinnedToCore(taskSoak, "Soak", 4096, NULL, 1, &hTaskSoak, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCore(taskSoak, "Soak", 6144, NULL, 1, &hTaskSoak, 1) != pdPASS) {
     hTaskSoak = NULL; gSoak.active = false; busRelease("soak"); return false;
   }
   printf("[SOAK] %d module(s) for %d min\n", n, minutes);
   return true;
 }
 void sfSoakCancel() { if (gSoak.active) gSoak.cancel = true; }
+unsigned sfSoakStackFree()  { return hTaskSoak  ? uxTaskGetStackHighWaterMark(hTaskSoak)  : 0; }
+unsigned sfProbeStackFree() { return hTaskProbe ? uxTaskGetStackHighWaterMark(hTaskProbe) : 0; }
 
 bool sfProbeStart(int id, int rounds) {
   if (gProbe.active || hTaskProbe || gSoak.active) return false;
@@ -1038,6 +1071,23 @@ void sfCalibrate(int addr) {
 // (Belt and suspenders: rs485Send() now normalizes framing for EVERY sender, so
 // even a hand-typed "m<id>v\n" from the bus monitor or a REST/MQTT raw send is
 // shipped bare. This helper still emits the bare form directly to document intent.)
+void sfBusResync() {
+  static const uint8_t nl[1] = { '\n' };
+  rs485Send(nl, 1, true);          // raw: the normal path drops a frame that is only a terminator
+}
+
+bool sfReadDump(int id, const char* frame, unsigned long timeoutMs,
+                char* out, size_t outLen, bool* late, volatile bool* abort) {
+  if (late) *late = false;
+  if (sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) return true;
+  if (abort && *abort) return false;      // cancelled: do not spend another read winding down
+  vTaskDelay(pdMS_TO_TICKS(BUS_RETRY_GAP_MS));
+  if (!sfSendAndCaptureDump(id, frame, timeoutMs, out, outLen, abort)) return false;
+  if (late) *late = true;
+  DBG("[SF] module %d answered the dump only on the second ask\n", id);
+  return true;
+}
+
 void sfQueryVersion(int addr) {
   char buf[16];
   snprintf(buf, sizeof(buf), "m%dv", addr);   // no '\n' -- gateway turnaround workaround, see note
@@ -1051,7 +1101,8 @@ void sfQueryVersion(int addr) {
 // watchdog-safe. The capture slot is single-use, which is safe because the
 // synchronous web server serves one request at a time.
 bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs,
-                                 char* out, size_t outLen) {
+                                 char* out, size_t outLen, volatile bool* abort) {
+  sfBusResync();                 // clear any listener's overflow-discard state first
   gDump.data[0] = 0;
   gDump.ts  = 0;
   gDump.autoHome = gDump.curIndex = gDump.reportedId = -99;  // A-only; cleared per attempt
@@ -1063,6 +1114,13 @@ bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs,
     wdgWebMs = millis();
     vTaskDelay(pdMS_TO_TICKS(10));
     if (gDump.ts != 0) { strlcpy(out, gDump.data, outLen); return true; }
+    if (abort && *abort) {
+      // Give up waiting, but not the bus: the module may be half-way through a 700-byte
+      // reply, and releasing the hold on top of that would put content into the middle of
+      // its frame. Let the line go quiet first -- still far shorter than the full timeout.
+      vTaskDelay(pdMS_TO_TICKS(400));
+      return false;
+    }
   }
   return false;
 }

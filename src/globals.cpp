@@ -158,3 +158,4 @@ unsigned long          lastDispPubMs   = 0;
 unsigned long mqttRetryMs  = 0;
 HealWebServer server(80);
 unsigned long staDownSince = 0;   // millis() the station last dropped (0 = up/never)
+char gResetReason[12] = "?";

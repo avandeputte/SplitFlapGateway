@@ -206,7 +206,7 @@ function soakRender(s){var out=document.getElementById("soakOut");if(!out)return
   else if(ma===ta){F.silent.push(r);r._why=t("never answered");r._c="var(--bad)";}
   else if(r.dup){}
   else if(ms&&ml){F.contact.push(r);r._why=t("misses at every size")+" ("+pct(ma,ta)+t(", worst ")+r.worst+t(" in a row")+")";r._c="var(--bad)";}
-  else if(!ms&&tdA>=2&&mdA===tdA){F.nodump.push(r);r._why=t("answers, but never its dump: the map is too big for its firmware to send");r._c="var(--bad)";}
+  else if(!ms&&tdA>=2&&mdA===tdA){F.nodump.push(r);r._why=(r.drops?t("answers, but its dump never arrives whole"):t("answers, but never sends its dump"));r._c="var(--bad)";}
   else if(!ms&&!ml&&mw){F.write.push(r);r._why=(r.ww&1)?t("a write did not read back"):t("a write did not land or could not be confirmed");r._c="var(--ylw)";}
   else if(ms&&!mdir&&!ml||(mb&&!mdir&&!mw)){F.bcast.push(r);r._why=t("fine alone, misses only in broadcasts")+(r.bad?" ("+r.bad+t(" damaged")+")":"");r._c="var(--ylw)";}
   else if(!ms&&ml){F.longOnly.push(r);r._why=t("short replies fine, long ones lost")+" ("+pct(ml,tl)+")";r._c="var(--ylw)";}
@@ -228,9 +228,10 @@ function soakRender(s){var out=document.getElementById("soakOut");if(!out)return
  if(F.contact.length)finding("var(--bad)",t("Dropping out at every size: ")+ids(F.contact),
    F.contact.map(function(r){return t("module ")+r.id+t(" missed ")+pct(miss(r,ALL),tries(r,ALL))+t(" of everything, up to ")+r.worst+t(" in a row");}).join("; ")+". "+t("The shortest reply fails as often as the longest, so frame length is not the problem."),
    t("Power or contact at those modules, not the bus: re-seat them on the backplane, look at the pogo pins and the rail voltage in the Diagnostics snapshot (a sagging rail resets the module mid-reply). If they are neighbours, suspect the segment of the backplane they share."));
- if(F.nodump.length)finding("var(--bad)",t("Cannot send their dump: ")+ids(F.nodump),
-   t("Every short reply from these modules got through and not one dump or combined dump did -- not lost now and then, but never. A module whose calibration map has grown large cannot assemble that reply any more (a limit of the module firmware), and from then on its backups fail and its calibration cannot be read, while the display keeps working."),
-   t("Erase the module's map (the bus command m&lt;id&gt;e, or Factory Reset in its Info dialog) and restore its calibration from your backup -- the restore writes the entries one at a time, which the module takes without trouble. Then keep the map to the flaps that really need fine-tuning. The lasting fix is a module firmware that streams its dump; until then, back up before you fully calibrate."));
+ if(F.nodump.length){var nd=F.nodump.some(function(r){return r.drops;});
+  finding("var(--bad)",t("No dump from: ")+ids(F.nodump),
+   t("Every short reply from these modules arrived; not one dump or combined dump did, on either address form and after a second ask -- not lost now and then, but never. ")+(nd?t("Bytes DID arrive while they had the bus and the gateway discarded them (too long, or never terminated), so the reply is being started and not surviving the trip."):t("Nothing arrived at all while they had the bus: no bytes, nothing discarded. The reply is not being sent, or not being started.")),
+   t("Narrow it down on those modules: run the reply-size probe in their Diagnostics dialog, then the snapshot. A boot count that climbs after each attempt means the module restarts mid-reply. A clean snapshot with nothing arriving points at the module never starting the reply; discards point at the line or at two modules talking at once. A full calibration map makes the reply as long as it can be, so a working stopgap is to erase the map and restore it from a backup, which writes the entries one at a time."));}
  if(F.longOnly.length){var far=F.longOnly.slice().sort(function(a,b){return b._rate-a._rate;});var mx=Math.max.apply(null,rows.map(function(r){return r.max||0;}));
   finding("var(--ylw)",t("The bus loses long frames: ")+ids(far),
    t("Every short reply from these modules got through; ")+pct(far.reduce(function(n,r){return n+miss(r,LONG);},0),far.reduce(function(n,r){return n+tries(r,LONG);},0))+t(" of the long ones (dumps, combined dumps) did not; the list is worst first. Longest frame that did arrive: ")+mx+" B. "+(s.drops?s.drops+t(" frames were discarded unfinished, which is what a long frame breaking up looks like. "):""),
@@ -244,6 +245,10 @@ function soakRender(s){var out=document.getElementById("soakOut");if(!out)return
  if(s.stray)finding("var(--ylw)",s.stray+t(" replies came from IDs that are not in the module table"),
    t("A roll call reached modules the gateway does not list: a module that was never registered, or one whose ID was reassigned by hand."),
    t("Open the Modules tab: Identify lists everything on the bus. Provision the newcomer, or remove the duplicate."));
+ var lateN=rows.reduce(function(n,r){return n+(r.late||0);},0);
+ if(lateN)finding("var(--ylw)",lateN+t(" long read(s) only answered when asked twice"),
+   t("The first ask went unanswered and an immediate second one worked. A module that lost bytes while a neighbour was replying ignores everything until it sees a line terminator, so the command that arrives in that window is the one that gets eaten. The gateway sends a terminator before every long read and retries once, which is why these count as passes."),
+   t("Harmless in ones and twos. If the count is high, the bus is overflowing module receivers: shorten the run, check termination, and keep an eye on Frames Discarded."));
  if(!fx.length&&s.drops)finding("var(--ylw)",s.drops+t(" frames were discarded unfinished"),t("Every module scored clean, but the gateway also received frames that never terminated or were too long to be a reply. Something else is talking on the bus."),t("Watch the Monitor tab for frames that are not replies to anything the gateway sent."));
  var head,hc;
  if(!rows.length){head=t("No modules to test.");hc="var(--dim)";}
@@ -255,15 +260,15 @@ function soakRender(s){var out=document.getElementById("soakOut");if(!out)return
  var sorted=rows.slice().sort(function(a,b){return (b.alt?1:0)-(a.alt?1:0)||b._rate-a._rate||b.worst-a.worst||a.id-b.id;});
  function td(x,c){return "<td style='padding:3px 6px;"+(c?"color:"+c:"")+"'>"+x+"</td>";}function th(c){return "<th style='text-align:left;padding:3px 6px;color:var(--dim);font-weight:normal'>"+t(c)+"</th>";}
  function cell(r,ks){var m=miss(r,ks),n=tries(r,ks);return td(n?(n-m)+"/"+n:"-",n?(m?"var(--bad)":"var(--grn)"):"var(--dim)");}
- var t1="<table id='soakT1' style='border-collapse:collapse;width:100%;font-size:.78rem'><tr>"+["Module","Verdict","Short","Long","Writes","Longest","Worst run"].map(th).join("")+"</tr>";
+ var t1="<table id='soakT1' style='border-collapse:collapse;width:100%;font-size:.78rem'><tr>"+["Module","Firmware","Verdict","Short","Long","Writes","Longest","Worst run"].map(th).join("")+"</tr>";
  var t2="<table id='soakT2' style='border-collapse:collapse;width:100%;font-size:.78rem;display:none'><tr>"+["Module","Version","Snapshot","Dump","Combined","Roll call","Bcast dump","Write","Longest","Worst run"].map(th).join("")+"</tr>";
  sorted.forEach(function(r){var id="<b>"+r.id+"</b>",lg=td(r.max?r.max+" B":"-","var(--dim)"),wr=td(r.worst?r.worst+t(" in a row"):"-","var(--dim)");
-  t1+="<tr>"+td(id)+td(r._why,r._c)+cell(r,SHORT)+cell(r,LONG)+cell(r,WR)+lg+wr+"</tr>";
+  t1+="<tr>"+td(id)+td(r.fw?("v"+r.fw):"-","var(--dim)")+td(r._why,r._c)+cell(r,SHORT)+cell(r,LONG)+cell(r,WR)+lg+wr+"</tr>";
   t2+="<tr>"+td(id)+["v","Q","d","A","V","B","W"].map(function(k){return cell(r,[k]);}).join("")+lg+wr+"</tr>";});
  h+=t1+"</table>"+t2+"</table>";
  if(s.snap&&(s.snap.ok||s.snap.modules))h+="<p style='font-size:.75rem;color:var(--dim);margin:8px 0 0'>"+t("Before the test wrote anything it read the calibration of ")+s.snap.modules+t(" of ")+s.snap.total+t(" modules into the gateway's flash. ")+"<a href='/api/flap/soak/snapshot' download>"+t("Download that snapshot")+"</a> &middot; <a href='#' onclick='soakRollback();return false;'>"+t("restore the wall from it")+"</a></p>";
  else if(s.snap&&s.snap.err)h+="<p style='font-size:.75rem;color:var(--ylw);margin:8px 0 0'>"+t("No pre-test snapshot was taken: ")+s.snap.err+t(". Each module's own before-values are still in the report above.")+"</p>";
- h+="<p style='font-size:.75rem;color:var(--dim);margin:6px 0 0'><a href='#' onclick=\"var a=document.getElementById('soakT1'),b=document.getElementById('soakT2'),s=a.style.display==='none';a.style.display=s?'':'none';b.style.display=s?'none':'';this.textContent=s?'"+t("Show every kind of traffic")+"':'"+t("Show the summary")+"';return false;\">"+t("Show every kind of traffic")+"</a> &middot; "+t("Short = version, snapshot, roll call. Long = dump, combined dump, broadcast dump. Writes = a home offset and a map entry, each nudged and put back.")+"</p>";
+ h+="<p style='font-size:.75rem;color:var(--dim);margin:6px 0 0'><a href='#' onclick=\"var a=document.getElementById('soakT1'),b=document.getElementById('soakT2'),s=a.style.display==='none';a.style.display=s?'':'none';b.style.display=s?'none':'';this.textContent=s?'"+t("Show every kind of traffic")+"':'"+t("Show the summary")+"';return false;\">"+t("Show every kind of traffic")+"</a> &middot; "+t("Short = version, snapshot, roll call. Long = dump, combined dump, broadcast dump, each asked twice before it counts as a miss. Writes = a home offset and a map entry, each nudged and put back.")+"</p>";
  if(s.drops&&fx.length)h+="<p style='font-size:.78rem;color:var(--bad);margin-top:6px'>"+s.drops+t(" frame(s) were discarded during the test: replies arrived that were too long or never terminated.")+"</p>";
  if(s.rejects&&!F.dup.length)h+="<p style='font-size:.78rem;color:var(--ylw)'>"+s.rejects+t(" frame(s) arrived corrupt.")+"</p>";
  out.innerHTML=h;}

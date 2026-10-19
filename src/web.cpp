@@ -1297,6 +1297,10 @@ static void handleApiStatus() {
   unsigned stkNet = hTaskNet   ? uxTaskGetStackHighWaterMark(hTaskNet)   : 0;
   unsigned stkOta = hTaskOTA   ? uxTaskGetStackHighWaterMark(hTaskOTA)   : 0;
   unsigned stkRtc = hTaskRTC   ? uxTaskGetStackHighWaterMark(hTaskRTC)   : 0;
+  // The transient workers too (0 when not running). A soak that reboots the board is a stack
+  // question first, and these are the only numbers that answer it from outside.
+  unsigned stkSoak  = sfSoakStackFree();
+  unsigned stkProbe = sfProbeStackFree();
   // v3.0: seconds since the companion last checked in (-1 = never / deregistered)
   long compAge = gCompanionSeenMs ? (long)((millis() - gCompanionSeenMs) / 1000UL) : -1;
   char rst[112];                       // v3.12: {"state","done","total","startsIn"}
@@ -1309,7 +1313,7 @@ static void handleApiStatus() {
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"mqtt\":%s,\"modules\":%d,"
-    "\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u},"
+    "\"reset\":\"%s\",\"stk\":{\"rs485\":%u,\"web\":%u,\"net\":%u,\"ota\":%u,\"rtc\":%u,\"soak\":%u,\"probe\":%u},"
     "\"time\":\"%s\",\"ntpSynced\":%s,\"maint\":%s,\"quiet\":%s,"
     "\"companion\":{\"status\":\"%s\",\"age\":%ld},\"restore\":%s,"
     "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu,\"lock\":%s}}",
@@ -1320,7 +1324,7 @@ static void handleApiStatus() {
     ESP.getFreeHeap(), ESP.getMinFreeHeap(),
     mqtt.connected()?"true":"false",
     sfModuleCount,
-    stk485, stkWeb, stkNet, stkOta, stkRtc,
+    gResetReason, stk485, stkWeb, stkNet, stkOta, stkRtc, stkSoak, stkProbe,
     rtcBuf,
     ntpSynced?"true":"false",
     gMaintenanceMode?"true":"false",
@@ -2260,10 +2264,12 @@ static void handleApiSoakStatus() {
       const SoakRow& r = gSoak.rows[i];
       int n = snprintf(row, sizeof(row),
         "%s{\"id\":%d,\"v\":[%d,%d],\"Q\":[%d,%d],\"d\":[%d,%d],\"A\":[%d,%d],\"W\":[%d,%d],\"V\":[%d,%d],\"B\":[%d,%d],"
-        "\"max\":%d,\"streak\":%d,\"worst\":%d,\"alt\":%d,\"bad\":%d,\"dup\":%d,\"ww\":%d",
+        "\"max\":%d,\"streak\":%d,\"worst\":%d,\"alt\":%d,\"bad\":%d,\"dup\":%d,\"ww\":%d,"
+        "\"fw\":%d,\"late\":%d,\"drops\":%d",
         i ? "," : "", r.id, r.ok[0], r.tries[0], r.ok[1], r.tries[1], r.ok[2], r.tries[2], r.ok[3], r.tries[3],
         r.ok[4], r.tries[4], r.ok[5], r.tries[5], r.ok[6], r.tries[6],
-        (int)r.maxLen, (int)r.streak, (int)r.worstStreak, (int)r.altered, (int)r.mangled, (int)r.dup, (int)r.wWhy);
+        (int)r.maxLen, (int)r.streak, (int)r.worstStreak, (int)r.altered, (int)r.mangled, (int)r.dup, (int)r.wWhy,
+        (int)r.fw, (int)r.late, (int)r.drops);
       if (r.altered)   // what the write leg found before it first wrote, so a hand repair is possible
         n += snprintf(row + n, sizeof(row) - n, ",\"orig\":{\"ho\":%d,\"idx\":%d,\"pos\":%d}",
                       (int)r.origHo, (int)r.origIdx, (int)r.origPos);
