@@ -665,6 +665,9 @@ paths:
                       vcc:        { type: integer, description: "Supply voltage in millivolts (0 if unavailable)", example: 3320 }
                       eepromOk:   { type: integer, description: "1 if the EEPROM write-verify passed, else 0", example: 1 }
                       curIndex:   { type: integer, description: "Current flap index (-1 unknown / needs homing, -2 released)", example: 5 }
+                      rxOverflows: { type: integer, description: "Module firmware v33+: times the module's receive ring overflowed, which happens only while it is busy. -1 = not reported", example: -1 }
+                      bcastSent:   { type: integer, description: "v33+: staggered broadcast replies the module actually sent -- compare with what the gateway heard to tell a reply lost on the wire from one never sent. -1 = not reported", example: -1 }
+                      bcastLate:   { type: integer, description: "v33+: how many of those went out after their slot. -1 = not reported", example: -1 }
               examples:
                 captured: { value: { ok: true, started: true, id: 11, q: { resetCause: 1, bootCount: 3, vcc: 3320, eepromOk: 1, curIndex: 5 } } }
                 noQ:      { value: { ok: true, started: true, id: 11, q: null } }
@@ -1649,6 +1652,8 @@ paths:
                             R a frame arrived complete and would not parse;
                             L a long read answered only when asked a second time;
                             M a long read was never answered;
+                            F a long read failed and a shorter one succeeded in its place
+                              -- the module is there, its reply LENGTH is the problem;
                             X two modules appear to share one id
                         cmd:   { type: string, description: "The command in flight (v, Q, d, A, W)" }
                         bytes: { type: integer, description: "Size involved, when known" }

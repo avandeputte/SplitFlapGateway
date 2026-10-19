@@ -760,9 +760,36 @@ static void soakBroadcastWindow(char cmd, int k, int lo, int hi) {
   char frame[24];
   snprintf(frame, sizeof(frame), "m*%c%d-%d\n", cmd, lo, hi);
   rs485SendStr(frame);
+  /* How long to hold the window open.
+     A module answers at lead-in + (id - lo) x slot by ITS OWN clock, and that clock runs slow
+     while bytes are on the bus: the bit-banged serial masks interrupts for most of each byte
+     time, so ticks are lost and later slots land later than nominal -- about 15% of the reply
+     traffic ahead of them, per the module firmware's own analysis. A window sized to the
+     nominal slots therefore closes while the last modules are still waiting their turn, and
+     the NEXT broadcast cancels a reply that has not gone out yet. That is the likeliest
+     explanation for a wide wall reporting modules that go missing only in broadcasts: at 64
+     ids the nominal window is 46 s and the last reply lands past 50 s.
+     So: allow for the drift, and finish early the moment every id has answered, which is the
+     common case and keeps a healthy batch short. */
   const unsigned long slot = (cmd == 'A') ? 700UL : 100UL;            // the module's reply slots
-  const unsigned long waitMs = 30 + (unsigned long)(hi - lo + 1) * slot + (cmd == 'A' ? 1500 : 600);
-  if (!soakWait(waitMs)) {
+  const unsigned long replyMs = (cmd == 'A') ? 700UL : 40UL;          // the frame itself on the wire
+  const int span = hi - lo + 1;
+  const unsigned long waitMs = 30 + (unsigned long)(span * slot * 6 / 5)   // +20% for the drift
+                               + replyMs + (cmd == 'A' ? 1500 : 600);
+  const unsigned long deadline = millis() + waitMs;
+  bool allIn = false;
+  while ((long)(millis() - deadline) < 0) {
+    if (gSoak.cancel) break;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    allIn = true;                       // every id we expect to hear from, heard from
+    for (int i = 0; i < gSoak.modules && allIn; i++) {
+      const uint8_t id = gSoak.rows[i].id;
+      if (id < lo || id > hi) continue;
+      if (!gSoakBcSeen[id]) allIn = false;
+    }
+    if (allIn) { vTaskDelay(pdMS_TO_TICKS(60)); break; }   // a breath for a straggler/duplicate
+  }
+  if (gSoak.cancel) {
     // Cancelled mid-window: modules are still answering into their slots, so give the line a
     // moment to go quiet before anyone else may transmit, then drop this window's scores --
     // they are incomplete by definition.
@@ -770,6 +797,7 @@ static void soakBroadcastWindow(char cmd, int k, int lo, int hi) {
     gSoakBcArmed = false;
     return;
   }
+  traceNote("# broadcast %c %d-%d: %s", cmd, lo, hi, allIn ? "all answered" : "window expired");
   gSoakBcArmed = false;
   static bool inTable[256];
   memset(inTable, 0, sizeof(inTable));
@@ -1775,16 +1803,22 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     char qb[48];
     strlcpy(qb, p + 1, sizeof(qb));
     for (int k = (int)strlen(qb)-1; k >= 0 && (qb[k]=='\n'||qb[k]=='\r'||qb[k]==' '); k--) qb[k] = 0;
-    char* qf[5] = {0}; qf[0] = qb; int qi = 1;
-    for (char* cp = qb; *cp && qi < 5; cp++) { if (*cp == ':') { *cp = 0; qf[qi++] = cp + 1; } }
+    char* qf[8] = {0}; qf[0] = qb; int qi = 1;
+    for (char* cp = qb; *cp && qi < 8; cp++) { if (*cp == ':') { *cp = 0; qf[qi++] = cp + 1; } }
     int rc   = (qf[0] && qf[0][0]) ? atoi(qf[0]) : 0;
     int boot = (qf[1] && qf[1][0]) ? atoi(qf[1]) : 0;
     int vcc  = (qf[2] && qf[2][0]) ? atoi(qf[2]) : 0;
     int ee   = (qf[3] && qf[3][0]) ? atoi(qf[3]) : 0;
     int cur  = (qf[4] && qf[4][0]) ? atoi(qf[4]) : -1;
-    DBG("[SF] Module %d diag Q: rc=%d boot=%d vcc=%d ee=%d cur=%d\n", id, rc, boot, vcc, ee, cur);
+    // v33 appends three bus counters; older firmware stops at curIndex and leaves these -1.
+    int rxOv = (qf[5] && qf[5][0]) ? atoi(qf[5]) : -1;
+    int bcS  = (qf[6] && qf[6][0]) ? atoi(qf[6]) : -1;
+    int bcL  = (qf[7] && qf[7][0]) ? atoi(qf[7]) : -1;
+    DBG("[SF] Module %d diag Q: rc=%d boot=%d vcc=%d ee=%d cur=%d rxOv=%d bcast=%d/%d\n",
+        id, rc, boot, vcc, ee, cur, rxOv, bcS, bcL);
     if (gDiag.q.waitId == (int)id) {
       gDiag.q.reset = rc; gDiag.q.boot = boot; gDiag.q.vcc = vcc; gDiag.q.ee = ee; gDiag.q.cur = cur;
+      gDiag.q.rxOv = rxOv; gDiag.q.bcSent = bcS; gDiag.q.bcLate = bcL;
       gDiag.q.ts = millis();
     }
     char payload[96];

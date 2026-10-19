@@ -132,10 +132,18 @@ struct CalibState {                  // calibration: sync steps/rev + async job
   volatile unsigned long jobDeadline = 0;          // millis() timeout
 };
 
+/* The v33 module firmware appends three counters to the Q snapshot:
+     m<id>Q:<resetCause>:<bootCount>:<vcc>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>
+   They are the module's own account of what the bus did to it: how often its receive ring
+   overflowed (which, per the firmware authors, only happens while it is busy), how many
+   staggered broadcast replies it actually sent, and how many went out late. Comparing
+   bcastSent against what the gateway heard separates "the reply was lost on the wire" from
+   "the module never sent one". -1 = not reported, which is every firmware before v33. */
 struct DiagState {                   // self-diagnostics (module fw v26+/v28+)
   // 'Q' snapshot -- instant, captured synchronously (no motor)
   struct { volatile int waitId = -1; volatile unsigned long ts = 0;
-           volatile int reset = 0, boot = 0, vcc = 0, ee = 0, cur = -1; } q;
+           volatile int reset = 0, boot = 0, vcc = 0, ee = 0, cur = -1;
+           volatile int rxOv = -1, bcSent = -1, bcLate = -1; } q;
   // 'T' Hall test -- motor ~2 revolutions
   struct { volatile int waitId = -1; volatile unsigned long ts = 0;
            volatile int code = -1, rising = 0, active = 0, falling = 0; } t;

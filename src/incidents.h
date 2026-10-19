@@ -32,6 +32,8 @@ struct BusIncident {
 //   'R'  a frame arrived complete and would not parse (corrupt, or two replies on top)
 //   'L'  a long read answered only when it was asked a second time
 //   'M'  a long read was never answered, after both asks
+//   'F'  a long read failed and a shorter one succeeded in its place -- the module is there,
+//        the LENGTH is the problem. Logged by the caller that recovered, because only it knows
 //   'X'  two modules appear to share one id
 
 void incidentsInit();                                            // once, from setup()

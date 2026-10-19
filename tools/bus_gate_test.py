@@ -91,6 +91,11 @@ print("   waiting for the lease to lapse...")
 time.sleep(8)
 check("a lease nobody renews expires", bus().get("level"), 0)
 
+# Homing spins a reel for a second or two, and a module that is turning cannot answer. Let the
+# wall settle before the soak, or its first reads record incidents that say more about this
+# test than about the bus.
+time.sleep(3)
+
 print("\n4. a machine-run test holds the bus (soak)")
 st, j = call("POST", "/api/flap/soak", {"minutes": 1})
 check("soak started", (st, j.get("started")), (200, True))

@@ -53,6 +53,20 @@ void busReleaseFirmware(const char* reason) {
    second: if the job that justifies a hold is not running, the hold goes. Leases taken by a
    client over REST are left alone; those expire by themselves. */
 void busSweep() {
+  /* A self-test or a calibration that nobody polls used to stay "running" for ever: only the
+     status endpoint cleared the flag, and that flag is what blocks the probe and the soak from
+     starting. Start a Hall test with curl, never read its result, and every later test is
+     refused until the board reboots. Reap it here, but only well past its own deadline, so a
+     client that IS polling always sees its result first. */
+  const unsigned long now = millis();
+  if (gDiag.jobActive && (long)(now - gDiag.jobDeadline) > 10000L) {
+    printf("[BUS] self-test on module %d was never collected -- clearing it\n", (int)gDiag.jobId);
+    gDiag.jobActive = false; gDiag.t.waitId = -1; gDiag.m.waitId = -1;
+  }
+  if (gCalib.jobActive && (long)(now - gCalib.jobDeadline) > 10000L) {
+    printf("[BUS] calibration on module %d was never collected -- clearing it\n", (int)gCalib.jobId);
+    gCalib.jobActive = false; gCalib.waitId = -1;
+  }
   if (!gSoak.active)                      busReleaseFirmware("soak");
   if (!gProbe.active)                     busReleaseFirmware("probe");
   if (!gDiag.jobActive)                   busReleaseFirmware("diagnostics");

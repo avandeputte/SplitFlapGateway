@@ -380,6 +380,19 @@ static void sfQuietCapturePending(const uint8_t* data, size_t len) {
 // (see sfQueryVersion() for the half-duplex turnaround reason). Broadcast "m*v",
 // by-serial "mX.." frames, and anything with bytes after the 'v' are NOT matched
 // and so keep their terminator.
+/* The ONE frame the gateway ships without a terminator: a direct, numeric-id version query.
+   Everything else keeps its newline, because framing every command is the safer default.
+   Why this one is different, and why the exception stays narrow:
+     A module acts on the command letter itself and answers immediately. A trailing newline is
+     still clocking out while that reply starts, and the gateway is deaf while it transmits, so
+     the reply's first bytes are lost. Measured on a v32 module at 9600 baud: "m5v" answered
+     40 times out of 40, "m5v\n" answered 0 times out of 40.
+     The module firmware authors expected the same race on Q, d and A. It does not show: those
+     replies take milliseconds to prepare (an ADC read for Q, EEPROM assembly for d and A),
+     which is far longer than the ~1 ms terminator, and "m5Q\n" also answered 40 out of 40. So
+     they keep their terminators. If a module ever answers them fast enough to collide, the
+     symptom is a reply missing its leading 'm' in the incident log, and this is where to
+     widen the exception. */
 static bool sfIsDirectVersionQuery(const uint8_t* data, size_t len) {
   int addr;
   if (sfFrameCmd(data, len, &addr) != 'v') return false;   // command must be 'v'

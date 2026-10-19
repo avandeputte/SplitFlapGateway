@@ -303,10 +303,18 @@ static void restoreWriteOne(const RestoreEntry& e, unsigned long* readyAt) {
       const char* v = end + 1;
       long pos = strtol(v, &end, 10);
       if (end == v) break;
-      if (idx >= 0 && idx < SF_MAX_FLAPS) {
+      // A position outside one revolution is not a position. Values like 65368 (which is
+      // -168 stored as unsigned) exist in older backups; replaying one writes nonsense back
+      // into the module, and module firmware v33 refuses it anyway -- silently, so the only
+      // trace would be a verify mismatch nobody can explain. Skip it and say so.
+      const bool posSane = (pos >= 0 && (e.totalSteps <= 0 || pos < e.totalSteps));
+      if (idx >= 0 && idx < SF_MAX_FLAPS && posSane) {
         sfWritePos(wId, (int)idx, (int)pos);
         sent++;
         vTaskDelay(pdMS_TO_TICKS(RESTORE_ENTRY_GAP_MS));
+      } else if (idx >= 0 && idx < SF_MAX_FLAPS) {
+        printf("[RESTORE] %s: flap %ld has position %ld, outside 0..%d -- left uncalibrated\n",
+               e.sn, idx, pos, e.totalSteps - 1);
       }
       if (*end == ',') p = end + 1; else break;
     }
@@ -535,10 +543,12 @@ bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* to
     else               snprintf(frame, sizeof(frame), "m%dA\n", list[i].id);
     if (list[i].fw == 0 || list[i].fw >= 25)
       got = sfReadDump(list[i].id, frame, 1400, dump, sizeof(dump), NULL, abort);
+    const bool aFailed = !got;
     if (!got) {                                  // 'A' refused or lost: the shorter read
       if (list[i].sn[0] && list[i].fw >= 15) snprintf(frame, sizeof(frame), "mXD%s\n", list[i].sn);
       else                                   snprintf(frame, sizeof(frame), "m%dd\n", list[i].id);
       got = sfReadDump(list[i].id, frame, 1400, dump, sizeof(dump), NULL, abort);
+      if (got && aFailed) incidentLog(list[i].id, 'F', 'A', 0);   // length, not silence
     }
     if (got && dump[0]) {
       // Only an 'A' read carries a flap set, and only a self-consistent one is written --

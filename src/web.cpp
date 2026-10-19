@@ -655,8 +655,10 @@ static void handleApiDiag() {
   if (qok) {
     snprintf(out, sizeof(out),
       "{\"ok\":true,\"started\":true,\"id\":%d,"
-      "\"q\":{\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d}}",
-      id, gDiag.q.reset, gDiag.q.boot, gDiag.q.vcc, gDiag.q.ee, gDiag.q.cur);
+      "\"q\":{\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d,"
+      "\"rxOverflows\":%d,\"bcastSent\":%d,\"bcastLate\":%d}}",
+      id, gDiag.q.reset, gDiag.q.boot, gDiag.q.vcc, gDiag.q.ee, gDiag.q.cur,
+      gDiag.q.rxOv, gDiag.q.bcSent, gDiag.q.bcLate);
   } else {
     snprintf(out, sizeof(out), "{\"ok\":true,\"started\":true,\"id\":%d,\"q\":null}", id);
   }
@@ -1990,7 +1992,10 @@ static void handleApiAll() {
       char alt2[40] = "";
       if (sn[0]) snprintf(alt2, sizeof(alt2), "mXD%s\n", sn);   // only if the short ask is ignored
       gotReply = sfReadDump(id, f2, 1300, rawDump, sizeof(rawDump), NULL, NULL, alt2[0] ? alt2 : NULL);
-      if (gotReply) printf("[API] module %d: v+d succeeded where 'A' did not\n", id);
+      if (gotReply) {
+        printf("[API] module %d: v+d succeeded where 'A' did not\n", id);
+        incidentLog((uint8_t)id, 'F', 'A', 0);   // the module answers; the long reply is what fails
+      }
     }
   } else {
     // Unknown or older firmware: version query, then dump (two transactions).

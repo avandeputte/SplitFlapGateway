@@ -33,6 +33,46 @@
   ID yet, the ID is being changed, or pairing the right calibration with the right serial is
   the point of the operation.
 
+### Also in this release
+
+Written after the module firmware authors replied to the hardening requests, and after
+measuring their claims against a live wall of v32 modules.
+
+- **A broadcast batch now ends when every module has answered**, instead of running to a clock.
+  A module answers in its own timed slot, and its clock runs slow while bytes are on the bus,
+  so later slots land later than nominal. A window sized to the nominal slots closes while the
+  last modules are still waiting their turn, and the next broadcast cancels a reply that has
+  not gone out. At 64 IDs that window was 46 s against a last reply landing past 50 s, which
+  fits the field report of modules going missing *only* in broadcasts better than collisions
+  do. The deadline now allows for the drift as a backstop. Measured on 15 modules: the roll
+  call holds the bus 1.6 s instead of 2.5, and the combined-dump batch 10.5 s instead of 14.9.
+
+- **A restore will not replay an impossible flap position.** Values such as 65368 (which is
+  −168 stored unsigned) exist in older backups; writing one back stores nonsense, and module
+  firmware v33 refuses it silently, so the only symptom would be a verify mismatch nobody can
+  explain. Such an entry is now skipped and logged with its module and flap.
+
+- **The three bus counters module firmware v33 reports are read and shown** — receive
+  overflows, broadcast replies sent, and how many went out late — in the module's Info dialog
+  and on `GET /api/flap/diag/status`. Older modules report them as unavailable rather than
+  breaking the parse, which was checked against v32.
+
+- **The incident log distinguishes a recovered fallback from real silence.** "A long read
+  failed and a shorter one worked" is the signature of a length problem on a module that is
+  plainly alive, and it no longer reads as "no reply".
+
+- **A self-test nobody collects no longer blocks every later test.** The running flag was only
+  cleared by reading the status endpoint, so starting a Hall test from a script and never
+  polling it left the gateway refusing probes and soaks until it rebooted. Stale jobs are now
+  reaped past their own deadline, late enough that a polling client still sees its result.
+
+- **Terminators stay on every command but one.** The module authors expected the stats and dump
+  queries to suffer the same half-duplex race as the version query, where the module answers on
+  the command letter while the gateway is still transmitting its newline and deaf. Measured on
+  a v32 module: `m5v` answered 40 times out of 40 and `m5v\n` zero times out of 40, while
+  `m5Q` answered 40 out of 40 either way, because its reply takes milliseconds to prepare. So
+  the exception stays exactly one frame wide, with the numbers recorded beside it.
+
 ## v3.17.0 — 2026-10-19
 
 ### Added
