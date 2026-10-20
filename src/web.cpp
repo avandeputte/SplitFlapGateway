@@ -2273,7 +2273,9 @@ static void handleApiModFwRaw() {
       if (!modfwValidateFile(MODFW_TMP, &crc, mfWhy, sizeof(mfWhy))) { mfAbort(422); break; }
       FFat.remove(MODFW_FILE);
       if (!FFat.rename(MODFW_TMP, MODFW_FILE)) { mfAbort(507); break; }
-      printf("[MODFW] image stored: %u bytes, CRC %04X\n", (unsigned)mfRecvd, crc);
+      modfwImageForget();
+      printf("[MODFW] image stored: %u bytes, CRC %04X, firmware v%d\n",
+             (unsigned)mfRecvd, crc, modfwImageVersion(MODFW_FILE));
       break;
     }
     case RAW_ABORTED: mfAbort(400); break;
@@ -2294,6 +2296,7 @@ static void handleApiModFwDelete() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (gModFw.phase != MODFW_IDLE && gModFw.phase < MODFW_DONE) { sendJsonError(409, "an update is running"); return; }
   if (sfFsReady) FFat.remove(MODFW_FILE);
+  modfwImageForget();
   server.send(200, "application/json", "{\"ok\":true,\"deleted\":true}");
 }
 /* Streamed, because a wall can hold 255 modules and a row apiece does not belong in a static

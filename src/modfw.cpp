@@ -149,17 +149,60 @@ bool modfwValidateFile(const char* path, uint16_t* crcOut, char* err, size_t err
   return true;
 }
 
-bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid) {
-  if (!sfFsReady || !FFat.exists(MODFW_FILE)) return false;
-  File f = FFat.open(MODFW_FILE, "r");
-  if (!f) return false;
-  if (bytes) *bytes = f.size();
+int modfwImageVersion(const char* path) {
+  if (!sfFsReady || !FFat.exists(path)) return 0;
+  File f = FFat.open(path, "r");
+  if (!f) return 0;
+  static uint8_t buf[512];
+  int found = 0, version = 0;
+  int digits = 0, value = 0;          // a run of digits, carried across chunk boundaries
+  bool prevDigit = false;
+  while (f.available()) {
+    const int n = f.read(buf, sizeof(buf));
+    for (int i = 0; i < n; i++) {
+      const uint8_t c = buf[i];
+      if (c >= '0' && c <= '9') {
+        if (digits < 4) { value = value * 10 + (c - '0'); digits++; }
+        else digits = 5;              // too long to be a version
+        prevDigit = true;
+        continue;
+      }
+      if (prevDigit && c == 0 && digits >= 2 && digits <= 3 && value >= MODULE_FW_BOOTLOADER && value <= 255) {
+        if (!found || value != version) { found++; version = value; }
+      }
+      digits = 0; value = 0; prevDigit = false;
+    }
+    wdgWebMs = millis();
+  }
   f.close();
-  char err[72];
-  uint16_t c = 0;
-  const bool ok = modfwValidateFile(MODFW_FILE, &c, err, sizeof(err));
-  if (crc)   *crc = c;
-  if (valid) *valid = ok;
+  return (found == 1) ? version : 0;  // more than one candidate: say nothing rather than guess
+}
+
+// Cached, because a status poll every two seconds should not re-read and re-CRC 15 KB of flash
+// while an update's timing is being measured in milliseconds.
+static struct { bool known = false, exists = false, valid = false;
+                size_t bytes = 0; uint16_t crc = 0; int version = 0; } gImg;
+
+void modfwImageForget() { gImg.known = false; }
+
+bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version) {
+  if (!gImg.known) {
+    gImg.known = true;
+    gImg.exists = (sfFsReady && FFat.exists(MODFW_FILE));
+    gImg.bytes = 0; gImg.crc = 0; gImg.valid = false; gImg.version = 0;
+    if (gImg.exists) {
+      File f = FFat.open(MODFW_FILE, "r");
+      if (f) { gImg.bytes = f.size(); f.close(); }
+      char err[72];
+      gImg.valid = modfwValidateFile(MODFW_FILE, &gImg.crc, err, sizeof(err));
+      if (gImg.valid) gImg.version = modfwImageVersion(MODFW_FILE);
+    }
+  }
+  if (!gImg.exists) return false;
+  if (bytes)   *bytes   = gImg.bytes;
+  if (crc)     *crc     = gImg.crc;
+  if (valid)   *valid   = gImg.valid;
+  if (version) *version = gImg.version;
   return true;
 }
 
@@ -409,19 +452,19 @@ static const char* phaseName() {
 }
 
 void modfwStatusEmit(void (*emit)(const char* chunk)) {
-  size_t bytes = 0; uint16_t crc = 0; bool valid = false;
-  const bool have = modfwImageInfo(&bytes, &crc, &valid);
+  size_t bytes = 0; uint16_t crc = 0; bool valid = false; int version = 0;
+  const bool have = modfwImageInfo(&bytes, &crc, &valid, &version);
   char out[360];
   int n = snprintf(out, sizeof(out),
     "{\"ok\":true,\"state\":\"%s\",\"targets\":%d,\"pass\":%d,\"pagesSent\":%d,\"pagesThisPass\":%d,"
     "\"updated\":%d,\"elapsed\":%lu,\"error\":\"%s\","
-    "\"image\":{\"stored\":%s,\"bytes\":%u,\"crc\":\"%04X\",\"valid\":%s,\"pages\":%d},\"modules\":[",
+    "\"image\":{\"stored\":%s,\"bytes\":%u,\"crc\":\"%04X\",\"valid\":%s,\"version\":%d,\"pages\":%d},\"modules\":[",
     phaseName(), (int)gModFw.targets, (int)gModFw.pass, (int)gModFw.pagesSent,
     (int)gModFw.pagesThisPass, (int)gModFw.ok,
     (unsigned long)(gModFw.phase >= MODFW_DONE ? gModFw.elapsedMs
                                                : (gModFw.startedMs ? millis() - gModFw.startedMs : 0)),
     gModFw.err, have ? "true" : "false", (unsigned)bytes, crc, valid ? "true" : "false",
-    MODFW_PAGES);
+    version, MODFW_PAGES);
   (void)n;
   emit(out);
   if (gModFw.list) {

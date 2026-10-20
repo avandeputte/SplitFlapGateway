@@ -80,8 +80,18 @@ struct ModFwState {
 extern ModFwState gModFw;
 
 void modfwInit();                                   // once, from setup()
-// What is stored: size, the image's own CRC, and whether it checks out.
-bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid);
+/* What is stored: size, the image's own CRC, whether it checks out, and which firmware
+   version it holds (0 when that cannot be told -- see modfwImageVersion). Cached: the answer
+   only changes when an image is uploaded or deleted, and re-reading 15 KB of flash on every
+   status poll would add cache stalls to a run whose timing is being measured in milliseconds. */
+bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version = NULL);
+void modfwImageForget();      // after an upload or a delete: the cache is stale
+/* The version the image will install, read out of the image itself.
+   The module firmware keeps it as a short NUL-terminated digit string, so the image is scanned
+   for digit strings of that shape with a value of 35 or more -- no earlier firmware has a
+   bootloader, so no earlier image can arrive here. Exactly one candidate means we know; more
+   than one means we do not, and saying nothing beats guessing. 0 = unknown. */
+int modfwImageVersion(const char* path);
 // Validate a candidate image file (size and CRC). `err` gets a short reason on failure.
 bool modfwValidateFile(const char* path, uint16_t* crcOut, char* err, size_t errLen);
 // Start a run over `ids` (or every eligible module when n == 0). False, with a reason, if the
