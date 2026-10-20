@@ -216,6 +216,7 @@ function modHome(id){apiFlapCmd("/api/flap/home",{id:id}).then(function(j){loadM
   h+="<tr><td style='padding:2px 8px'><b>"+m.id+"</b></td><td style='padding:2px 8px;color:var(--dim)'>v"+m.from+"</td><td style='padding:2px 8px;color:"+col+"'>"+now+"</td><td style='padding:2px 8px;color:var(--dim)'>"+(m.pagesLeft||0)+"</td></tr>";});
  o.innerHTML=h+"</table>";}
 function mfwLoad(){fetch("/api/modules/firmware").then(function(r){return r.json();}).then(mfwFmt).catch(function(){});}
+mfwLoad();   // the Modules tab is the one open at load, and show() only runs on a switch
 function mfwUpload(){var f=document.getElementById("mfwFile").files[0];var r=document.getElementById("mfwUpR");
  if(!f){r.textContent=t("Choose a file first.");return;}
  r.textContent=t("Uploading...");
