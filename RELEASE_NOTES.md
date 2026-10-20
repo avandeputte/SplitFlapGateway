@@ -1,5 +1,30 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.0.1 — 2026-10-20
+
+### Fixed
+
+- **The maintenance banner and its yellow border hung around after the work had finished**,
+  sometimes for fifteen seconds and sometimes until the page was reloaded, which is what it
+  looked like from the outside.
+
+  The dashboard runs several pollers and passes them through one gate so the gateway's
+  single-threaded web server is never hammered: at most one request every 150 ms. The gate
+  **dropped** a call that arrived inside that window instead of deferring it, and the loser was
+  always the same one — the status poll runs every three seconds and draws the banner, while
+  the bus monitor polls every six hundred milliseconds. Every collision cost the banner another
+  three seconds, and a run of them cost it much more. A reload looked like the fix because the
+  page polls once on load.
+
+  A gated call is now deferred rather than lost, at most one pending per poller so nothing can
+  pile up. The dashboard also refreshes the moment it takes or releases a hold of its own,
+  rather than waiting for the next poll.
+
+  Measured on the wall, over three trials: a hold taken by something else shows and clears
+  within the three-second poll, where it previously took fifteen seconds or needed a reload.
+  Opening the Calibration tab now shows the banner in **0.4 s** and leaving it clears the
+  banner in **0.6 s**.
+
 ## v4.0.0 — 2026-10-20
 
 **A major version, because the gateway now does something it never could: update the modules
