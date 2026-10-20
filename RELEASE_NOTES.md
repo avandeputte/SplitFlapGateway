@@ -2,13 +2,35 @@
 
 ## v4.0.0 — 2026-10-20
 
-**The modules' own firmware can now be updated over the bus, from the gateway.** A whole wall
-in about a minute, with nobody touching a module and no UPDI programmer.
+**A major version, because the gateway now does something it never could: update the modules
+themselves.**
 
-This is the gateway side of the bootloader that module firmware v35 introduced: 1 KB at the
-start of each module's flash that can replace the firmware from an image sent over RS-485. The
-protocol and its timing are the module firmware's BUS-UPDATE.md, and `tools/busflash.py` there
-is the reference sender this follows step for step.
+### What changed, and why that needs a new major version
+
+Until now, new module firmware meant a programmer, a cable and a trip to every single module.
+Module firmware [**v35**](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/tag/35)
+changes that by giving each module a **bootloader** — a kilobyte at the start of its own flash
+that can replace the rest of the firmware from an image sent over the RS-485 bus. The modules
+stay on the wall; the firmware comes to them.
+
+That only works with a controller that speaks the update protocol, and **this release is that
+controller**. The gateway grew a new role here: it is no longer only a thing that drives a
+display, it is the thing that maintains the hardware behind it. Hence 4.0.
+
+**What you need to do once.** The bootloader itself has to arrive the old way: one last flash
+over UPDI per module, with the web flasher or avrdude, which also sets the fuse that reserves
+the bootloader's kilobyte. After that, every future module firmware goes over the bus from this
+screen. Modules still on older firmware keep working exactly as before — the gateway skips them
+and they are not disturbed by the update traffic.
+
+**Nothing about an update puts a module at risk.** It keeps its ID and its calibration, because
+the bootloader never writes EEPROM. It never starts a half-written image: a module that loses
+power, or loses the gateway, part way through simply waits for the image to be sent again.
+
+### The gateway side
+
+This follows the module firmware's BUS-UPDATE.md step for step, with `tools/busflash.py` there
+as the reference sender.
 
 ### How a run goes
 
