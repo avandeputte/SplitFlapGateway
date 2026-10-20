@@ -1,5 +1,74 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.0.0 — 2026-10-20
+
+**The modules' own firmware can now be updated over the bus, from the gateway.** A whole wall
+in about a minute, with nobody touching a module and no UPDI programmer.
+
+This is the gateway side of the bootloader that module firmware v35 introduced: 1 KB at the
+start of each module's flash that can replace the firmware from an image sent over RS-485. The
+protocol and its timing are the module firmware's BUS-UPDATE.md, and `tools/busflash.py` there
+is the reference sender this follows step for step.
+
+### How a run goes
+
+Upload `firmware-update.bin` from a module firmware release — 15,360 bytes, whose own CRC the
+gateway checks before storing it — then start the update from **Modules ▸ Module Firmware**,
+either for named modules or for every eligible one. The gateway then:
+
+1. **skips anything older than v35**, which has no bootloader, and says so rather than sending
+   it 15 KB it cannot use;
+2. **puts the targets into update mode** with a checksummed command, which is the only form a
+   module accepts for this, so line noise can never take a wall off the air;
+3. **confirms each one is waiting** in its bootloader;
+4. **broadcasts the image's 240 pages once**, to every module at a time, so four modules cost
+   the same as one;
+5. **asks each module which pages it actually wrote and read back**, and resends only the gaps,
+   per module, for up to five passes;
+6. **tells them to start the image**, which a module does only when it holds every page and the
+   whole image matches its CRC;
+7. **waits for each one to come back** and reports the version it now runs.
+
+The bus is held **exclusively** throughout, and every frame goes into the trace, so a failed
+update leaves a complete record. A module keeps its ID and calibration — the bootloader never
+writes EEPROM — and one that loses power part way through waits for the image rather than
+starting a half-written one.
+
+### Measured on a real wall
+
+Fifteen modules on v32 and v33, four on v35 or v36:
+
+| | |
+|---|---|
+| Four modules, v35/v36 → v36 | one pass, no resends, **4 of 4**, about 75 s |
+| Pages delivered | 240 of 240, broadcast once for all four |
+| The other eleven modules | untouched; their firmware ignores update traffic entirely |
+| Bus counters afterwards | 0 discards, 0 rejects, 0 checksum failures, 0 incidents |
+
+Also exercised on hardware: a single-module update both ways between v35 and v36, the whole
+run driven from the dashboard including the upload, and the protocol's safe exit — entering
+update mode and sending go before any page returns a module to the firmware it already has,
+with nothing written.
+
+**One number worth recording:** a module takes **28.7 seconds** to answer again after it
+starts a new image. It restarts, re-checks the whole image, waits out the staggered start-up
+that keeps a wall from drawing its inrush at once, and homes its reel, and it answers nothing
+through any of that. An earlier build called a perfectly good update a failure by asking after
+two seconds.
+
+### Added
+
+- `PUT /api/modules/firmware` stores the image (size and CRC checked), `GET` reports what is
+  stored, `DELETE` forgets it.
+- `POST /api/modules/firmware/start` `{"ids":[…]}`, or `{}` for every eligible module.
+- `GET /api/modules/firmware/status` — phase, pass, pages, and a row per module.
+- `POST /api/modules/firmware/cancel`.
+- `POST /api/modules/firmware/probe` `{"id":N}` asks one module's bootloader how it is doing:
+  which image it holds and how many pages of it. A module running its firmware does not answer,
+  which is itself the answer.
+- **Modules ▸ Module Firmware** in the dashboard: upload, choose modules or all, progress, and
+  a table of what each module ran before and runs now.
+
 ## v3.18.0 — 2026-10-19
 
 Module firmware **v33** adds a checksummed frame format and four counters of its own. This is

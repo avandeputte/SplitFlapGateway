@@ -71,8 +71,9 @@ void taskRS485(void* pv) {
         lineLen = 0;
       }
 
-      // Start accumulating at the leading 'm', or at the '~' of a checksummed frame.
-      if (lineLen == 0 && c != 'm' && c != '~') {
+      // Start accumulating at the leading 'm', at the '~' of a checksummed frame, or at the
+      // '#' of a bootloader frame (a module being updated over the bus speaks only those).
+      if (lineLen == 0 && c != 'm' && c != '~' && c != '#') {
         continue;  // skip noise / framing bytes before the message start
       }
       (void)inCrcPrefix;
@@ -150,7 +151,8 @@ void taskRS485(void* pv) {
         mqttPublishMsg(m);
         // parseOff skips a verified checksum prefix; a frame whose checksum FAILED is not
         // parsed at all, only recorded.
-        if (!(lineBuf[0] == '~' && !rxLastChecked))
+        if (lineBuf[0] == '#') modfwNoteReply(lineBuf, lineLen);        // a bootloader's reply
+        else if (!(lineBuf[0] == '~' && !rxLastChecked))
           sfParseResponse(lineBuf + parseOff, lineLen - parseOff);
         lineLen = 0;
       }

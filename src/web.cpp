@@ -38,6 +38,14 @@ static void handleApiSoakCancel();
 static void handleApiSoakSnapshot();
 static void handleApiIncidents();
 static void handleApiStats();
+static void handleApiModFwGet();
+static void handleApiModFwPut();
+static void handleApiModFwRaw();
+static void handleApiModFwDelete();
+static void handleApiModFwStart();
+static void handleApiModFwStatus();
+static void handleApiModFwCancel();
+static void handleApiModFwProbe();
 static void handleApiSoakLog();
 static void handleApiIncidentsClear();
 static void handleApiSoakRollback();
@@ -2219,6 +2227,127 @@ static void handleApiSoakLog() {
   server.sendContent("");
 }
 
+/* The modules' own firmware, updated over the bus (see modfw.h).
+   PUT  /api/modules/firmware         store firmware-update.bin (15,360 bytes, CRC checked)
+   GET  /api/modules/firmware         what is stored, and which modules could take it
+   POST /api/modules/firmware/start   {"ids":[...]} or {} for every eligible module
+   GET  /api/modules/firmware/status  progress, per module
+   POST /api/modules/firmware/cancel  stop after the current frame
+   POST /api/modules/firmware/probe   {"id":N} -- ask one module's bootloader how it is doing */
+static File     mfFile;
+static size_t   mfRecvd = 0;
+static int      mfErr   = 0;
+static char     mfWhy[72] = "";
+static void mfAbort(int code) {
+  mfErr = code;
+  if (mfFile) mfFile.close();
+  FFat.remove(MODFW_TMP);
+}
+static void handleApiModFwRaw() {
+  HTTPRaw& raw = server.raw();
+  wdgWebMs = millis();
+  switch (raw.status) {
+    case RAW_START: {
+      mfRecvd = 0; mfErr = 0; mfWhy[0] = 0;
+      const size_t len = (size_t)server.clientContentLength();
+      if (!sfFsReady)                 { mfErr = 503; break; }
+      if (gModFw.phase != MODFW_IDLE && gModFw.phase < MODFW_DONE) { mfErr = 409; break; }
+      if (len != MODFW_IMAGE_BYTES)   { mfErr = 400; break; }   // the image is exactly this long
+      FFat.remove(MODFW_TMP);
+      mfFile = FFat.open(MODFW_TMP, "w");
+      if (!mfFile) mfErr = 507;
+      break;
+    }
+    case RAW_WRITE:
+      if (mfErr || !mfFile) break;
+      if (mfRecvd + raw.currentSize > MODFW_IMAGE_BYTES) { mfAbort(413); break; }
+      if (mfFile.write(raw.buf, raw.currentSize) != raw.currentSize) { mfAbort(507); break; }
+      mfRecvd += raw.currentSize;
+      break;
+    case RAW_END: {
+      if (mfErr) { mfAbort(mfErr); break; }
+      mfFile.close();
+      if (mfRecvd != MODFW_IMAGE_BYTES) { mfAbort(400); break; }
+      uint16_t crc = 0;
+      if (!modfwValidateFile(MODFW_TMP, &crc, mfWhy, sizeof(mfWhy))) { mfAbort(422); break; }
+      FFat.remove(MODFW_FILE);
+      if (!FFat.rename(MODFW_TMP, MODFW_FILE)) { mfAbort(507); break; }
+      printf("[MODFW] image stored: %u bytes, CRC %04X\n", (unsigned)mfRecvd, crc);
+      break;
+    }
+    case RAW_ABORTED: mfAbort(400); break;
+  }
+}
+static void handleApiModFwPut() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (mfErr) {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}",
+             mfWhy[0] ? mfWhy : (mfErr == 400 ? "the image must be exactly 15360 bytes" : "upload failed"));
+    server.send(mfErr, "application/json", buf);
+    return;
+  }
+  char out[256];
+  modfwStatusJson(out, sizeof(out));
+  server.send(200, "application/json", out);
+}
+static void handleApiModFwDelete() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (gModFw.phase != MODFW_IDLE && gModFw.phase < MODFW_DONE) { sendJsonError(409, "an update is running"); return; }
+  if (sfFsReady) FFat.remove(MODFW_FILE);
+  server.send(200, "application/json", "{\"ok\":true,\"deleted\":true}");
+}
+static void handleApiModFwGet() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  static char out[1600];
+  modfwStatusJson(out, sizeof(out));
+  server.send(200, "application/json", out);
+}
+static void handleApiModFwStatus() { handleApiModFwGet(); }
+static void handleApiModFwStart() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  int ids[MAX_MODULES]; int n = 0;
+  if (server.hasArg("plain") && server.arg("plain").length()) {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
+    JsonArrayConst a = doc["ids"].as<JsonArrayConst>();
+    for (JsonVariantConst v : a) { if (n < MAX_MODULES) ids[n++] = v.as<int>(); }
+  }
+  char err[96] = "";
+  if (!modfwStart(n ? ids : NULL, n, err, sizeof(err))) { sendJsonError(409, err[0] ? err : "cannot start"); return; }
+  static char out[1600];
+  modfwStatusJson(out, sizeof(out));
+  server.send(200, "application/json", out);
+}
+static void handleApiModFwCancel() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (gModFw.phase == MODFW_IDLE || gModFw.phase >= MODFW_DONE) { sendJsonError(409, "no update running"); return; }
+  modfwCancel();
+  server.send(200, "application/json", "{\"ok\":true,\"cancelling\":true}");
+}
+static void handleApiModFwProbe() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { sendJsonError(400, "No body"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
+  const int id = doc["id"] | -1;
+  if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
+  uint8_t ver = 0, reason = 0, flags = 0; uint16_t img = 0; int held = 0;
+  if (!modfwProbe(id, &ver, &reason, &flags, &img, &held)) {
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+      "{\"ok\":true,\"id\":%d,\"inBootloader\":false,\"note\":\"no answer: the module is running its firmware, or has no bootloader\"}", id);
+    server.send(200, "application/json", buf);
+    return;
+  }
+  char buf[220];
+  snprintf(buf, sizeof(buf),
+    "{\"ok\":true,\"id\":%d,\"inBootloader\":true,\"bootloader\":%d,\"reason\":%d,\"flags\":%d,"
+    "\"imageCrc\":\"%04X\",\"pagesHeld\":%d,\"pagesNeeded\":%d}",
+    id, ver, reason, flags, img, held, MODFW_PAGES);
+  server.send(200, "application/json", buf);
+}
+
 /* POST /api/flap/stats {"id":N} -- the module's own snapshot, and nothing else.
    /api/flap/diag returns the same figures but starts a Hall self-test with them, which spins
    the reel for twenty seconds. Since module firmware v33 the snapshot carries the counters
@@ -2945,6 +3074,16 @@ void webInit() {
   server.on("/api/flap/soak/cancel", HTTP_POST,    handleApiSoakCancel);
   server.on("/api/flap/soak/status", HTTP_GET,     handleApiSoakStatus);
   server.on("/api/flap/soak/snapshot", HTTP_GET,    handleApiSoakSnapshot);
+  server.on("/api/modules/firmware",        HTTP_GET,     handleApiModFwGet);
+  server.on("/api/modules/firmware",        HTTP_PUT,     handleApiModFwPut, handleApiModFwRaw);
+  server.on("/api/modules/firmware",        HTTP_DELETE,  handleApiModFwDelete);
+  server.on("/api/modules/firmware",        HTTP_OPTIONS, handleOptions);
+  server.on("/api/modules/firmware/start",  HTTP_POST,    BUSGATED(handleApiModFwStart));
+  server.on("/api/modules/firmware/start",  HTTP_OPTIONS, handleOptions);
+  server.on("/api/modules/firmware/status", HTTP_GET,     handleApiModFwStatus);
+  server.on("/api/modules/firmware/cancel", HTTP_POST,    handleApiModFwCancel);
+  server.on("/api/modules/firmware/probe",  HTTP_POST,    BUSGATED(handleApiModFwProbe));
+  server.on("/api/modules/firmware/probe",  HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/stats",         HTTP_POST,    BUSGATED(handleApiStats));
   server.on("/api/flap/stats",         HTTP_OPTIONS, handleOptions);
   server.on("/api/flap/soak/log",      HTTP_GET,     handleApiSoakLog);

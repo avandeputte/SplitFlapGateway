@@ -1805,6 +1805,122 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /api/modules/firmware:
+    get:
+      tags: [Status]
+      summary: The stored module-firmware image (v4.0)
+      description: |
+        What is stored for updating the MODULES' own firmware over the bus, plus the state of
+        any run in progress. The same body `/status` returns.
+      responses:
+        "200":
+          description: Image and run state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModFwStatus" }
+    put:
+      tags: [Status]
+      summary: Store a module-firmware image (v4.0)
+      description: |
+        The body is `firmware-update.bin` from a module firmware release: exactly 15,360 bytes,
+        240 pages of 64. The gateway checks the image's own CRC (its last two bytes, big-endian,
+        over everything before them) and refuses anything that does not match, so a truncated
+        upload cannot be sent to a wall.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200": { description: Stored, content: { application/json: { schema: { $ref: "#/components/schemas/ModFwStatus" } } } }
+        "400": { description: Not 15,360 bytes }
+        "409": { description: An update is running }
+        "422": { description: The image's CRC does not check out }
+    delete:
+      tags: [Status]
+      summary: Forget the stored image (v4.0)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /api/modules/firmware/start:
+    post:
+      tags: [Status]
+      summary: Update the modules' firmware over the bus (v4.0)
+      description: |
+        Runs the procedure in the module firmware's BUS-UPDATE.md: into update mode with a
+        checksummed command, confirm, broadcast the 240 pages once for every module at a time,
+        ask each module which pages it actually wrote, resend only the gaps, then go. Modules
+        older than v35 have no bootloader and are skipped. The bus is held EXCLUSIVELY for the
+        run, which takes about 75 seconds however many modules are being updated.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer, minimum: 0, maximum: 254 }
+                  description: Modules to update. Omit, or send {}, for every eligible module.
+      responses:
+        "200": { description: Started, content: { application/json: { schema: { $ref: "#/components/schemas/ModFwStatus" } } } }
+        "409": { description: No image, nothing eligible, or the bus is busy }
+
+  /api/modules/firmware/status:
+    get:
+      tags: [Status]
+      summary: Progress of a module firmware update (v4.0)
+      responses:
+        "200": { description: Progress, content: { application/json: { schema: { $ref: "#/components/schemas/ModFwStatus" } } } }
+
+  /api/modules/firmware/cancel:
+    post:
+      tags: [Status]
+      summary: Stop an update after the current frame (v4.0)
+      description: >
+        A module that has not been told to start an image stays in its bootloader waiting for
+        one; run the update again, or send it back to its existing firmware.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "409": { description: No update running }
+
+  /api/modules/firmware/probe:
+    post:
+      tags: [Status]
+      summary: Ask one module's bootloader how it is doing (v4.0)
+      description: >
+        A module running its firmware does not answer, which is itself the answer. One in
+        update mode reports the bootloader version, why it is there, which image it holds and
+        how many of its 240 pages.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, minimum: 0, maximum: 254 }
+      responses:
+        "200":
+          description: What the module said, or that it said nothing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:           { type: boolean }
+                  id:           { type: integer }
+                  inBootloader: { type: boolean }
+                  bootloader:   { type: integer, description: "Bootloader version" }
+                  reason:       { type: integer, description: "1 it was asked to, 2 it has no valid firmware" }
+                  flags:        { type: integer, description: "Bit 0: the last go did not start an image" }
+                  imageCrc:     { type: string, description: "The image it is receiving; FFFF = none" }
+                  pagesHeld:    { type: integer }
+                  pagesNeeded:  { type: integer, example: 240 }
+                  note:         { type: string }
+
   /api/flap/stats:
     post:
       tags: [Status]
@@ -2401,6 +2517,40 @@ components:
           type: string
           description: "What the nav shows for it"
           example: "Calibration"
+
+    ModFwStatus:
+      type: object
+      description: The stored module-firmware image and the state of any update (v4.0).
+      properties:
+        ok:    { type: boolean }
+        state:
+          type: string
+          enum: [idle, entering, confirming, sending, verifying, going, checking, done, failed, cancelled]
+        targets:       { type: integer }
+        pass:          { type: integer, description: "Resend round, 1-based" }
+        pagesSent:     { type: integer }
+        pagesThisPass: { type: integer }
+        updated:       { type: integer, description: "Modules now running the new firmware" }
+        elapsed:       { type: integer, description: "ms" }
+        error:         { type: string }
+        image:
+          type: object
+          properties:
+            stored: { type: boolean }
+            bytes:  { type: integer, example: 15360 }
+            crc:    { type: string, example: "6E1C" }
+            valid:  { type: boolean }
+            pages:  { type: integer, example: 240 }
+        modules:
+          type: array
+          items:
+            type: object
+            properties:
+              id:           { type: integer }
+              from:         { type: integer, description: "The version it ran when the run started" }
+              to:           { type: integer, description: "What it reports afterwards; 0 = not back yet" }
+              inBootloader: { type: boolean }
+              pagesLeft:    { type: integer }
 
     BusHolds:
       type: object

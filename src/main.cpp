@@ -134,6 +134,7 @@ void setup() {
   // first schedule tick could assert Quiet Time in the gap.)
   incidentsInit();
   traceInit();
+  modfwInit();
   restoreInit();
 
   // 8. Spawn tasks after WiFi stack is ready
