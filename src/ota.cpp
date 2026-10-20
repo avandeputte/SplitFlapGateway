@@ -72,27 +72,28 @@ void taskOTA(void* pv) {
 
 
 // ---------------------------------------------------------------------------
-// Web-based OTA firmware upload
+// Web-based gateway firmware upload
 // ---------------------------------------------------------------------------
 void handleOTAPage() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   // Served as a standalone page at /ota so the upload iframe works cleanly
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Firmware Update</title>"
+    "<title>Gateway Firmware Update</title>"
     "<link rel='icon' type='image/svg+xml' href='/favicon.svg'>"
     "<style>body{font-family:sans-serif;background:#1a1a2e;color:#eaeaea;padding:30px}"
     "h2{color:#e94560}progress{width:100%;height:20px;margin-top:10px}"
     "input[type=file]{color:#eaeaea}button{margin-top:10px;padding:8px 20px;"
     "background:#e94560;border:none;color:#fff;border-radius:4px;cursor:pointer}"
     "#status{margin-top:14px;font-size:.9rem}</style></head><body>"
-    "<h2>Firmware Update</h2>"
-    "<p style='color:#888;font-size:.85rem'>Select a compiled .bin file. "
+    "<h2>Gateway Firmware Update</h2>"
+    "<p style='color:#888;font-size:.85rem'>This updates <b>the gateway itself</b>, not the modules. "
+    "Select a compiled .bin file. "
     "The gateway verifies the image when the last byte lands, then reboots into it. "
     "The progress bar shows the file leaving your browser; the gateway writes it to "
     "flash at about 90 KB/s, so a full image takes 15-20 s after the bar fills.</p>"
     "<input type='file' id='fw' accept='.bin'>"
-    "<br><button onclick='upload()'>Upload Firmware</button>"
+    "<br><button onclick='upload()'>Upload Gateway Firmware</button>"
     "<progress id='prog' value='0' max='100' style='display:none'></progress>"
     "<div id='status'></div>"
     "<script>"
