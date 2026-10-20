@@ -408,10 +408,11 @@ static const char* phaseName() {
   }
 }
 
-void modfwStatusJson(char* out, size_t outLen) {
+void modfwStatusEmit(void (*emit)(const char* chunk)) {
   size_t bytes = 0; uint16_t crc = 0; bool valid = false;
   const bool have = modfwImageInfo(&bytes, &crc, &valid);
-  int n = snprintf(out, outLen,
+  char out[360];
+  int n = snprintf(out, sizeof(out),
     "{\"ok\":true,\"state\":\"%s\",\"targets\":%d,\"pass\":%d,\"pagesSent\":%d,\"pagesThisPass\":%d,"
     "\"updated\":%d,\"elapsed\":%lu,\"error\":\"%s\","
     "\"image\":{\"stored\":%s,\"bytes\":%u,\"crc\":\"%04X\",\"valid\":%s,\"pages\":%d},\"modules\":[",
@@ -421,14 +422,18 @@ void modfwStatusJson(char* out, size_t outLen) {
                                                : (gModFw.startedMs ? millis() - gModFw.startedMs : 0)),
     gModFw.err, have ? "true" : "false", (unsigned)bytes, crc, valid ? "true" : "false",
     MODFW_PAGES);
+  (void)n;
+  emit(out);
   if (gModFw.list) {
-    for (int i = 0; i < gModFw.targets && n > 0 && (size_t)n < outLen; i++) {
+    for (int i = 0; i < gModFw.targets; i++) {
       const ModFwTarget& t = gModFw.list[i];
-      n += snprintf(out + n, outLen - n,
+      char row[120];
+      snprintf(row, sizeof(row),
         "%s{\"id\":%d,\"from\":%d,\"to\":%d,\"inBootloader\":%s,\"pagesLeft\":%d}",
         i ? "," : "", (int)t.id, (int)t.fwBefore, (int)t.fwAfter,
         t.inBootloader ? "true" : "false", (int)t.pagesLeft);
+      emit(row);
     }
   }
-  if (n > 0 && (size_t)n < outLen) snprintf(out + n, outLen - n, "]}");
+  emit("]}");
 }

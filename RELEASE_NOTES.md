@@ -36,19 +36,31 @@ starting a half-written one.
 
 ### Measured on a real wall
 
-Fifteen modules on v32 and v33, four on v35 or v36:
+Nineteen modules, eighteen of them with a bootloader:
 
-| | |
+| Test | Result |
 |---|---|
-| Four modules, v35/v36 → v36 | one pass, no resends, **4 of 4**, about 75 s |
-| Pages delivered | 240 of 240, broadcast once for all four |
-| The other eleven modules | untouched; their firmware ignores update traffic entirely |
+| **18 modules, v35/v36 → v36** | one pass, no resends, **18 of 18**, **83 s** |
+| The v32 module on the same bus | skipped by the eligibility check, and undisturbed by 240 broadcast page frames |
 | Bus counters afterwards | 0 discards, 0 rejects, 0 checksum failures, 0 incidents |
+| **Cancel mid-send**, 18 modules | stopped **3.2 s** after the request, bus released |
+| **Recovery**, a second run after that cancel | **18 of 18**, 82 s |
+| **A named subset** (3 of 18) | those three on v36, the other fifteen left on v35 |
 
-Also exercised on hardware: a single-module update both ways between v35 and v36, the whole
-run driven from the dashboard including the upload, and the protocol's safe exit — entering
+Eighteen modules cost the same as one, because the pages go out once to the whole bus. The
+same wall module by module would be twenty minutes, or eighteen trips with a programmer.
+
+Also exercised: single-module updates both ways between v35 and v36, the whole run driven from
+the dashboard including the upload, the guards (an update is refused while a soak owns the bus,
+and refused outright when no target has a bootloader), and the protocol's safe exit — entering
 update mode and sending go before any page returns a module to the firmware it already has,
 with nothing written.
+
+**What a cancel leaves behind.** Once a module has taken its first page it no longer has a
+valid firmware, so a cancelled run leaves its targets waiting in their bootloaders with their
+reels blank, and the eight-second bootloader watchdog makes them forget which pages they had.
+That is the bootloader refusing to start a half-written image rather than anything going wrong,
+and the fix is simply to run the update again: measured above at 82 s for eighteen modules.
 
 **One number worth recording:** a module takes **28.7 seconds** to answer again after it
 starts a new image. It restarts, re-checks the whole image, waits out the staggered start-up

@@ -88,7 +88,10 @@ bool modfwValidateFile(const char* path, uint16_t* crcOut, char* err, size_t err
 // image is missing, nothing is eligible, or the bus is busy with something else.
 bool modfwStart(const int* ids, int n, char* err, size_t errLen);
 void modfwCancel();
-void modfwStatusJson(char* out, size_t outLen);
+/* Streamed: a wall can hold 255 modules, and a row apiece is far too much for a static
+   buffer in a memory this board is short of. At 18 modules the old fixed buffer truncated the
+   JSON mid-row, which a browser reads as a broken response. */
+void modfwStatusEmit(void (*emit)(const char* chunk));
 // One module's bootloader status, for the dashboard's "is this module ready" check. Sends an
 // S frame and waits; false when nothing answers (which is what a module without the
 // bootloader does).

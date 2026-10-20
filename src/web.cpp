@@ -39,6 +39,7 @@ static void handleApiSoakSnapshot();
 static void handleApiIncidents();
 static void handleApiStats();
 static void handleApiModFwGet();
+static void mfSendStatus();
 static void handleApiModFwPut();
 static void handleApiModFwRaw();
 static void handleApiModFwDelete();
@@ -2287,9 +2288,7 @@ static void handleApiModFwPut() {
     server.send(mfErr, "application/json", buf);
     return;
   }
-  char out[256];
-  modfwStatusJson(out, sizeof(out));
-  server.send(200, "application/json", out);
+  mfSendStatus();
 }
 static void handleApiModFwDelete() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -2297,11 +2296,18 @@ static void handleApiModFwDelete() {
   if (sfFsReady) FFat.remove(MODFW_FILE);
   server.send(200, "application/json", "{\"ok\":true,\"deleted\":true}");
 }
+/* Streamed, because a wall can hold 255 modules and a row apiece does not belong in a static
+   buffer. At 18 modules a fixed 256-byte reply truncated mid-row. */
+static void mfSendStatus() {
+  server.client().setConnectionTimeout(1500);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  modfwStatusEmit([](const char* c) { server.sendContent(c); wdgWebMs = millis(); });
+  server.sendContent("");
+}
 static void handleApiModFwGet() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  static char out[1600];
-  modfwStatusJson(out, sizeof(out));
-  server.send(200, "application/json", out);
+  mfSendStatus();
 }
 static void handleApiModFwStatus() { handleApiModFwGet(); }
 static void handleApiModFwStart() {
@@ -2315,9 +2321,7 @@ static void handleApiModFwStart() {
   }
   char err[96] = "";
   if (!modfwStart(n ? ids : NULL, n, err, sizeof(err))) { sendJsonError(409, err[0] ? err : "cannot start"); return; }
-  static char out[1600];
-  modfwStatusJson(out, sizeof(out));
-  server.send(200, "application/json", out);
+  mfSendStatus();
 }
 static void handleApiModFwCancel() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
