@@ -245,8 +245,10 @@ paths:
                     that reel does have (♥→*, ☺→:, ↓→V) or a blank. Their emoji forms
                     (❤ ⬆ ⬇ ⬅ ➡ 🙂 😊 😀) and a trailing variation selector are accepted
                     too. A TYPED letter is never a symbol: 'h' is still an H. With
-                    id:-1 the gateway sends one frame when every reel agrees and a frame
-                    per module when they do not, so a heart never lands as an 'h'.
+                    id:-1 the gateway broadcasts one frame only when every reel is known
+                    and resolves the request the same way; otherwise it sends each module
+                    its own frame, so a module with no heart on its reel gets the stand-in
+                    rather than an 'h' it would have to home on.
             example: { id: 5, char: "A" }
       responses:
         "200":

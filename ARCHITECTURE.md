@@ -503,10 +503,13 @@ so the firmware and the native tests compile the same table:
    `/api/display/state` and `/api/flap/modules` report what the flap SHOWS. Only `sets[].chars`
    stays raw, because flap-INDEX addressing works against the bytes the module stores.
 
-A broadcast is the interesting case: `m*-♥` cannot be one frame when the reels differ, because
-one frame can only carry one byte. `sfSendChar()` resolves the request for every provisioned
-module first and sends a single broadcast only when every reel is known and they all agree --
-otherwise a frame each, which is what a wall of mixed reels needs anyway.
+A broadcast is the interesting case, because a frame carries one byte and a request for a heart
+has only one byte to choose: `m*-h`. That is the heart on the reels printed with one, and on
+every other module it is a byte its reel does not contain -- which makes the module home, the
+very silence this feature exists to avoid. So `sfSendChar()` resolves the request for every
+provisioned module first and sends a single `m*-h` only when every reel is known and they all
+agree; otherwise a frame each (`m14-h`, `m13-*`, ...), which is what a wall of mixed reels needs
+anyway.
 
 Module firmware needs no change: a v31+ module stores and reports whatever bytes its flap set
 holds, and `m<id>-<byte>` has always accepted any byte.

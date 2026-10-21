@@ -54,15 +54,17 @@ stray consonant in a character set.
 
 - **`chars` in the `/api/flap/text` reply counts modules written, not bytes of UTF-8.** `"A♥B"`
   answered 5 before this release; it answers 3.
-- **A broadcast of something reel-dependent is expanded per module.** `m*-♥` cannot be one frame
-  when the reels differ -- one frame carries one byte -- so the gateway sends a single broadcast
-  only when every reel is known and they all agree, and a frame each otherwise. Everything that
+- **A broadcast of something reel-dependent is expanded per module.** A broadcast carries one
+  byte, and for a heart that byte is `h`: `m*-h` is the heart only on the reels printed with
+  one, and every other module, finding no `h` on its reel, would home. So the gateway resolves
+  the request for each provisioned module first and sends a single `m*-h` only when every reel
+  is known and they all agree -- otherwise a frame each (`m14-h`, `m13-*`, ...). Everything that
   does not depend on the reel still broadcasts exactly as before.
-- **157 dashboard strings became translatable.** The string extractor only collected literals in
+- **147 dashboard strings became translatable.** The string extractor only collected literals in
   a `.textContent`/`placeholder`/`confirm`/`alert` context, so strings hand-wrapped in `t()`
   inside built HTML -- a title, a label spliced into a row -- never reached the catalog and
-  silently stayed English in every language. The catalog is 640 keys now, up from 479. The new
-  symbol strings are translated in all 12 languages.
+  silently stayed English in every language. With those, and this release's own, the catalog is
+  640 keys, up from 479. The new symbol strings are translated in all 12 languages.
 
 ### Fixed
 
