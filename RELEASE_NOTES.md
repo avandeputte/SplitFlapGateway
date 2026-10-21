@@ -29,6 +29,15 @@ power, or loses the gateway, part way through simply waits for the image to be s
 
 ### Fixed in this release
 
+- **The Settings card that updates the gateway did not say whose firmware it updates.** Now
+  that the gateway can update the modules as well, "OTA Firmware Update" was both ambiguous
+  and jargon. It is **Gateway Firmware**, it says in a line that it updates this gateway and
+  where the modules' own firmware lives, and the page it opens says the same. The word "OTA"
+  is gone from the dashboard; the endpoints, the `otaPassword` setting and the `/ota` path are
+  unchanged.
+- **The Module Firmware card read "-" instead of naming the image it holds** until you left the
+  Modules tab and came back. It now loads on the first paint.
+
 - **The maintenance banner and its yellow border hung around after the work had finished**,
   sometimes for fifteen seconds and sometimes until the page was reloaded, which is what it
   looked like from the outside.
