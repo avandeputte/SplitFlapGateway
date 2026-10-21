@@ -1,5 +1,100 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.1.0 — 2026-10-21
+
+**Symbols on the flaps: a heart, arrows and a smiley, printed on a real reel and addressed as
+themselves.**
+
+People print symbols on some of their flaps. Until now the gateway had no way to reach one: a
+module carries exactly one byte per flap and is addressed by that byte, and ♥ has no
+Windows-1252 code. A client could only pick a punctuation mark and remember what it stood for.
+
+This release gives each symbol a reserved lowercase letter on the wire -- the same trick the
+protocol already uses for the seven colour flaps (`r o y g b p w`) and for the classic reel's
+double-quote flap (`q`) -- and translates at every edge, so **clients only ever see the symbol
+itself**.
+
+| Letter on the wire | Symbol | Name | Stand-in | Also accepted |
+|---|---|---|---|---|
+| `h` | ♥ | heart | `*` | ❤ |
+| `u` | ↑ | up | `^` | ⬆ |
+| `d` | ↓ | down | `V` | ⬇ |
+| `s` | ☺ | smiley | `:` | 🙂 😊 😀 |
+| `l` | ← | left | `<` | ⬅ |
+| `t` | → | right | `>` | ➡ |
+
+**Update the gateway before you configure a reel with symbols.** An older gateway stores the
+letters but reports them as plain lowercase letters, which is how `h` ends up looking like a
+stray consonant in a character set.
+
+### Added
+
+- **Send and receive the symbols.** `POST /api/flap/char`, `/api/flap/text`,
+  `/api/display/cells`, the MQTT display topics and the Home Assistant Text entity all accept
+  ♥ ↑ ↓ ☺ ← →, their emoji forms, and a trailing variation selector (`❤️` is one flap).
+- **Printed where it is printed, nowhere else.** Each character is resolved against the reel of
+  the module it lands on: the symbol's flap if that reel carries it, otherwise a stand-in that
+  reel does have (♥→`*`, ☺→`:`, ↓→`V`) or a blank. One glyph is still one module, so text never
+  shifts around a module that cannot show a heart. `/api/display/cells`, whose contract is
+  lenient rather than approximate, skips such a cell instead and counts it in `skipped`.
+- **Configure a reel with symbols.** Paste ♥ ↑ ↓ into the Flap Set editor, or use the new
+  palette of the six symbols and seven colours that inserts at the cursor. The dashboard shows a
+  stored reel's symbols as symbols and its colours as swatches, in the module dialog, the live
+  wall, the calibration grid and the wizard; the bus monitor annotates a frame as `m5-h (♥)`.
+- **`/api/capabilities` says what the wall is printed with.** `charset.union` and `common`
+  report the symbols themselves (never the letters), the new **`pictographs`** names the ones
+  some reel carries (`["heart","up","down"]`), and the new **`spelling`** gives the byte to send
+  on the raw frame paths for every character whose wire byte differs from the character. The
+  `symbols` feature token means all three are present. API version is now **3.2.0**.
+- **Reports what the flap shows.** `/api/display/state`, `/api/flap/modules` and the MQTT
+  display string report a symbol as its symbol and the double-quote flap as `"`. `sets[].chars`
+  stays raw, because addressing a flap by INDEX works against the bytes the module stores.
+
+### Changed
+
+- **`chars` in the `/api/flap/text` reply counts modules written, not bytes of UTF-8.** `"A♥B"`
+  answered 5 before this release; it answers 3.
+- **A broadcast of something reel-dependent is expanded per module.** `m*-♥` cannot be one frame
+  when the reels differ -- one frame carries one byte -- so the gateway sends a single broadcast
+  only when every reel is known and they all agree, and a frame each otherwise. Everything that
+  does not depend on the reel still broadcasts exactly as before.
+- **157 dashboard strings became translatable.** The string extractor only collected literals in
+  a `.textContent`/`placeholder`/`confirm`/`alert` context, so strings hand-wrapped in `t()`
+  inside built HTML -- a title, a label spliced into a row -- never reached the catalog and
+  silently stayed English in every language. The catalog is 640 keys now, up from 479. The new
+  symbol strings are translated in all 12 languages.
+
+### Fixed
+
+- **A reel printed with a real `"` could not show it.** The gateway always sent `q`, the byte
+  the classic reel borrows for that flap, so a module whose reel prints `"` directly hunted for
+  a flap it does not have and re-homed. It now sends whichever byte that module's reel actually
+  carries.
+- **Quiet Time gave back `Q` instead of `"`.** The replay pushed the captured wire bytes through
+  the resolver a second time, so the double-quote flap came back as a letter Q -- and a heart
+  would have come back as an H. Captured bytes are replayed verbatim now.
+- **The Module Firmware card read "-" until you switched tabs** and came back (4.0.0 respin).
+
+### Measured on the wall
+
+Fifteen modules, one of them given a reel with ♥ ↑ ↓ in place of three punctuation flaps:
+
+| Check | Result |
+|---|---|
+| `A♥B` across modules 0-2 | `m0-A`, `m1-*`, `m2-B` -- the stand-in, and nothing shifted |
+| ♥ to the module that has it | `m14-h` |
+| `❤️` (emoji + variation selector) | `m14-h` -- one flap |
+| A typed `h` | `m14-H` |
+| `"` on a reel that borrows `q` | `m14-q` |
+| Cells ♥ to one module with it and one without | `sent 1, skipped 1` |
+| Broadcast ♥ with mixed reels | fourteen `m<id>-*` and one `m14-h` |
+| Broadcast `A` | one `m*-A`, as before |
+| Quiet Time off | `m13-q` and `m14-h` replayed verbatim |
+| Capabilities | `pictographs ["heart","up","down"]`, ♥ in `union` and not in `common`, no letters in either |
+
+Also: 71 host assertions in `tools/symbol_test.cpp` and 14 more in `tools/capset_test.cpp`,
+compiling the firmware's own table and set arithmetic rather than a copy of either.
+
 ## v4.0.0 — 2026-10-20
 
 **A major version, because the gateway now does something it never could: update the modules

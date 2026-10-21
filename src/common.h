@@ -73,6 +73,8 @@
 #include <ArduinoOTA.h>
 #include <Update.h>
 #include <FFat.h>
+
+#include "flapsym.h"   // the colour/symbol flap codes and the reel resolution rules
 #include <ESPmDNS.h>
 #include <esp_mac.h>
 
@@ -130,14 +132,14 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "4.0.0"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "4.1.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
 // differences that matter (a fixed reel per module vs one shared reel; colours as flaps vs
 // colours as names) are exactly what capabilities describes.
 #define PRODUCT_NAME         "Split-Flap Gateway"
-#define API_VERSION          "3.1.0"
+#define API_VERSION          "3.2.0"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -279,11 +281,15 @@ extern char gResetReason[12];   // why the board last rebooted, for /api/status
 // "assumed" rather than folding the guess in silently.
 //
 // 'q' is not the letter q. The classic reel has no lowercase, so the char map borrowed that byte
-// for the DOUBLE-QUOTE flap -- and r/o/y/g/b/p/w are the seven COLOUR flaps, not letters. Both
-// are protocol, not repertoire, which is why capabilities reports '"' and a colour list rather
-// than 'q' and seven stray consonants.
+// for the DOUBLE-QUOTE flap -- and r/o/y/g/b/p/w are the seven COLOUR flaps, not letters. The six
+// SYMBOL flaps (h u d s l t -- heart, the arrows, a smiley) work the same way: a printed symbol
+// has no Windows-1252 byte, so it is carried as a reserved lowercase letter too. All three are
+// protocol, not repertoire, which is why capabilities reports '"', a colour list and the symbols
+// themselves rather than 'q' and thirteen stray consonants.
+//
+// The table, the resolution rules and the colour/symbol code defines live in flapsym.h -- kept
+// Arduino-free so the native tests compile the firmware's own table rather than a copy of it.
 #define FLAPSET_DEFAULT " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw"
-#define FLAP_COLOUR_CODES  "roygbpw"
 #define MODULES_FILE     "/modules.dat"
 #define MODULES_MAGIC    0x53464733UL   // "SFG3" (bumped: PersistedModule gained the flap set)
 

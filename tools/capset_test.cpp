@@ -2,7 +2,10 @@
 //
 // Compiles the FIRMWARE'S OWN capset.h, not a copy of it:
 //
-//   g++ -std=c++17 -I src -o /tmp/capset_test tools/capset_test.cpp && /tmp/capset_test
+//   g++ -std=c++17 -I src -o /tmp/capset_test tools/capset_test.cpp src/charset.cpp && /tmp/capset_test
+//
+// (charset.cpp comes along because the sets are RENDERED the way the endpoint renders them: a
+// symbol flap's letter leaves as its symbol. tools/symbol_test.cpp covers the rest of that.)
 //
 // This logic cannot be exercised on real hardware without physically rebuilding the wall out of
 // modules with different reels, which is precisely the case most likely to be wrong.
@@ -31,6 +34,14 @@ static void eq(const bool* map, const char* want, const char* what) {
   bool same = strcmp(got, want) == 0;
   printf("  %s  %s\n", same ? "PASS" : "FAIL", what);
   if (!same) { printf("         want '%s'\n         got  '%s'\n", want, got); failures++; }
+}
+
+// Render a byte map the way the ENDPOINT streams it: what a client actually sees, so a symbol
+// flap's letter comes out as its symbol and the double-quote flap as '"'.
+static void mapToDisplay(const bool* m, char* out) {
+  int n = 0;
+  for (int b = 0x20; b < 256; b++) if (m[b]) n += (int)flapShownToUtf8((uint8_t)b, out + n);
+  out[n] = 0;
 }
 
 static void ranges(const uint8_t* ids, int n, const char* want, const char* what) {
@@ -100,6 +111,66 @@ int main() {
     capFoldReel("",    uni, com, false);
     eq(uni, " AB", "union keeps what the other module has");
     eq(com, "",    "common is empty");
+  }
+
+  printf("\nsymbol flaps: a wall where only some reels carry them\n");
+  {
+    // Module 5 reprinted with a heart and two arrows in place of three punctuation flaps; every
+    // other module classic. This is the case the whole feature exists for, and the one that
+    // cannot be produced without physically reprinting a reel.
+    const char* SYMREEL = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789hud$&()-+=;q:%'.,/?*roygbpw";
+    bool uni[256] = {false}, com[256] = {false};
+    capFoldReel(SYMREEL, uni, com, true);
+    capFoldReel(CLASSIC, uni, com, false);
+
+    char u[600], c[600];
+    mapToDisplay(uni, u);
+    mapToDisplay(com, c);
+    ok(strstr(u, "\u2665") && strstr(u, "\u2191") && strstr(u, "\u2193"),
+       "the union reports the symbols THEMSELVES");
+    ok(!strchr(u, 'h') && !strchr(u, 'u') && !strchr(u, 'd'),
+       "...and never their wire letters");
+    ok(!strstr(c, "\u2665"), "a symbol only ONE reel has is not 'common'");
+    ok(strstr(c, "A") && strstr(c, "Z"), "...while the letters every reel has still are");
+    ok(strstr(u, "!") && !strstr(c, "!"),
+       "the punctuation those flaps replaced went the other way: union yes, common no");
+
+    int idx[FLAP_SYM_COUNT];
+    int np = capPictographs(uni, idx, FLAP_SYM_COUNT);
+    ok(np == 3, "three pictographs on this wall");
+    ok(np == 3 && strcmp(FLAP_SYMBOLS[idx[0]].name, "heart") == 0 &&
+                  strcmp(FLAP_SYMBOLS[idx[1]].name, "up")    == 0 &&
+                  strcmp(FLAP_SYMBOLS[idx[2]].name, "down")  == 0,
+       "named in table order: heart, up, down");
+
+    // A wall with no symbols anywhere names none.
+    bool u2[256] = {false}, c2[256] = {false};
+    capFoldReel(CLASSIC, u2, c2, true);
+    ok(capPictographs(u2, idx, FLAP_SYM_COUNT) == 0, "a classic wall lists no pictographs");
+  }
+
+  printf("\nsymbol flaps: a wall where EVERY reel carries them\n");
+  {
+    const char* SYMREEL = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789hud$&()-+=;q:%'.,/?*roygbpw";
+    bool uni[256] = {false}, com[256] = {false};
+    for (int i = 0; i < 12; i++) capFoldReel(SYMREEL, uni, com, i == 0);
+    char c[600];
+    mapToDisplay(com, c);
+    ok(strstr(c, "\u2665") && strstr(c, "\u2191") && strstr(c, "\u2193"),
+       "a symbol EVERY reel has is common -- a client can put a heart anywhere");
+    ok(!strchr(c, 'h'), "still no letters in the common set");
+  }
+
+  printf("\nthe '\"' spelling entry\n");
+  {
+    ok(capQuoteSpelling(true, false),
+       "reels borrow 'q' for it and none prints '\"': clients are told to send 'q'");
+    ok(!capQuoteSpelling(true, true),
+       "reels DISAGREE: no entry, because there is no single answer for the wall");
+    ok(!capQuoteSpelling(false, true),
+       "every reel prints '\"' itself: no entry, the byte is the character");
+    ok(!capQuoteSpelling(false, false),
+       "no reel has the flap at all: no entry");
   }
 
   printf("\nrange compression\n");

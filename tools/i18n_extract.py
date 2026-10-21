@@ -179,6 +179,18 @@ def collect(page):
                 nodes |= text_nodes(lab)              # one label wraps its text in a <span>
             elif is_key(lab):
                 nodes.add(lab.strip())
+        # (c) a literal already inside t("...") is user-facing BY CONSTRUCTION, wherever it
+        #     sits. The context rules below only see .textContent/placeholder/confirm/alert,
+        #     so a string wrapped by hand inside a concatenation -- a title= on a palette
+        #     button, a label spliced into built HTML -- never reached the catalog and was
+        #     silently untranslatable in every language. Nothing to wrap: it already is.
+        for m in re.finditer(r'\bt\(\s*(["\'])(.*?)\1\s*\)', sc):
+            if is_protocol_label(m.group(2)):
+                continue
+            lit = js_unescape(m.group(2)).strip()
+            if is_key(lit):
+                nodes.add(lit)
+
         # (b) literals in a user-facing context -> must be wrapped in t()
         for m in UI_CTX.finditer(sc):
             expr = next(g for g in m.groups() if g is not None)

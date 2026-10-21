@@ -468,3 +468,45 @@ symptom was easy to misread as the well-known "receive buffers pile up" story, w
 release notes had blamed for two versions. The header now goes on the response, once. Rule
 for every chunked callback (upload or raw): no `sendHeader()`, no allocation that outlives
 the chunk. A full image now uploads in ~10 s with ~80 KB of heap free throughout.
+
+## Symbol flaps: a heart is not a letter (v4.1)
+
+Some reels are printed with symbols -- a heart, arrows, a smiley -- and the wire has no way to
+say so. A module carries exactly one byte per flap and is addressed BY that byte, and those
+symbols have no Windows-1252 code. The protocol already had this problem twice and solved it
+the same way both times: the seven colour flaps travel as `r o y g b p w`, and the classic
+reel's double-quote flap travels as `q`. So each symbol gets a reserved lowercase letter too.
+
+| Letter | Symbol | Name | Stand-in | Also accepted |
+|---|---|---|---|---|
+| `h` | ♥ | heart | `*` | ❤ |
+| `u` | ↑ | up | `^` | ⬆ |
+| `d` | ↓ | down | `V` | ⬇ |
+| `s` | ☺ | smiley | `:` | 🙂 😊 😀 |
+| `l` | ← | left | `<` | ⬅ |
+| `t` | → | right | `>` | ➡ |
+
+Three rules keep the letters from leaking, and all three live in [`src/flapsym.h`](src/flapsym.h)
+so the firmware and the native tests compile the same table:
+
+1. **A typed letter is never a symbol.** `h` still folds to `H` on every text path. Every
+   existing client sends lowercase text and relies on that, so the alternative was silently
+   turning someone's "hello" into "♥ELLO" -- which is exactly what would happen on the Matrix
+   Gateway if its one-byte path ever adopted these letters. It must not.
+2. **A symbol exists only where it is printed.** `utf8ToFlap()` decodes ♥ to an internal code
+   (0x01-0x06, which `isFlapByte()` rejects), and the code is resolved against the reel of the
+   module it is going to: the letter if that reel carries it, the stand-in if it carries that,
+   otherwise a blank. One glyph is still one module, so text never shifts around a symbol a
+   module cannot show. `rs485Send()` refuses a frame carrying an unresolved code outright.
+3. **The letters never leave the gateway as letters.** `charset.union`/`common` report the
+   symbols, `pictographs` names them, `spelling` gives the byte for each, and
+   `/api/display/state` and `/api/flap/modules` report what the flap SHOWS. Only `sets[].chars`
+   stays raw, because flap-INDEX addressing works against the bytes the module stores.
+
+A broadcast is the interesting case: `m*-♥` cannot be one frame when the reels differ, because
+one frame can only carry one byte. `sfSendChar()` resolves the request for every provisioned
+module first and sends a single broadcast only when every reel is known and they all agree --
+otherwise a frame each, which is what a wall of mixed reels needs anyway.
+
+Module firmware needs no change: a v31+ module stores and reports whatever bytes its flap set
+holds, and `m<id>-<byte>` has always accepted any byte.

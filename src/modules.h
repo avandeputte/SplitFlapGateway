@@ -321,8 +321,20 @@ void sfModulesPruneStale();
 void sfTrackChar(int addr, char c);
 void sfSendChar(int addr, char c);
 // The wire byte for a CP1252 byte (uppercase fold except colour codes; '"' -> 'q'), or 0 if it
-// is not a displayable flap glyph. Shared by sfSendChar and POST /api/display/cells.
+// is not a displayable flap glyph. Reel-independent: the fallback for a module the gateway has
+// no reel for. Prefer sfResolveFor() on any path that knows which module it is addressing.
 uint8_t sfResolveFlapByte(uint8_t b);
+// Copy module `id`'s flap set into `out` (SF_MAX_FLAPS+1 bytes). True if the gateway knows it
+// (reported, or assumed for a pre-v31 module); false leaves `out` empty. Takes sfMutex itself,
+// so never call it while holding that mutex.
+bool sfReelOf(int id, char* out);
+// The wire byte for one requested byte ON THAT MODULE: a symbol code (flapsym.h) becomes the
+// reel's letter, its stand-in or a blank; '"' reaches the reel's double-quote flap whichever
+// byte it is printed as; everything else is sfResolveFlapByte(). 0 = nothing showable.
+uint8_t sfResolveFor(int id, uint8_t b);
+// Send one ALREADY-RESOLVED wire byte (no folding, no reel lookup). For replaying a captured
+// frame, and for callers that resolved the byte themselves against a snapshot of the reels.
+void sfSendCharRaw(int addr, uint8_t b);
 void sfSendIndex(int addr, int idx);
 void sfHomeOffset(int addr, int steps);
 void sfSetTotalSteps(int addr, int steps);

@@ -33,6 +33,14 @@
 // `out` is always NUL-terminated. Returns the number of bytes written. If
 // `allMapped` is non-NULL it is set false when any input code point was dropped
 // (unrepresentable, invalid, or buffer full).
+//
+// The SYMBOL flaps (flapsym.h) are the one exception to "one byte per glyph in
+// Windows-1252": a heart has no CP1252 byte, so it decodes to an INTERNAL code
+// (0x01-0x06) that the caller must resolve against a module's reel -- or convert
+// to its wire letter, for a reel being configured. Internal codes are still one
+// byte per glyph, so lengths and module counts are unaffected, and isFlapByte()
+// rejects them so an unresolved one can never be mistaken for a flap. A
+// variation selector (U+FE0E/U+FE0F) right after a symbol is swallowed with it.
 size_t utf8ToFlap(const char* in, char* out, size_t outSize, bool* allMapped = nullptr);
 
 // True if `b` is a byte the flap protocol may carry: a printable glyph in the
@@ -45,6 +53,20 @@ bool isFlapByte(uint8_t b);
 // NUL-terminated); returns the number of bytes written. `out` must have room for
 // at least 3 bytes.
 size_t flapByteToUtf8(uint8_t b, char* out);
+
+// What a flap byte SHOWS, as UTF-8 (1-3 bytes, NOT NUL-terminated): the symbol
+// for a symbol letter, '"' for the double-quote flap's 'q', and otherwise
+// exactly what flapByteToUtf8() gives. This is for reporting what a module is
+// displaying -- /api/display/state, /api/flap/modules, the MQTT display string.
+// Everything that reports a REEL (sets[].chars, dumps, the bus monitor) must
+// keep using flapByteToUtf8(): a reel is stored and addressed as the raw bytes.
+// Colour codes stay letters here, as on the Matrix Gateway. `out` needs 4 bytes.
+size_t flapShownToUtf8(uint8_t b, char* out);
+
+// flapShownToUtf8() with JSON escaping: '"' and '\\' come back backslash-escaped,
+// so the result can go straight inside a JSON string. NUL-terminated. `out`
+// needs 6 bytes. Returns the length written (excluding the NUL).
+size_t flapShownToJson(uint8_t b, char* out, size_t outSize);
 
 // Transcode `inLen` flap bytes into a JSON-string-safe UTF-8 sequence in `out`:
 //   * `"` and `\` are backslash-escaped

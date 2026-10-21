@@ -374,33 +374,81 @@ void sfTrackChar(int addr, char c) {
 // through verbatim -- uppercasing them would turn a colour request into a letter.
 // Bytes that aren't a valid flap glyph (controls, undefined slots, the 0x00/0xFF
 // firmware sentinels) are dropped.
-// Resolve a Windows-1252 byte to the flap byte that actually goes on the wire, or 0 if it is
-// not a displayable glyph. Two rules, and they are the reel's, not this function's:
-//   * ASCII lowercase folds to uppercase (the classic reel is printed in capitals) -- EXCEPT
-//     the seven colour codes r/o/y/g/b/p/w, which the protocol conveys as lowercase letters, so
-//     folding them would turn a colour request into a letter.
-//   * '"' maps to 'q', the reel's double-quote alias (the reel has no lowercase, so it borrowed
-//     that byte). GET /api/capabilities advertises the flap as '"', so a caller asking for '"'
-//     must reach it; without the map a '"' went out as byte 0x22, which no reel contains.
-// Shared by sfSendChar and POST /api/display/cells so the two can never disagree about what a
-// byte means (the audit's q-vs-'"' finding was exactly such a disagreement).
+// Resolve a requested byte to the one that actually goes on the wire, or 0 if it is not a
+// displayable glyph. The rules live in flapsym.h (flapResolveFor), because the native tests
+// compile them too; this is the REEL-INDEPENDENT entry point -- what a module whose flap set the
+// gateway does not know gets. It folds lowercase to uppercase except the colour codes, and sends
+// '"' as 'q', the byte the classic char map borrowed for the double-quote flap.
+//
+// Prefer sfResolveFor(id, b) wherever the module is known: a symbol flap and a reel that prints
+// '"' itself can only be resolved against that module's own reel.
 uint8_t sfResolveFlapByte(uint8_t b) {
-  if (b >= 'a' && b <= 'z' && !strchr("roygbpw", (char)b)) b = (uint8_t)(b - 'a' + 'A');
-  if (b == '"') b = 'q';                                     // after the fold, or 'q'->'Q' undoes it
-  return isFlapByte(b) ? b : 0;
+  return flapResolveFor(b, NULL);                            // NULL reel = "not known"
 }
 
-void sfSendChar(int addr, char c) {
-  uint8_t b = sfResolveFlapByte((uint8_t)c);
-  if (!b) return;                                            // not a valid flap glyph
+// One module's reel, copied out under the lock. False (and an empty `out`) when the gateway has
+// no reel for it: a v31+ module that has not answered yet, or an id with no module behind it.
+bool sfReelOf(int id, char* out) {
+  out[0] = 0;
+  if (id < 0) return false;
+  bool known = false;
+  if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    SFModule* m = sfFindById((uint8_t)id);
+    if (m) known = (sfFlapSetOf(*m, out) != FLAPSET_UNKNOWN);
+    xSemaphoreGive(sfMutex);
+  }
+  if (!known) out[0] = 0;
+  return known;
+}
+
+uint8_t sfResolveFor(int id, uint8_t b) {
+  char reel[SF_MAX_FLAPS + 1];
+  sfReelOf(id, reel);                                        // empty when unknown: the fallback
+  return flapResolveFor(b, reel);
+}
+
+void sfSendCharRaw(int addr, uint8_t b) {
+  if (!b || !isFlapByte(b)) return;                          // never put a control byte on the bus
   char buf[24];
-  if (addr < 0)
-    snprintf(buf, sizeof(buf), "m*-%c\n", b);
-  else
-    snprintf(buf, sizeof(buf), "m%d-%c\n", addr, b);
+  if (addr < 0) snprintf(buf, sizeof(buf), "m*-%c\n", b);
+  else          snprintf(buf, sizeof(buf), "m%d-%c\n", addr, b);
   rs485SendStr(buf);
   // Display tracking is handled centrally in rs485Send via sfTrackFromFrame,
   // so every path (including raw frame sends) is covered uniformly.
+}
+
+void sfSendChar(int addr, char c) {
+  uint8_t in = (uint8_t)c;
+  if (addr >= 0) { sfSendCharRaw(addr, sfResolveFor(addr, in)); return; }
+
+  // A BROADCAST of something that resolves per module cannot simply go out as one frame: a
+  // heart is a 'h' on the reels that carry one and a '*' or a blank on the rest, and one frame
+  // can only say one of those. So resolve it for every provisioned module first; one frame only
+  // when every reel is known and they all agree, and otherwise a frame each. Everything that
+  // does NOT depend on the reel (which is almost everything) still broadcasts as before.
+  static uint8_t ids[MAX_MODULES], outB[MAX_MODULES];        // static: not on the caller's stack
+  int    n = 0;
+  bool   allKnown = true, allSame = true;
+  uint8_t firstB = 0;
+  if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    char reel[SF_MAX_FLAPS + 1];
+    for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {
+      SFModule& m = sfModules[i];
+      if (!m.provisioned) continue;
+      bool known = (sfFlapSetOf(m, reel) != FLAPSET_UNKNOWN);
+      if (!known) { allKnown = false; reel[0] = 0; }
+      ids[n]  = m.id;
+      outB[n] = flapResolveFor(in, reel);
+      if (n == 0) firstB = outB[0];
+      else if (outB[n] != firstB) allSame = false;
+      n++;
+    }
+    xSemaphoreGive(sfMutex);
+  }
+  // Nothing provisioned, or one answer for the whole wall: the single frame it has always been.
+  if (n == 0)                 { sfSendCharRaw(-1, flapResolveFor(in, NULL)); return; }
+  if (allKnown && allSame)    { sfSendCharRaw(-1, firstB);                   return; }
+  for (int i = 0; i < n; i++) sfSendCharRaw(ids[i], outB[i]);
 }
 
 // Display by flap index.  addr=-1 = broadcast.
@@ -1056,10 +1104,17 @@ size_t sfBuildRestoreFrame(const char* sn, int homeOffset, int totalSteps, const
 // `charSet` is UTF-8 (as received over JSON); it is converted to the single-byte flap
 // encoding (Windows-1252) the bus protocol and module firmware use -- so euro signs and
 // accented letters each become one flap byte (see charset.h).
+//
+// A reel may also be printed with the SYMBOL flaps, which have no Windows-1252 byte. Those
+// decode to internal codes, and a reel STORES them as their wire letters: that is what the
+// module keeps in EEPROM, reports in its 'A' dump and is addressed by. A typed 'h' is still a
+// typed 'h' -- only ♥ (or one of its aliases) becomes the heart flap. Length counts FLAPS, and
+// a symbol is one of them however many UTF-8 bytes it arrived as.
 const char* sfValidateCharSet(const char* charSet, char* out, size_t outLen) {
   char tmp[SF_MAX_FLAPS * 4 + 4];          // hold the transcode before length-check
   bool allMapped = true;
   size_t n = utf8ToFlap(charSet, tmp, sizeof(tmp), &allMapped);
+  flapSymToLetters(tmp);                   // symbols are stored as the letters the wire uses
   if (!allMapped)        return "charSet has characters not in Windows-1252";
   if (n == 0)            return "charSet has no displayable characters";
   if (n > SF_MAX_FLAPS)  return "charSet too long (max 64 characters)";
@@ -1313,14 +1368,36 @@ static void sfSetAutoHome(int addr, bool enable) {
 void sfSendText(int startAddr, const char* text, bool blankUnused) {
   // `text` arrives as UTF-8 (from the web UI / MQTT / JSON). Transcode it to the
   // single-byte flap encoding (Windows-1252) first, so one displayed glyph --
-  // including a euro sign or an accented letter, which are multi-byte in UTF-8 --
-  // maps to exactly one flap module. Unrepresentable code points are dropped.
+  // including a euro sign, an accented letter or a symbol flap, all of which are
+  // multi-byte in UTF-8 -- maps to exactly one flap module. Unrepresentable code
+  // points are dropped.
   char enc[SF_MAX_FLAPS * 4 + 1];
   size_t len = utf8ToFlap(text, enc, sizeof(enc));
+
+  // Resolve the WHOLE line against the reels in ONE pass under the lock, then send with the
+  // lock released. A symbol resolves differently per module (its letter, a stand-in, a blank),
+  // so each character has to be measured against the module it is going to -- but taking the
+  // mutex per character would hold it across the inter-frame gaps below, where rs485Send must
+  // never be called with it held.
+  static uint8_t wire[SF_MAX_FLAPS * 4 + 1];                 // static: keeps it off this stack
+  if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    char reel[SF_MAX_FLAPS + 1];
+    for (size_t i = 0; i < len; i++) {
+      int       id = startAddr + (int)i;
+      SFModule* m  = (id >= 0 && id <= 254) ? sfFindById((uint8_t)id) : NULL;
+      bool known = (m && sfFlapSetOf(*m, reel) != FLAPSET_UNKNOWN);
+      if (!known) reel[0] = 0;
+      wire[i] = flapResolveFor((uint8_t)enc[i], reel);
+    }
+    xSemaphoreGive(sfMutex);
+  } else {
+    for (size_t i = 0; i < len; i++) wire[i] = flapResolveFor((uint8_t)enc[i], NULL);
+  }
+
   for (size_t i = 0; i < len; i++) {
-    // sfSendChar uppercases ASCII and rejects non-printable bytes itself; the
-    // module firmware maps the character byte to a flap index.
-    sfSendChar((int)(startAddr + i), enc[i]);
+    // One character, one module: a symbol that this module cannot show still occupies its
+    // place (as a stand-in or a blank), so nothing shifts left around it.
+    sfSendCharRaw((int)(startAddr + i), wire[i]);
     delay(10); // inter-message gap to avoid bus collision
   }
   // Optionally blank any previously-set modules beyond the text length
@@ -1390,7 +1467,11 @@ void sfSetQuietTime(bool on) {
       xSemaphoreGive(sfMutex);
     }
     for (int i = 0; i < n; i++) {
-      if (list[i].ch) sfSendChar(list[i].id, list[i].ch);
+      // The captured bytes are what went to the WIRE -- already resolved against each module's
+      // reel when they were first sent. Replay them verbatim: pushing them through sfSendChar
+      // again would fold them a second time, and a double-quote flap ('q') or a heart ('h')
+      // would come back from Quiet Time as a letter Q or H.
+      if (list[i].ch) sfSendCharRaw(list[i].id, (uint8_t)list[i].ch);
       else if (list[i].idx >= 0) sfSendIndex(list[i].id, list[i].idx);
     }
     if (n) printf("[QUIET] off -- resynced %d module(s) to last requested display\n", n);

@@ -18,14 +18,18 @@
 //            small -- 45 modules with one reel between them are one entry, not 45 copies of the
 //            same 64 characters.
 //
-// TWO TRANSLATIONS, because the wire is not the repertoire:
+// THREE TRANSLATIONS, because the wire is not the repertoire:
 //   * r o y g b p w are the seven COLOUR flaps, not letters. Kept out of the character sets and
 //     reported by name instead -- a client that read them as letters would believe a classic
 //     reel can show a lowercase w.
 //   * 'q' is not the letter q. The classic reel has no lowercase, so the char map borrowed that
 //     byte for the DOUBLE-QUOTE flap. It folds to '"', which is what the flap actually shows.
-// Both are exactly what sfSendChar() does when it resolves a frame, so what capabilities
-// promises is what the wall will do.
+//   * h u d s l t are the six SYMBOL flaps (flapsym.h): a reel that carries one is printed with
+//     a heart, an arrow or a smiley, and that is what the character sets report. The letters
+//     stay in the byte maps here -- they are what the reel holds -- and are rendered as their
+//     symbols on the way out, so the set arithmetic never has to know about UTF-8.
+// All three are exactly what the resolver does when it turns a request into a frame, so what
+// capabilities promises is what the wall will do.
 #ifndef SFGW_CAPSET_H
 #define SFGW_CAPSET_H
 
@@ -33,9 +37,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifndef FLAP_COLOUR_CODES
-#define FLAP_COLOUR_CODES "roygbpw"
-#endif
+#include "flapsym.h"     // the colour and symbol codes, and what each symbol is called
 
 // Fold one module's reel into the running union/common maps. A reel is a set of BYTES, so a
 // 256-entry map is the whole of it: no sorting, no dedupe, no allocation.
@@ -57,6 +59,23 @@ static inline void capFoldReel(const char* reel, bool* uni, bool* com, bool firs
     if (first)        com[b] = here[b];
     else if (!here[b]) com[b] = false;                  // common = intersection
   }
+}
+
+// The symbols SOME reel carries, in table order, as indexes into FLAP_SYMBOLS. That is the
+// union -- `pictographs` answers "is there a heart anywhere on this wall", the way `colors`
+// does for the colour flaps. Returns how many were written.
+static inline int capPictographs(const bool* uni, int* idxOut, int maxN) {
+  int n = 0;
+  for (int i = 0; i < FLAP_SYM_COUNT && n < maxN; i++)
+    if (uni[(uint8_t)FLAP_SYMBOLS[i].code]) idxOut[n++] = i;
+  return n;
+}
+
+// Should `spelling` carry the '"' -> 'q' entry? Only when some known reel holds the borrowed
+// byte and none prints '"' itself. When reels disagree there is no single answer for the wall,
+// so the entry is left out and a client that cares reads sets[].chars per module.
+static inline bool capQuoteSpelling(bool anyBorrowedQ, bool anyPrintedQuote) {
+  return anyBorrowedQ && !anyPrintedQuote;
 }
 
 // Compress a SORTED-ASCENDING id list into "0-44,50". Returns the length written. A run of one

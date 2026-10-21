@@ -524,6 +524,16 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
   }
   if (!bare) return;
 
+  // An internal symbol code (flapsym.h) is an artefact of decoding ♥ from UTF-8, not a flap.
+  // Every display path either resolves it against a module's reel or converts it to its wire
+  // letter; one that escaped would ask a module for flap 0x01, which it would answer by
+  // hunting. Refuse the frame here -- the single door every send path goes through -- so a bug
+  // upstream stops at the gateway instead of on the wall.
+  if (flapFrameShowsInternal(data, bare)) {
+    DBG("[TX] refused: unresolved symbol code in a show frame\n");
+    return;
+  }
+
   // Quiet Time: swallow normal display-motion frames so the flaps stay still.
   // The request is acknowledged (we return as if sent) and the desired display
   // is remembered for resync; nothing reaches the bus and tracking is unchanged.

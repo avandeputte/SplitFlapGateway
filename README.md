@@ -56,6 +56,11 @@ to do when a web update fails, is in
 - **RS-485** — the module wire protocol, documented in
   [Bus Protocol](https://splitflap.iothing.net/docs/Bus-Protocol/).
 
+Reels printed with **symbol flaps** (♥ ↑ ↓ ☺ ← →) are supported end to end from v4.1: clients
+send and receive the symbols, the gateway carries them on the wire as the reserved letters
+`h u d s l t`, and a module without the symbol printed on it shows a stand-in instead. See
+[ARCHITECTURE.md](ARCHITECTURE.md#symbol-flaps-a-heart-is-not-a-letter-v41).
+
 ## In this repository
 
 | | |

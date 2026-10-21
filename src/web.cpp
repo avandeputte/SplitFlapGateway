@@ -400,9 +400,12 @@ static void handleApiModules() {
     xSemaphoreGive(sfMutex);
     if (!valid) continue;   // list shrank (prune/deprovision) mid-iteration
 
-    // Tracked flap char is one Windows-1252 byte; emit it as JSON-safe UTF-8.
-    char flapBuf[6] = {0};
-    if (m.flapChar) flapToJsonUtf8(&m.flapChar, 1, flapBuf, sizeof(flapBuf));
+    // Tracked flap char is one wire byte; report what it SHOWS, as JSON-safe UTF-8 -- the
+    // symbol for a symbol letter, '"' for the double-quote flap. (A reel is reported raw
+    // elsewhere; this field is the glyph on the front of the module.)
+    char flapBuf[8] = {0};
+    if (m.flapChar && isFlapByte((uint8_t)m.flapChar))
+      flapShownToJson((uint8_t)m.flapChar, flapBuf, sizeof(flapBuf));
     char obj[288];
     int on = snprintf(obj, sizeof(obj),
       "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"acked\":%s,\"flapIndex\":%d,"
@@ -481,8 +484,9 @@ static void handleApiDisplayState() {
     if (c == 0)       cn = snprintf(cellBuf, sizeof(cellBuf), "%snull", i ? "," : "");
     else if (c == 1)  cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"?\"", i ? "," : "");
     else {
-      // Windows-1252 byte -> JSON-safe UTF-8 (handles euro/accented glyphs).
-      char u[6]; flapToJsonUtf8(&c, 1, u, sizeof(u));
+      // The wire byte -> the glyph the module is showing, as JSON-safe UTF-8 (handles
+      // euro/accented glyphs, the symbol flaps and the double-quote flap).
+      char u[8]; flapShownToJson((uint8_t)c, u, sizeof(u));
       cn = snprintf(cellBuf, sizeof(cellBuf), "%s\"%s\"", i ? "," : "", u);
     }
     if (cn < 0) cn = 0;
@@ -546,8 +550,13 @@ static void handleApiText() {
   int start = doc["start"] | 0;
   if (!text[0]) { sendJsonError(400, "Empty text"); return; }
   sfSendText(start, text, false);
+  // `chars` is MODULES written, not bytes of UTF-8: a euro sign, an accented letter and a
+  // symbol flap are each one flap however many bytes they arrived as. (It counted bytes until
+  // 4.1 -- "A♥B" answered 5.)
+  char enc[SF_MAX_FLAPS * 4 + 1];
+  size_t written = utf8ToFlap(text, enc, sizeof(enc));
   char resp[64];
-  snprintf(resp, sizeof(resp), "{\"ok\":true,\"chars\":%zu}", strlen(text));
+  snprintf(resp, sizeof(resp), "{\"ok\":true,\"chars\":%zu}", written);
   server.send(200, "application/json", resp);
 }
 
@@ -1014,18 +1023,15 @@ static void capPut(const char* str) {
   capLen += n;
 }
 
-// A byte map as a JSON string body, in reel order (ASCII, then the high bytes).
+// A byte map as a JSON string body, in reel order (ASCII, then the high bytes). Bytes go in as
+// the wire holds them and come out as what a client SEES: a symbol letter becomes its symbol,
+// so `h` never leaves this gateway looking like a lowercase h. (capFoldReel has already turned
+// the double-quote flap's 'q' into '"', which flapShownToJson escapes for the JSON string.)
 static void capPutMap(const bool* map) {
   for (int b = 0x20; b < 256; b++) {
     if (!map[b]) continue;
     char one[12];
-    if (b == '"' || b == '\\') { one[0] = '\\'; one[1] = (char)b; one[2] = 0; }
-    else {
-      char utf8[8] = "";
-      size_t n = flapByteToUtf8((uint8_t)b, utf8);
-      utf8[n] = 0;
-      snprintf(one, sizeof(one), "%s", utf8);
-    }
+    flapShownToJson((uint8_t)b, one, sizeof(one));
     capPut(one);
   }
 }
@@ -1100,6 +1106,41 @@ static void handleApiCapabilities() {
       firstC = false;
     } }
   capPut("],");
+
+  // The SYMBOL flaps some reel is printed with, by name -- `colors`' counterpart, and a union
+  // for the same reason: it answers "is there a heart anywhere on this wall". The names are the
+  // companion's own pictograph names, so a client already speaking to a Matrix wall knows them.
+  { int idx[FLAP_SYM_COUNT];
+    int np = capPictographs(uni, idx, FLAP_SYM_COUNT);
+    capPut("\"pictographs\":[");
+    for (int i = 0; i < np; i++) {
+      char one[26];
+      snprintf(one, sizeof(one), "%s\"%s\"", i ? "," : "", FLAP_SYMBOLS[idx[i]].name);
+      capPut(one);
+    }
+    capPut("],"); }
+
+  // `spelling` -- for every character whose byte on the WIRE differs from the character itself,
+  // the byte to send on the raw paths (/api/rs485/send, MQTT <prefix>/send). The six symbols are
+  // always listed: that is a contract a client can code against whatever this wall happens to be
+  // printed with. '"' joins them only when the wall's reels borrow 'q' for it and none prints
+  // '"' directly -- when reels disagree there is no single answer, so the entry is left out.
+  capPut("\"spelling\":{");
+  { for (int i = 0; i < FLAP_SYM_COUNT; i++) {
+      char sym[8] = ""; size_t sl = flapShownToUtf8((uint8_t)FLAP_SYMBOLS[i].code, sym); sym[sl] = 0;
+      char one[24];
+      snprintf(one, sizeof(one), "%s\"%s\":\"%c\"", i ? "," : "", sym, FLAP_SYMBOLS[i].code);
+      capPut(one);
+    }
+    bool anyBorrowedQ = false, anyPrintedQuote = false;
+    for (int i = 0; i < n; i++) {
+      if (src[i] == FLAPSET_UNKNOWN) continue;
+      if (strchr(reel[i], 'q'))  anyBorrowedQ    = true;
+      if (strchr(reel[i], '"'))  anyPrintedQuote = true;
+    }
+    if (capQuoteSpelling(anyBorrowedQ, anyPrintedQuote)) capPut(",\"\\\"\":\"q\"");
+  }
+  capPut("},");
 
   char mid[48];
   snprintf(mid, sizeof(mid), "\"charset\":{\"uniform\":%s,\"union\":\"", uniform ? "true" : "false");
@@ -1199,8 +1240,12 @@ static void handleApiCapabilities() {
 
   // What the wall can DO, not just show, so a client reads this instead of sniffing the
   // firmware version and guessing.
+  // "symbols" means: the symbol flaps are translated at every edge -- charset.union/common
+  // report the symbols themselves, `pictographs` names the ones this wall carries, and
+  // `spelling` gives the byte for each. NOT "pictographs": on the Matrix Gateway that token
+  // means all fourteen of them, and a client reads it that way.
   capPut("\"features\":[\"colors\",\"index\",\"batch\",\"quiet\",\"maintenance\","
-         "\"ha\",\"ota\",\"flapconfig\"]}");
+         "\"ha\",\"ota\",\"flapconfig\",\"symbols\"]}");
   capFlush();                 // the body -- everything above is still sitting in capBuf
   server.sendContent("");     // the terminating chunk
 }
@@ -1275,8 +1320,21 @@ static void handleApiDisplayCells() {
     } else if (c["ch"].is<const char*>()) {
       const char* ch = c["ch"].as<const char*>();
       char enc[8];
-      utf8ToFlap(ch ? ch : "", enc, sizeof(enc));            // UTF-8 -> CP1252 byte(s)
-      uint8_t b = enc[0] ? sfResolveFlapByte((uint8_t)enc[0]) : 0;
+      utf8ToFlap(ch ? ch : "", enc, sizeof(enc));            // UTF-8 -> CP1252 byte or symbol code
+      uint8_t in = (uint8_t)enc[0];
+      uint8_t b;
+      int si = flapSymFromInternal(in);
+      if (si >= 0) {
+        // A symbol flap. This endpoint's contract is lenient, not approximate: a module whose
+        // reel the gateway KNOWS and which has no heart printed on it is skipped, rather than
+        // shown the stand-in a text path would use. The caller asked for a heart.
+        char reel[SF_MAX_FLAPS + 1];
+        bool known = sfReelOf(id, reel);
+        if (known && !strchr(reel, FLAP_SYMBOLS[si].code)) { skipped++; continue; }
+        b = (uint8_t)FLAP_SYMBOLS[si].code;
+      } else {
+        b = in ? sfResolveFor(id, in) : 0;                   // per module: '"' needs its reel
+      }
       if (!b) { skipped++; continue; }                       // no showable glyph: lenient skip
       flen = snprintf(frame, sizeof(frame), "m%d-%c\n", id, b);
     } else {

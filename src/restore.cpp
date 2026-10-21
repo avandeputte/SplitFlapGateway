@@ -118,6 +118,7 @@ static bool restoreParseEntry(JsonObjectConst o, RestoreEntry& e) {
     char tmp[SF_MAX_FLAPS * 4 + 4];
     bool all = true;
     size_t n = utf8ToFlap(chars, tmp, sizeof(tmp), &all);
+    flapSymToLetters(tmp);        // a backed-up reel may carry symbols; it stores their letters
     if (all && n >= 1 && n <= SF_MAX_FLAPS) memcpy(e.flapBytes, tmp, n + 1);
   }
   // A flap set is only trusted when it is self-consistent: the character set must be

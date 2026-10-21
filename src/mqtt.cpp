@@ -120,8 +120,8 @@ void mqttPublishDisplayState() {
   int cells = (int)cfg.gridRows * (int)cfg.gridCols;
   if (cells < 1) cells = 1;
   if (cells > MAX_MODULES) cells = MAX_MODULES;
-  // Each cell is one glyph; a Windows-1252 high byte (euro/accent) expands to up
-  // to 3 UTF-8 bytes, so size the buffer for the worst case.
+  // Each cell is one glyph; a Windows-1252 high byte (euro/accent) or a symbol
+  // flap expands to up to 3 UTF-8 bytes, so size the buffer for the worst case.
   static char str[MAX_MODULES * 3 + 1];   // static: single-caller (taskNetwork)
   int outLen = 0;
   if (xSemaphoreTake(sfMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -131,7 +131,7 @@ void mqttPublishDisplayState() {
         SFModule* m = sfFindById((uint8_t)id);
         uc = (m && m->provisioned) ? (uint8_t)'?' : (uint8_t)' ';
       }
-      outLen += flapByteToUtf8(uc, str + outLen);       // ASCII -> 1 byte, high -> UTF-8
+      outLen += flapShownToUtf8(uc, str + outLen);      // what the module SHOWS: symbols, '"'
     }
     xSemaphoreGive(sfMutex);
   }
@@ -419,11 +419,11 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     bool hasChars = (charSet[0] != 0);
     if ((!hasCount && !hasChars) ||
         (hasCount && (flapCount < 1 || flapCount > SF_MAX_FLAPS))) return;
-    char enc[SF_MAX_FLAPS * 4 + 4];
+    char enc[SF_MAX_FLAPS + 1];
     if (hasChars) {
-      bool allMapped = true;
-      size_t n = utf8ToFlap(charSet, enc, sizeof(enc), &allMapped);
-      if (!allMapped || n == 0 || n > SF_MAX_FLAPS) return;   // unmappable / empty / too long
+      // The same validation the REST path uses, so a reel configured over MQTT is stored
+      // byte-for-byte the same -- symbol flaps included, which it stores as their wire letters.
+      if (sfValidateCharSet(charSet, enc, sizeof(enc))) return;   // unmappable / empty / too long
     }
     int   reqCount = hasCount ? flapCount : 0;
     const char* reqChars = hasChars ? enc : nullptr;

@@ -1,9 +1,10 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "3.5"
+  version: "3.2.0"
   description: |
-    REST API for the ESP32-S3 Split-Flap Gateway firmware (firmware v3.5).
+    REST API for the ESP32-S3 Split-Flap Gateway firmware. The version above is the
+    API version `GET /api/capabilities` reports as `api`; the firmware has its own.
 
     **Base URL:** `http://<gateway-ip>` — replace with the gateway's IP
     (shown on the Status page), or use `http://192.168.4.1` when connected to
@@ -166,6 +167,10 @@ paths:
         row*cols + col == module id). Each cell is the tracked character, "?" if
         a module is present but its character is unknown (e.g. after a home or an
         index set), or null if no module has that id. Drives the Live Display.
+
+        Cells report what the flap SHOWS (v4.1): a symbol flap as its symbol (♥ ↑ ↓
+        ☺ ← →) and the double-quote flap as '"', never the letters the wire uses.
+        Colour flaps stay their letters, as on the Matrix Gateway.
       responses:
         "200":
           description: Display state
@@ -233,6 +238,15 @@ paths:
                     letters work), then sends m<id>-<char>; the module firmware maps
                     the byte to a flap index. Characters with no Windows-1252
                     representation are rejected.
+
+
+                    SYMBOL FLAPS (v4.1): ♥ ↑ ↓ ☺ ← → are resolved against THAT module's
+                    reel — the reel's own flap when it carries one, otherwise a stand-in
+                    that reel does have (♥→*, ☺→:, ↓→V) or a blank. Their emoji forms
+                    (❤ ⬆ ⬇ ⬅ ➡ 🙂 😊 😀) and a trailing variation selector are accepted
+                    too. A TYPED letter is never a symbol: 'h' is still an H. With
+                    id:-1 the gateway sends one frame when every reel agrees and a frame
+                    per module when they do not, so a heart never lands as an 'h'.
             example: { id: 5, char: "A" }
       responses:
         "200":
@@ -269,6 +283,14 @@ paths:
     post:
       tags: [Modules]
       summary: Send a text string across sequential modules
+      description: |
+        One glyph per module, left to right from `start`. A euro sign, an accented
+        letter and a symbol flap (♥ ↑ ↓ ☺ ← →, v4.1) are each ONE module however many
+        UTF-8 bytes they arrived as, and each character is resolved against the reel of
+        the module it lands on — so a module without the heart printed on it shows the
+        stand-in (* : V) or a blank and the text does not shift around it.
+
+        `chars` in the reply is the number of MODULES written (bytes of UTF-8 before v4.1).
       requestBody:
         required: true
         content:
@@ -317,7 +339,15 @@ paths:
         errors (bad JSON, missing `cells`) return 400.
 
         Sent by CHARACTER (`m<id>-<char>`), so each module resolves the byte against its own
-        reel; lowercase folds to uppercase and `"` reaches the double-quote flap.
+        reel; lowercase folds to uppercase and `"` reaches the double-quote flap — the byte
+        itself on a reel printed with it, else the reel's borrowed 'q'.
+
+        SYMBOL FLAPS (v4.1): `{"ch":"♥"}` reaches the heart flap. Here, unlike the text
+        paths, a module whose reel the gateway KNOWS and which has no heart is SKIPPED
+        rather than shown a stand-in — the caller asked for a heart, and this endpoint's
+        leniency is about skipping, not approximating. `/api/capabilities` says which
+        symbols the wall carries (`pictographs`) and which every module carries
+        (`charset.common`).
       requestBody:
         required: true
         content:
@@ -905,9 +935,14 @@ paths:
         module applies the change silently (no reply); read it back with
         `/api/flap/all`. `charSet` is UTF-8 and may use any character representable
         in Windows-1252 — ASCII plus the euro sign and Western-European
-        accents; the gateway transcodes it to the single-byte form the bus uses.
-        Characters with no Windows-1252 representation are rejected. At most 64
-        characters. On modules older than v31 the command is ignored.
+        accents — and, from v4.1, the six SYMBOL flaps ♥ ↑ ↓ ☺ ← → (their emoji
+        forms and a trailing variation selector are accepted too). The gateway
+        transcodes it to the single-byte form the bus uses, storing each symbol as
+        its wire letter (h u d s l t) — which is what the module keeps and reports,
+        and what `/api/capabilities` turns back into symbols. A typed letter stays a
+        letter. Characters with no representation are rejected. The limit is 64
+        FLAPS: a symbol is one flap however many UTF-8 bytes it arrived as. On
+        modules older than v31 the command is ignored.
       requestBody:
         required: true
         content:
@@ -924,6 +959,9 @@ paths:
                 value: { id: 5, flapCount: 40, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }
               euroAndAccents:
                 value: { id: 5, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ€éàüöç0123456789" }
+              symbolFlaps:
+                summary: A reel with a heart and two arrows printed on three of its flaps
+                value: { id: 5, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789♥↑↓" }
               broadcast:
                 value: { id: -1, charSet: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }
               bySerial:
@@ -1138,10 +1176,23 @@ paths:
         is. The `chars` of a set is the reel VERBATIM, in flap-index order, because a client
         addressing a flap by index needs the positions rather than the alphabet.
 
-        TWO TRANSLATIONS apply to the character sets, matching what the gateway does when it
+        THREE TRANSLATIONS apply to the character sets, matching what the gateway does when it
         resolves a frame: the seven colour flaps (r o y g b p w) are reported under `colors` by
-        name and kept OUT of the character sets, and 'q' -- which the classic reel borrows for
-        the double-quote flap -- is reported as '"'.
+        name and kept OUT of the character sets; 'q' -- which the classic reel borrows for the
+        double-quote flap -- is reported as '"'; and the six SYMBOL flaps (v4.1), carried on the
+        wire as h u d s l t, are reported as the symbols themselves (♥ ↑ ↓ ☺ ← →). The letters
+        never appear in `union` or `common`.
+
+        `pictographs` (v4.1) names the symbols SOME reel carries, the way `colors` does for the
+        colour flaps, using the companion's own pictograph names. `spelling` (v4.1) gives, for
+        every character whose byte on the WIRE differs from the character itself, the byte to
+        send on the raw paths (`POST /api/rs485/send`, MQTT `<prefix>/send`): the six symbols
+        always, plus `"` -> `q` when the wall's reels borrow that byte and none prints '"'
+        itself. The `symbols` feature token means all three of these are present.
+
+        `sets[].chars` is unaffected by any of this: a reel is reported exactly as the module
+        stores it, symbol letters and colour codes included, because that is what flap INDEX
+        addressing works against.
 
         On the Split-Flap Gateway a module only reports its reel from firmware v31. `assumed`
         lists modules too old to report one, whose reel is taken to be the firmware's built-in
@@ -1158,7 +1209,7 @@ paths:
                 properties:
                   product:  { type: string, example: "Split-Flap Gateway" }
                   fw:       { type: string, example: "3.7.0" }
-                  api:      { type: string, example: "3.1.0" }
+                  api:      { type: string, example: "3.2.0" }
                   grid:
                     type: object
                     properties:
@@ -1171,6 +1222,20 @@ paths:
                     description: "The colour flaps the wall actually has, by name. A custom reel with no colour codes reports none."
                     items: { type: string }
                     example: ["red","orange","yellow","green","blue","purple","white"]
+                  pictographs:
+                    type: array
+                    description: "(v4.1) The symbol flaps SOME reel carries, by name, in table order. Empty on a wall with none."
+                    items: { type: string, enum: [heart, up, down, smiley, left, right] }
+                    example: ["heart","up","down"]
+                  spelling:
+                    type: object
+                    description: >
+                      (v4.1) For each character whose byte on the wire differs from the character
+                      itself, the byte to send on the raw frame paths. Always the six symbols;
+                      plus '"' -> 'q' when the wall's known reels borrow that byte and none
+                      prints '"' directly.
+                    additionalProperties: { type: string }
+                    example: { "♥": "h", "↑": "u", "↓": "d", "☺": "s", "←": "l", "→": "t", "\"": "q" }
                   charset:
                     type: object
                     properties:
@@ -1198,7 +1263,7 @@ paths:
                   features:
                     type: array
                     items: { type: string }
-                    example: ["colors","index","batch","quiet","maintenance","ha","ota","flapconfig"]
+                    example: ["colors","index","batch","quiet","maintenance","ha","ota","flapconfig","symbols"]
 
   /api/status:
     get:
@@ -2625,7 +2690,7 @@ components:
         sn:          { type: string,  description: "Serial number hex string", example: "AABBCCDD11223344" }
         provisioned: { type: boolean, example: true }
         flapIndex:   { type: integer, description: "Last known flap index (-1 = unknown)", example: 1 }
-        flapChar:    { type: string,  description: "Last known displayed character", example: "A" }
+        flapChar:    { type: string,  description: "Last known displayed character -- what the flap SHOWS: a symbol flap as its symbol (v4.1), the double-quote flap as '\"', colour flaps as their letters", example: "A" }
         fwVersion:   { type: string,  description: "Firmware version string (empty for legacy v7-or-earlier modules, which do not answer the version command)", example: "12" }
         lastSeen:    { type: integer, description: "millis() of last activity (0 if not seen since boot; restored entries start at 0)", example: 45000 }
         lastSeenEpoch: { type: integer, description: "RTC wall-clock epoch (seconds) of last activity; survives reboot. 0 if the RTC clock has never been set.", example: 1781210380 }

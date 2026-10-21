@@ -6,6 +6,7 @@
 // controls. Five of those slots (0x81/0x8D/0x8F/0x90/0x9D) are undefined.
 
 #include "charset.h"
+#include "flapsym.h"   // the symbol table: code points in, wire letters out
 
 // Unicode code point for each CP1252 byte 0x80..0x9F (0 = undefined slot).
 static const uint16_t CP1252_HIGH[32] = {
@@ -38,6 +39,26 @@ bool isFlapByte(uint8_t b) {
   return b >= 0xA1 && b <= 0xFE;                         // Latin-1 letters (not 0xFF)
 }
 
+// Decode one UTF-8 sequence at `p` into `*cp`. Returns its length in bytes, or 0 for an
+// invalid lead byte or a truncated sequence. Separate from the loop below because a symbol has
+// to look at what FOLLOWS it (a variation selector) before deciding how much it consumed.
+static int utf8Decode(const uint8_t* p, uint32_t* cp) {
+  uint8_t b = *p;
+  uint32_t c;
+  int n;
+  if      (b < 0x80)           { c = b;        n = 1; }
+  else if ((b & 0xE0) == 0xC0) { c = b & 0x1F; n = 2; }
+  else if ((b & 0xF0) == 0xE0) { c = b & 0x0F; n = 3; }
+  else if ((b & 0xF8) == 0xF0) { c = b & 0x07; n = 4; }
+  else return 0;                                         // invalid lead byte
+  for (int k = 1; k < n; k++) {
+    if ((p[k] & 0xC0) != 0x80) return 0;                 // not a continuation
+    c = (c << 6) | (p[k] & 0x3F);
+  }
+  *cp = c;
+  return n;
+}
+
 size_t utf8ToFlap(const char* in, char* out, size_t outSize, bool* allMapped) {
   size_t oi = 0;
   bool   mapped = true;
@@ -45,22 +66,24 @@ size_t utf8ToFlap(const char* in, char* out, size_t outSize, bool* allMapped) {
   if (outSize == 0) { if (allMapped) *allMapped = false; return 0; }
 
   while (*p) {
-    uint8_t  b = *p;
     uint32_t cp;
-    int      n;
-    if      (b < 0x80)          { cp = b;        n = 1; }
-    else if ((b & 0xE0) == 0xC0){ cp = b & 0x1F; n = 2; }
-    else if ((b & 0xF0) == 0xE0){ cp = b & 0x0F; n = 3; }
-    else if ((b & 0xF8) == 0xF0){ cp = b & 0x07; n = 4; }
-    else { p++; mapped = false; continue; }              // invalid lead byte
-
-    bool ok = true;
-    for (int k = 1; k < n; k++) {
-      if ((p[k] & 0xC0) != 0x80) { ok = false; break; }  // not a continuation
-      cp = (cp << 6) | (p[k] & 0x3F);
-    }
-    if (!ok) { p++; mapped = false; continue; }          // truncated sequence
+    int n = utf8Decode(p, &cp);
+    if (!n) { p++; mapped = false; continue; }           // invalid lead or truncated sequence
     p += n;
+
+    // A symbol flap: no Windows-1252 byte exists for it, so it becomes an internal code the
+    // caller resolves against a reel. A variation selector right after it is part of the same
+    // glyph (an emoji heart is ❤ + U+FE0F), so it is consumed here rather than counted as an
+    // unmappable code point -- otherwise "❤️" would report itself as partly unrepresentable.
+    int si = flapSymFromCp(cp);
+    if (si >= 0) {
+      uint32_t next;
+      int      nn = *p ? utf8Decode(p, &next) : 0;
+      if (nn && flapSymIsVariationSelector(next)) p += nn;
+      if (oi + 1 >= outSize) { mapped = false; break; }   // no room left
+      out[oi++] = (char)flapSymInternal(si);
+      continue;
+    }
 
     int fb = unicodeToCp1252(cp);
     if (fb < 0 || !isFlapByte((uint8_t)fb)) { mapped = false; continue; }
@@ -88,6 +111,43 @@ size_t flapByteToUtf8(uint8_t b, char* out) {
   out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
   out[2] = (char)(0x80 | (cp & 0x3F));
   return 3;
+}
+
+// UTF-8 encoder for one code point, up to 4 bytes (the emoji aliases live above the BMP).
+static size_t encodeUtf8(uint32_t cp, char* out) {
+  if (cp < 0x80)    { out[0] = (char)cp; return 1; }
+  if (cp < 0x800)   { out[0] = (char)(0xC0 | (cp >> 6));
+                      out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+  if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12));
+                      out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                      out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+  out[0] = (char)(0xF0 | (cp >> 18));
+  out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  out[3] = (char)(0x80 | (cp & 0x3F));
+  return 4;
+}
+
+size_t flapShownToUtf8(uint8_t b, char* out) {
+  int si = flapSymFromLetter((char)b);
+  if (si >= 0) return encodeUtf8(FLAP_SYMBOLS[si].cp, out);   // the heart, not an 'h'
+  if (b == 'q') { out[0] = '"'; return 1; }                   // the double-quote flap
+  return flapByteToUtf8(b, out);
+}
+
+size_t flapShownToJson(uint8_t b, char* out, size_t outSize) {
+  char enc[4];
+  size_t n = flapShownToUtf8(b, enc);
+  size_t oi = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (enc[i] == '"' || enc[i] == '\\') {
+      if (oi + 2 >= outSize) break;
+      out[oi++] = '\\';
+    } else if (oi + 1 >= outSize) break;
+    out[oi++] = enc[i];
+  }
+  out[oi] = '\0';
+  return oi;
 }
 
 size_t flapToJsonUtf8(const char* in, size_t inLen, char* out, size_t outSize, char junk) {
