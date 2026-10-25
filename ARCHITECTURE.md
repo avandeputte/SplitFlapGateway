@@ -513,3 +513,34 @@ anyway.
 
 Module firmware needs no change: a v31+ module stores and reports whatever bytes its flap set
 holds, and `m<id>-<byte>` has always accepted any byte.
+
+## Where the heap for a browser update comes from (v4.1.1)
+
+The 3.12 note above is about an upload that leaked heap per chunk. This one is about an upload
+that had no heap to begin with, and it is worth separating: the symptom is identical -- a
+connection that dies in the last third of a 1.5 MB image, min-free heap in the hundreds of bytes
+-- but nothing in the upload path was wrong.
+
+Two function-local statics were holding 53 KB of internal RAM permanently:
+
+```c
+void sfModulesSave() { static PersistedModule recs[MAX_MODULES]; ... }   // 26,520 B
+void sfModulesLoad() { static PersistedModule recs[MAX_MODULES]; ... }   // 26,520 B
+```
+
+Both were `static` for the right reason -- 26 KB is not going on a 4 KB task stack -- but
+`static` put them in DRAM for the life of the board, for something that runs on a debounce when
+the registry changes. `restoreWriteSnapshot()` held another 7 KB the same way. Together that is
+60 KB of the ~155 KB this board has, reserved against a few milliseconds of work a minute.
+
+It only ever showed up during a web upload, because that is the one operation that needs a large
+transient allocation: lwIP queues incoming packets while each chunk goes to flash, and the queue
+is sized by what the heap will give it. With 67 KB free at boot the low-water during a full-size
+image was **5,480 bytes**; with the buffers in PSRAM it is **98,748**.
+
+The rule this leaves: on this board a `static` buffer of more than a few KB belongs in PSRAM
+unless something touches it per frame. `psramAlloc()` allocates it on first use and says so in
+the boot log, and PSRAM has 8 MB against internal RAM's 320 KB. The same reasoning is already
+written on the capabilities scratch (`capScratch`), the monitor ring, the MQTT queue and the
+module registry -- these three were simply missed, because a function-local `static` does not
+look like a global.

@@ -504,9 +504,14 @@ bool restoreWriteSnapshot(const char* path, volatile int* done, volatile int* to
                           volatile bool* abort) {
   if (!sfFsReady) { strlcpy(err, "no filesystem", errLen); return false; }
   // The module list is copied first: the sweep below takes seconds and must not hold the lock.
-  // static, not on the stack: MAX_MODULES entries are several KB and the soak task that calls
-  // this has 4 KB. Only one snapshot ever runs at a time (the soak holds the bus).
-  static struct { uint8_t id; char sn[21]; int fw; } list[MAX_MODULES];
+  // Not on the stack -- MAX_MODULES entries are 7 KB and the soak task that calls this has 4 KB
+  // -- and not a static either: 7 KB of internal RAM held permanently for something that runs
+  // during a backup is 7 KB the WiFi stack does not have during a firmware upload. PSRAM, on
+  // first use. Only one snapshot ever runs at a time (the soak holds the bus).
+  struct SnapEntry { uint8_t id; char sn[21]; int fw; };
+  static SnapEntry* list = NULL;
+  if (!list) list = (SnapEntry*) psramAlloc("backup module list", sizeof(SnapEntry) * MAX_MODULES);
+  if (!list) { strlcpy(err, "out of memory", errLen); return false; }
   int n = 0;
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {

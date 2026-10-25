@@ -88,7 +88,8 @@ void handleOTAPage() {
     "#status{margin-top:14px;font-size:.9rem}</style></head><body>"
     "<h2>Gateway Firmware Update</h2>"
     "<p style='color:#888;font-size:.85rem'>This updates <b>the gateway itself</b>, not the modules. "
-    "Select a compiled .bin file. "
+    "Choose <b>SplitFlapGateway-&lt;version&gt;.bin</b> from the release &mdash; the plain one. "
+    "The <b>.factory.bin</b> is a full-flash image for a blank board over USB and is refused here. "
     "The gateway verifies the image when the last byte lands, then reboots into it. "
     "The progress bar shows the file leaving your browser; the gateway writes it to "
     "flash at about 90 KB/s, so a full image takes 15-20 s after the bar fills.</p>"
@@ -163,6 +164,11 @@ void wifiSetApActive(bool up) {
 // Tracks whether the in-progress OTA upload has hit a fatal error, so we can
 // reject cleanly at the end instead of rebooting into a half-written image.
 bool otaUploadFailed = false;
+// Why it failed, in words the person at the browser can act on. Empty until something goes
+// wrong; sendOTAUploadResult() puts it in the 500 body, and the updater page shows that text.
+static char otaFailMsg[192] = "";
+// Whether the first chunk's header has been checked yet (see the app-descriptor test below).
+static bool otaHeaderSeen = false;
 
 // Restore normal WiFi after a failed/aborted OTA. During an upload we force
 // modem sleep off and (if it was up) the AP down to free RAM; afterwards we
@@ -191,7 +197,9 @@ void handleOTAUpload() {
 
   if (upload.status == UPLOAD_FILE_START) {
     otaUploadFailed = false;
-    printf("[OTA] Web upload start: %s\n", upload.filename.c_str());
+    otaFailMsg[0] = 0;
+    otaHeaderSeen  = false;
+    printf("[OTA] Web upload start: %s (heap=%u)\n", upload.filename.c_str(), ESP.getFreeHeap());
     // Quiesce the gateway for the duration of the upload: stop MQTT publishing
     // and free its buffers so the WiFi/TCP stack has the contiguous heap the
     // upload needs. gOtaInProgress also makes the network task skip its periodic
@@ -224,10 +232,40 @@ void handleOTAUpload() {
     // can't touch its watchdog from its loop -- feed it here on every chunk so a
     // large/slow upload can't trip the 30s web-stall reboot.
     wdgWebMs = millis();
+
+    // Check the FIRST chunk before streaming 1.5 MB that cannot possibly work. An ESP32
+    // application image carries the app descriptor's magic word at offset 0x20; a full-flash
+    // image (SplitFlapGateway-<v>.factory.bin) has the bootloader there instead, and its app
+    // only starts at 0x10000. Picking the factory file is the common mistake -- it used to
+    // upload for eight seconds and end in a bare "Update failed", which is indistinguishable
+    // from a real fault and is most of what "the updater is broken" turns out to be.
+    if (!otaHeaderSeen && !otaUploadFailed) {
+      otaHeaderSeen = true;
+      if (upload.currentSize >= 0x24) {
+        uint32_t descMagic;
+        memcpy(&descMagic, upload.buf + 0x20, sizeof(descMagic));
+        if (upload.buf[0] != 0xE9) {
+          otaUploadFailed = true;
+          strlcpy(otaFailMsg, "That is not an ESP32 firmware image. Upload the plain "
+                              "SplitFlapGateway-<version>.bin.", sizeof(otaFailMsg));
+        } else if (descMagic != 0xABCD5432UL) {
+          otaUploadFailed = true;
+          strlcpy(otaFailMsg, "That looks like a full-flash image (.factory.bin), which can "
+                              "only be written over USB. Upload the plain "
+                              "SplitFlapGateway-<version>.bin instead.", sizeof(otaFailMsg));
+        }
+        if (otaUploadFailed) {
+          printf("[OTA] Refused: %s\n", otaFailMsg);
+          Update.abort();
+        }
+      }
+    }
+
     // Skip writing once we've failed, so we don't keep feeding a dead Update.
     if (!otaUploadFailed) {
       if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
         otaUploadFailed = true;
+        snprintf(otaFailMsg, sizeof(otaFailMsg), "Flash write failed: %s", Update.errorString());
         printf("[OTA] Write error (%s) -- aborting upload\n", Update.errorString());
         Update.abort();
       }
@@ -245,6 +283,8 @@ void handleOTAUpload() {
       // gOtaInProgress stays set: we reboot momentarily; no need to resume.
     } else {
       otaUploadFailed = true;
+      snprintf(otaFailMsg, sizeof(otaFailMsg), "The image did not verify: %s",
+               Update.errorString());
       gOtaInProgress = false;
       otaRestoreWifi();
       printf("[OTA] Update.end failed (%s) -- incomplete or corrupt image\n",
@@ -252,6 +292,8 @@ void handleOTAUpload() {
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     otaUploadFailed = true;
+    strlcpy(otaFailMsg, "The upload stopped before the whole image had arrived.",
+            sizeof(otaFailMsg));
     gOtaInProgress = false;
     Update.abort();
     otaRestoreWifi();
@@ -265,9 +307,14 @@ void handleOTAUpload() {
 // reboot into the freshly flashed image; on failure we reply 500 and stay up.
 void sendOTAUploadResult() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  printf("[OTA] Upload finished -- heap %u, low-water %u\n",
+         ESP.getFreeHeap(), ESP.getMinFreeHeap());
   if (otaUploadFailed || !Update.isFinished()) {
-    server.send(500, "text/plain",
-                "Update failed -- firmware not flashed. Device left unchanged.");
+    char body[220];
+    snprintf(body, sizeof(body), "%s The gateway is unchanged and still running its "
+                                 "previous firmware.",
+             otaFailMsg[0] ? otaFailMsg : "The update failed before the image was complete.");
+    server.send(500, "text/plain", body);
     return;
   }
   server.send(200, "text/plain", "OK");

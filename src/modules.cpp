@@ -151,10 +151,26 @@ FlapSetSource sfFlapSetOf(const SFModule& m, char* out) {
   return FLAPSET_UNKNOWN;
 }
 
+// The 255-record staging buffer the registry is written through and read back into. It is
+// 26 KB, and it was a function-local `static` in each of the two functions below -- so 53 KB of
+// INTERNAL RAM, permanently, for something used twice a minute at most. That is the memory a
+// browser firmware upload needs: the WiFi/TCP stack queues what arrives while a chunk is being
+// written to flash, and on a 1.5 MB image the low-water mark was under 6 KB. Same reasoning as
+// psramAllocInit() and the capabilities scratch; allocated on first use, never freed. Save
+// holds sfMutex while it fills this, and load runs at boot before any task exists, so the two
+// never overlap.
+static PersistedModule* persistBuf() {
+  static PersistedModule* buf = NULL;
+  if (!buf) buf = (PersistedModule*) psramAlloc("module persistence staging",
+                                                sizeof(PersistedModule) * MAX_MODULES);
+  return buf;
+}
+
 void sfModulesSave() {
   if (!sfFsReady) return;
   // Build a compact array of durable records under sfMutex.
-  static PersistedModule recs[MAX_MODULES];  // static: avoid large stack frame
+  PersistedModule* recs = persistBuf();
+  if (!recs) return;                         // no memory anywhere: better to skip than crash
   int n = 0;
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < sfModuleCount && n < MAX_MODULES; i++) {
@@ -198,7 +214,8 @@ void sfModulesLoad() {
     f.close();
     return;
   }
-  static PersistedModule recs[MAX_MODULES];
+  PersistedModule* recs = persistBuf();
+  if (!recs) { DBG("[MOD] no staging buffer -- module file not loaded\n"); return; }
   size_t want = (size_t)hdr.count * sizeof(PersistedModule);
   size_t got  = f.read((uint8_t*)recs, want);
   f.close();

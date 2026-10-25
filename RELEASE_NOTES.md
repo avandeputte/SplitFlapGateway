@@ -1,5 +1,51 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.1.1 — 2026-10-25
+
+**The browser firmware update had almost no memory left to work with. It has 99 KB now.**
+
+Updating the gateway from its own web page failed for some people -- the upload would run to
+80-something percent and the connection would drop, or it would end in a bare "Update failed".
+Both symptoms have the same root, and it is not in the upload code: **60 KB of internal RAM was
+being held by two staging buffers that are used twice a minute at most.**
+
+`sfModulesSave()` and `sfModulesLoad()` each kept a `static PersistedModule recs[255]` -- 26 KB
+apiece -- so 53 KB of the gateway's ~155 KB of internal RAM was reserved permanently for writing
+and reading `/modules.dat`. The backup sweep held another 7 KB the same way. That is precisely
+the memory the WiFi/TCP stack needs during an upload: it queues what arrives while each chunk is
+written to flash, and with the margin that thin the queue hit the ceiling and the connection
+died. One gateway here recorded a **min-free heap of 500 bytes** before this release.
+
+All three buffers now live in PSRAM, allocated on first use -- the same arrangement the monitor
+ring, the MQTT queue, the module registry and the capabilities scratch have had since 3.12, and
+for exactly this reason.
+
+| | before | after |
+|---|---|---|
+| Internal RAM held at build time | 171,992 B (52.5 %) | **112,008 B (34.2 %)** |
+| Free heap at boot | 67,600 B | **127,576 B** |
+| Free heap low-water during a 1.5 MB upload | **5,480 B** | **98,748 B** |
+
+### Fixed
+
+- **The browser update no longer runs the heap down.** The three staging buffers moved to PSRAM
+  (above). Nothing about the upload path itself changed: it was already correct, it simply had
+  no room to work in.
+- **The wrong file now says so.** Uploading `SplitFlapGateway-<version>.factory.bin` -- the
+  full-flash image for a blank board over USB, and the easiest mistake to make, since it sits
+  next to the right file in every release -- used to stream for eight seconds and end in
+  "Update failed", which reads exactly like a broken updater. The first chunk is now checked for
+  the application-image descriptor and refused immediately with *"That looks like a full-flash
+  image (.factory.bin), which can only be written over USB. Upload the plain
+  SplitFlapGateway-&lt;version&gt;.bin instead."*
+- **Failures report what actually happened.** A flash write error or a failed verification now
+  carries the Update library's own reason ("The image did not verify: Could Not Activate The
+  Firmware") instead of one generic sentence, and the updater page prints it.
+
+### Changed
+
+- **The updater page names the file to pick**, and says the `.factory.bin` is refused there.
+
 ## v4.1.0 — 2026-10-21
 
 **Symbols on the flaps: a heart, arrows and a smiley, printed on a real reel and addressed as
