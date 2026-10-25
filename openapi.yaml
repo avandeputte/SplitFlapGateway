@@ -2417,7 +2417,7 @@ paths:
   /api/config/settings:
     post:
       tags: [Config]
-      summary: Save timezone, serial debug, or OTA password
+      summary: Save timezone, the network name, serial debug, or the upload password
       description: Send only the fields you want to change. Each takes effect immediately.
       requestBody:
         required: true
@@ -2436,10 +2436,15 @@ paths:
                 restoreOnBoot: { type: boolean, example: true, description: "Replay the stored calibration backup on every boot (v3.12). Takes effect at the next boot" }
                 restoreDelay:  { type: integer, minimum: 0, maximum: 600, example: 10, description: "Seconds after boot before that replay starts (v3.12)" }
                 stepMs:        { type: integer, minimum: 0, maximum: 100, example: 25, description: "Default per-module cascade pacing in ms (v3.13), reported on GET /api/config for clients to use as their step_ms" }
+                mdnsName:      { type: string, maxLength: 31, example: "splitflap", description: "The name on the local network (v4.2). One DNS label: lowercase letters, digits and hyphens, starting and ending on a letter or digit. Upper case is folded; blank resets to \"splitflap\". Applied at once -- no reboot -- and the reply carries the effective name and URL. 400 if the name is unusable. Two gateways on one network must not share one" }
             examples:
               timezone:
                 value:
                   posixTZ: "EST5EDT,M3.2.0,M11.1.0"
+              network_name:
+                summary: "Rename the gateway; the reply carries ok, mdnsName and url"
+                value:
+                  mdnsName: "hallway-wall"
               ntp_server:
                 value:
                   ntpServer: "time.google.com"
@@ -2812,3 +2817,4 @@ components:
         restoreOnBoot: { type: boolean, description: "Replay the stored calibration backup on every boot (v3.12)", example: false }
         restoreDelay:  { type: integer, description: "Seconds after boot before that replay starts (v3.12)", example: 10 }
         stepMs:        { type: integer, minimum: 0, maximum: 100, description: "Default per-module cascade pacing in ms (v3.13). Stored and reported for clients -- the companion uses it as its default step_ms; the gateway does not pace its own sends by it", example: 15 }
+        mdnsName:      { type: string, example: "splitflap", description: "The name the gateway answers to on the local network (v4.2): http://<mdnsName>.local, and the hostname espota and the Arduino IDE discover. Default \"splitflap\"" }

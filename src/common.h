@@ -132,7 +132,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "4.1.1"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "4.2.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -147,6 +147,11 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 #define DEFAULT_BAUD         9600UL           // RS-485 bus baud rate
 #define DEFAULT_MQTT_PORT    1883
 #define DEFAULT_MQTT_PREFIX  "splitflap"
+// The name the gateway answers to on the local network: http://<name>.local, and the
+// hostname espota and the Arduino IDE discover. One short word, so a person can type it.
+// Two gateways on one LAN must not share it -- change one of them in Settings.
+#define DEFAULT_MDNS_NAME    "splitflap"
+#define MDNS_NAME_MAX        31          // one DNS label, and what mDNS advertises
 #define DEFAULT_NTP_SERVER   "pool.ntp.org"   // overridable via Settings
 #define NTP_TIMEOUT_MS       8000UL
 

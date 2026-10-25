@@ -1435,7 +1435,8 @@ static void handleApiConfigGet() {
   doc["restoreOnBoot"]  = cfg.restoreOnBoot;      // v3.12
   doc["restoreDelay"]   = cfg.restoreDelaySec;
   doc["stepMs"]         = cfg.stepMs;             // v3.13: the companion's default step_ms
-  char out[840];   // headroom for "version" + JSON-escaped SSID/TZ strings
+  doc["mdnsName"]       = otaMdnsName();          // v4.2: http://<mdnsName>.local
+  char out[880];   // headroom for "version" + JSON-escaped SSID/TZ strings
   serializeJson(doc, out, sizeof(out));
   server.send(200, "application/json", out);
 }
@@ -1534,6 +1535,31 @@ static void handleApiConfigSettings() {
     }
     printf("[CFG] OTA password updated\n");
     server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  // The name on the network (v4.2). Lower-cased and checked before it is stored: a bad label
+  // would leave the gateway reachable only by IP, which is exactly the situation the setting
+  // exists to get people out of. Applied immediately -- no reboot -- and the response carries
+  // the name so the UI can show the URL that now works.
+  if (doc["mdnsName"].is<const char*>()) {
+    char want[MDNS_NAME_MAX + 2] = "";
+    strlcpy(want, doc["mdnsName"] | "", sizeof(want));
+    for (char* c = want; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    if (!want[0]) strlcpy(want, DEFAULT_MDNS_NAME, sizeof(want));     // blank = back to default
+    if (!otaMdnsNameValid(want)) {
+      sendJsonError(400, "Name must be 1-31 characters: lowercase letters, digits and hyphens, "
+                         "starting and ending with a letter or digit");
+      return;
+    }
+    bool changed = (strcmp(cfg.mdnsName, want) != 0);
+    strlcpy(cfg.mdnsName, want, sizeof(cfg.mdnsName));
+    saveConfig();
+    if (changed) otaApplyMdnsName();
+    printf("[CFG] mDNS name: %s\n", otaMdnsName());
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"mdnsName\":\"%s\",\"url\":\"http://%s.local\"}",
+             otaMdnsName(), otaMdnsName());
+    server.send(200, "application/json", resp);
     return;
   }
   // Serial debug toggle

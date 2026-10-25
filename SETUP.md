@@ -284,7 +284,7 @@ The board has no Wi-Fi credentials yet, so it starts its own access point.
 3. Go to **Settings ▸ Wi-Fi**, enter your network's SSID and password, and **Save Wi-Fi**.
 4. The gateway joins your network; its IP appears on the **Status** page (and in
    the serial log). After that it's reachable on your LAN at that IP or at
-   **<http://splitflap-gw.local>** (mDNS).
+   **<http://splitflap.local>** (mDNS; the name is a setting).
 
 For provisioning modules, calibration, MQTT, etc., see the [README](README.md) and
 [Calibration guide](https://splitflap.iothing.net/docs/Calibration/).
@@ -313,12 +313,12 @@ After the first USB flash you can update without a cable.
 
 ### B. OTA from the command line / PlatformIO (optional)
 
-The board advertises over mDNS as `splitflap-gw`. You can push `firmware.bin` with
+The board advertises over mDNS as `splitflap` (Settings ▸ Network Name changes it). You can push `firmware.bin` with
 `espota`:
 
 ```bash
 # from .pio/build/esp32s3_devmodule/
-python3 -m espota -i splitflap-gw.local -f firmware.bin
+python3 -m espota -i splitflap.local -f firmware.bin
 # with an OTA password set in Settings:
 python3 -m espota -i 192.168.1.105 -a yourpassword -f firmware.bin
 ```
@@ -328,7 +328,7 @@ To make PlatformIO's **Upload** target the board over Wi-Fi instead of USB, set 
 
 ```ini
 upload_protocol = espota
-upload_port     = splitflap-gw.local   ; or the gateway IP
+upload_port     = splitflap.local   ; or the gateway IP
 ; upload_flags  = --auth=yourpassword  ; if an OTA password is set
 ```
 

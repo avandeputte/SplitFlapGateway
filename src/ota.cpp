@@ -13,19 +13,54 @@ static void otaRestoreWifi();
 // ---------------------------------------------------------------------------
 // OTA update support
 // ---------------------------------------------------------------------------
-void otaInit() {
-  // The hostname carries the board id: two gateways on one LAN both called
-  // "splitflap-gw" fight over the mDNS name exactly the way they fought over
-  // the MQTT client id (see boardId24() in common.h — this is the same fix).
-  // splitflap-gw-<6 hex digits>, unique per board, printed at boot below.
-  static char hostname[24];
-  snprintf(hostname, sizeof(hostname), "splitflap-gw-%06x", (unsigned)boardId24());
-  ArduinoOTA.setHostname(hostname);
-
-  // Optional password protection
-  if (strlen(cfg.otaPassword) > 0) {
-    ArduinoOTA.setPassword(cfg.otaPassword);
+// A usable mDNS label: lowercase letters, digits and hyphens, starting and ending on a
+// letter or digit, 1-31 characters. That is a DNS label's rule, and it is also what a person
+// can type into a browser without surprises. Upper case is folded by the caller, not here.
+bool otaMdnsNameValid(const char* name) {
+  size_t n = name ? strlen(name) : 0;
+  if (n < 1 || n > MDNS_NAME_MAX) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = name[i];
+    bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (!alnum && !(c == '-' && i > 0 && i < n - 1)) return false;
   }
+  return true;
+}
+
+// The name this gateway answers to, as configured -- or the default if the stored one is
+// missing or unusable, so a bad value can never leave the board unreachable by name.
+const char* otaMdnsName() {
+  return otaMdnsNameValid(cfg.mdnsName) ? cfg.mdnsName : DEFAULT_MDNS_NAME;
+}
+
+// Start (or restart) the responder under the configured name.
+//
+// The responder is driven directly rather than through ArduinoOTA.setHostname(), which only
+// takes effect the FIRST time: it is guarded by `if (!_initialized && !_hostname.length())`, so
+// after boot it silently does nothing and a rename would re-announce the old name (it did --
+// the new name simply never appeared on the wire). So ArduinoOTA keeps its UDP listener and we
+// keep the mDNS registration: MDNS.begin() sets the host, enableArduino() publishes the
+// _arduino._tcp record espota and the Arduino IDE discover, and _http._tcp is the web UI.
+static void otaStartMdns() {
+  const char* name = otaMdnsName();
+  MDNS.begin(name);
+  MDNS.enableArduino(3232, strlen(cfg.otaPassword) > 0);
+  MDNS.addService("http", "tcp", 80);
+  printf("[OTA] mDNS name: %s (http://%s.local)\n", name, name);
+}
+
+// Apply a new name without a reboot. Anything already open keeps working by IP; the new name is
+// announced at once, and the old one disappears from the network as its records expire.
+void otaApplyMdnsName() {
+  MDNS.end();
+  otaStartMdns();
+}
+
+void otaInit() {
+  // The name is a setting (default "splitflap", so the wall is at http://splitflap.local).
+  // Two gateways on one LAN must not share it: mDNS has no way to tell them apart, exactly as
+  // they would fight over an MQTT client id, so the second one gets renamed in Settings. The
+  // board id is still what makes the MQTT client id unique -- see boardId24() in common.h.
 
   ArduinoOTA.onStart([]() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
@@ -52,11 +87,13 @@ void otaInit() {
     printf("[OTA] Error: %s\n", msg);
   });
 
+  // mDNS is ours to manage (see otaStartMdns), so ArduinoOTA only listens on its UDP port.
+  ArduinoOTA.setMdnsEnabled(false);
+  ArduinoOTA.setHostname(otaMdnsName());        // for its own logging; mDNS is set below
+  if (strlen(cfg.otaPassword) > 0) ArduinoOTA.setPassword(cfg.otaPassword);
   ArduinoOTA.begin();
-  // ArduinoOTA.begin() started the mDNS responder with our hostname; also
-  // advertise the web UI so browsers can reach http://<hostname>.local
-  MDNS.addService("http", "tcp", 80);
-  printf("[OTA] Ready (hostname: %s, web UI at http://%s.local)\n", hostname, hostname);
+  otaStartMdns();
+  printf("[OTA] Ready (web UI at http://%s.local)\n", otaMdnsName());
 }
 
 // OTA runs in its own task so ArduinoOTA.handle() is called frequently

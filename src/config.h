@@ -41,6 +41,8 @@ struct GwConfig {
   uint16_t      restoreDelaySec;   // seconds after boot before that replay starts
   // ---- v3.13 ----
   uint8_t       stepMs;            // default per-module cascade pacing, reported to clients (common.h)
+  // ---- v4.2 ----
+  char          mdnsName[MDNS_NAME_MAX + 1];  // http://<mdnsName>.local, and the espota hostname
 };
 
 // ---- owned globals (defined in globals.cpp) ----

@@ -544,3 +544,35 @@ the boot log, and PSRAM has 8 MB against internal RAM's 320 KB. The same reasoni
 written on the capabilities scratch (`capScratch`), the monitor ring, the MQTT queue and the
 module registry -- these three were simply missed, because a function-local `static` does not
 look like a global.
+
+## Renaming mDNS at runtime: ArduinoOTA.setHostname() only works once (v4.2)
+
+The network name became a setting, and a setting that needs a reboot to take effect is a
+setting people get wrong twice. Applying it live looks like three calls -- end the responder,
+set the new hostname, start it again -- and the middle one is a trap:
+
+```c
+ArduinoOTAClass &ArduinoOTAClass::setHostname(const char *hostname) {
+  if (!_initialized && !_hostname.length()) {   // <-- both, and _hostname is sticky
+    _hostname = hostname;
+  }
+  return *this;
+}
+```
+
+After the first call at boot `_hostname.length()` is non-zero for ever, so every later
+`setHostname()` returns silently having done nothing, and `ArduinoOTA.begin()` re-announces the
+OLD name. The rename reported success, the dashboard showed the new name, `/api/config` agreed
+-- and the only thing that disagreed was the network, where `dns-sd -B _arduino._tcp` kept
+showing the previous one. Nothing in the firmware was in a position to notice.
+
+So the gateway owns its mDNS registration instead of delegating it: `ArduinoOTA.setMdnsEnabled(false)`
+keeps the OTA library to its UDP listener, and `otaStartMdns()` does the three things the
+library would have done -- `MDNS.begin(name)` for the host, `MDNS.enableArduino(3232, auth)` for
+the `_arduino._tcp` record espota discovers, `MDNS.addService("http","tcp",80)` for the web UI.
+A rename is then `MDNS.end()` plus that function, and it is on the wire in under a second
+(verified with `dns-sd` watching: the old instance removed, the new one added, uptime unchanged).
+
+The general lesson is about verification, not about this library: a setter that validates
+nothing and returns `*this` for chaining can only be confirmed by looking at what it was
+supposed to change -- here, the multicast traffic, not the gateway's own idea of its name.

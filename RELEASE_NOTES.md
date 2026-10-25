@@ -1,6 +1,29 @@
 # Split-Flap Gateway — Release Notes
 
-## v4.1.1 — 2026-10-25
+## v4.2.0 — 2026-10-25
+
+**A name you choose, and a browser update with room to work.**
+
+### Added
+
+- **The gateway has a name, and it is `splitflap`.** It answers at
+  **http://splitflap.local** -- that is also the name `espota` and the Arduino IDE discover --
+  and **Settings ▸ Network Name** changes it to anything you like: lowercase letters, digits and
+  hyphens, up to 31 characters. The change applies at once, with no reboot: the old name leaves
+  the network and the new one is announced within a second, while anything already open keeps
+  working by IP. `GET /api/config` reports it as `mdnsName`, and
+  `POST /api/config/settings {"mdnsName":"hallway-wall"}` sets it, answering with the effective
+  name and URL. A blank value puts it back to `splitflap`.
+
+  **Two gateways on one network must not share a name.** Until now every board derived a unique
+  one from its chip id (`splitflap-gw-a1b2c3.local`), which never collided but which nobody
+  could remember or type -- and if you only have one wall, which is nearly everyone, the useful
+  name is the short one. If you run two, rename the second in Settings.
+
+  **What this changes on upgrade:** a board that updates to 4.2 stops answering to
+  `splitflap-gw-xxxxxx.local` and answers to `splitflap.local` instead. Bookmarks, an
+  `upload_port` in `platformio.ini`, a Home Assistant REST sensor or anything else pinned to the
+  old name needs the new one (or the IP, which has not changed).
 
 **The browser firmware update had almost no memory left to work with. It has 99 KB now.**
 

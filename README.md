@@ -41,7 +41,7 @@ from the conductor rail through pogo pins — see
 
 **First boot.** With no WiFi configured the gateway raises its own access point,
 `Split-Flap-GW` / `12345678`; open http://192.168.4.1, enter your WiFi under Settings, and it
-joins your network (it then appears as `splitflap-gw-xxxxxx.local`). The full set-up, and what
+joins your network (it then answers to `splitflap.local`, a name you can change in Settings). The full set-up, and what
 to do when a web update fails, is in
 [the gateway guide](https://splitflap.iothing.net/docs/SplitFlap-Gateway/).
 

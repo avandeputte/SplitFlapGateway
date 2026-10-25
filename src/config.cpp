@@ -15,6 +15,7 @@ void cfgSetDefaults() {
   strlcpy(cfg.mqttPrefix, DEFAULT_MQTT_PREFIX, sizeof(cfg.mqttPrefix));
   strlcpy(cfg.posixTZ, "UTC0", sizeof(cfg.posixTZ));
   strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
+  strlcpy(cfg.mdnsName, DEFAULT_MDNS_NAME, sizeof(cfg.mdnsName));
   cfg.gridRows = 1;
   cfg.gridCols = 16;
   cfg.serialDebug = false;
@@ -51,6 +52,7 @@ void loadConfig() {
   cfg.rs485StopBits   = prefs.getUChar("sbits",   1);
   strlcpy(cfg.posixTZ, prefs.getString("tz", "UTC0").c_str(), sizeof(cfg.posixTZ));
   strlcpy(cfg.ntpServer, prefs.getString("ntp", DEFAULT_NTP_SERVER).c_str(), sizeof(cfg.ntpServer));
+  strlcpy(cfg.mdnsName, prefs.getString("mdns", DEFAULT_MDNS_NAME).c_str(), sizeof(cfg.mdnsName));
   cfg.gridRows = (uint8_t)prefs.getInt("gRows", 1);
   cfg.gridCols = (uint8_t)prefs.getInt("gCols", 16);
   if (cfg.gridRows < 1) cfg.gridRows = 1;
@@ -82,6 +84,7 @@ void saveConfig() {
   prefs.begin("splitflap", false);
   prefs.putString("wSSID",  cfg.wifiSSID);
   prefs.putString("ntp",    cfg.ntpServer);
+  prefs.putString("mdns",   cfg.mdnsName);
   prefs.putInt   ("gRows",  cfg.gridRows);
   prefs.putInt   ("gCols",  cfg.gridCols);
   prefs.putString("wPASS",  cfg.wifiPass);
