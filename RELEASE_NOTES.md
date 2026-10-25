@@ -42,6 +42,16 @@ for exactly this reason.
   carries the Update library's own reason ("The image did not verify: Could Not Activate The
   Firmware") instead of one generic sentence, and the updater page prints it.
 
+- **A successful flash can no longer look like a failure because of mDNS.** The updater page
+  polls for the gateway coming back, on whatever address the page itself was opened from. Open
+  it as `http://splitflap-gw-xxxxxx.local/ota` and that poll depends on the name still resolving
+  the moment the board returns -- and a cached record, an access point that blocks multicast
+  between bands, or a phone that never resolves `.local` at all turns a flash that worked into
+  "the gateway has not come back after 90 s". The page now carries the gateway's own IP address
+  and tries it when the name does not answer, and the "Open the dashboard" link it then offers
+  points at the address that did. (mDNS itself is unchanged and working: `_arduino._tcp` for
+  `espota`, `_http._tcp` for browsers.)
+
 ### Changed
 
 - **The updater page names the file to pick**, and says the `.factory.bin` is refused there.

@@ -77,6 +77,16 @@ void taskOTA(void* pv) {
 void handleOTAPage() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   // Served as a standalone page at /ota so the upload iframe works cleanly
+  // The page polls for the gateway coming back after the reboot. If it was opened by mDNS
+  // name (splitflap-gw-xxxxxx.local), that poll depends on the name still resolving the moment
+  // the board returns -- and a resolver that cached the old record, a network that blocks
+  // multicast, or a phone that never did .local at all turns a SUCCESSFUL flash into "the
+  // gateway has not come back". So the page carries the station's own IP address and falls
+  // back to it. Same-origin first (it is usually right), the literal address second.
+  IPAddress ip = WiFi.localIP();
+  char ipStr[20];
+  snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Gateway Firmware Update</title>"
@@ -110,15 +120,23 @@ void handleOTAPage() {
     "document.getElementById('prog').value=p;"
     "document.getElementById('status').textContent='Uploading: '+p+'%';}"
     "};"
-    "var t0=Date.now();"
+    "var t0=Date.now();var GWIP='" + String(ipStr) + "';"
     "function back(){"
-    "fetch('/api/config',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){"
+    // Try this page's own origin first, then the gateway's address. Whichever answers wins,
+    // and the link offered afterwards points at the one that worked.
+    "var urls=[location.origin,'http://'+GWIP];"
+    "var i=0;"
+    "function tryOne(){"
+    "if(i>=urls.length){"
+    "if(Date.now()-t0<90000)setTimeout(function(){i=0;tryOne();},2000);"
+    "else document.getElementById('status').innerHTML='<span style=\"color:rgb(233,69,96)\">The gateway has not come back after 90 s. Check its power and WiFi, then reload. It may also be back at <a href=\"http://'+GWIP+'/\" style=\"color:#7c5cff\">'+GWIP+'</a> under a name your computer cannot look up.</span>';"
+    "return;}"
+    "var base=urls[i];"
+    "fetch(base+'/api/config',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){"
     "document.getElementById('status').innerHTML="
-    "'<span style=\"color:rgb(76,175,80)\">Rebooted. The gateway is back on firmware v'+(c.version||'?')+'. <a href=\"/\" style=\"color:#7c5cff\">Open the dashboard</a></span>';"
-    "}).catch(function(){"
-    "if(Date.now()-t0<90000)setTimeout(back,2000);"
-    "else document.getElementById('status').innerHTML='<span style=\"color:rgb(233,69,96)\">The gateway has not come back after 90 s. Check its power and WiFi, then reload.</span>';"
-    "});}"
+    "'<span style=\"color:rgb(76,175,80)\">Rebooted. The gateway is back on firmware v'+(c.version||'?')+'. <a href=\"'+base+'/\" style=\"color:#7c5cff\">Open the dashboard</a></span>';"
+    "}).catch(function(){i++;tryOne();});}"
+    "tryOne();}"
     "xhr.onload=function(){"
     "if(xhr.status===200){"
     "document.getElementById('status').innerHTML="
