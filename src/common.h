@@ -132,7 +132,7 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "4.2.0"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "4.3.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
@@ -233,6 +233,13 @@ extern char gResetReason[12];   // why the board last rebooted, for /api/status
 #define MODULE_REPROBE_BACKOFF_MS 3600000UL // after MODULE_PROBE_MAX_TRIES unanswered re-queries, leave the module alone for this long before asking again (it stays in the registry throughout)
 #define MODULE_PROBE_GRACE_MS   3000UL    // wait this long for a stale module's version reply before the next probe attempt
 #define MODULE_PROBE_SPACING_MS 150UL     // gap between consecutive stale probes: a module answers a bare 'v' INSTANTLY, so back-to-back queries make each reply collide with the next probe -- space them so every reply is received (and clears the probe) before the next query goes out
+// An UNPROVISIONED module advertises its serial every 10-15 s, unprompted -- so unlike a
+// provisioned one (which only speaks when addressed, and is therefore kept for ever) its
+// silence IS evidence. After this long with no advertisement it is gone: unplugged, or given
+// an ID from another gateway, or provisioned and now answering as itself. ~8 missed
+// advertisements, so a busy bus or a collision or two never clears a module that is still
+// there, and the Provision list stops filling up with modules that have left.
+#define UNPROV_STALE_MS         120000UL
 #define MODULE_PROBE_BATCH      8         // max stale modules probed per prune cycle; the rest are probed on later cycles (bounds the net task's spaced-probe burst)
 #define MODULE_PROBE_MAX_TRIES  4         // unanswered re-queries (one per ~1 min cycle) before backing off for MODULE_REPROBE_BACKOFF_MS. A single reply is easily lost to a bus collision while the host is streaming display frames, so one probe is not proof of absence.
 #define MODULE_POSTPROV_VER_MS  4000UL    // delay after a provisioning ack before the first version query. A freshly-provisioned module writes its new ID to EEPROM and then runs a staggered startup (~150ms x new-ID), so it can be unresponsive for several seconds; wait well past that before the first query.
@@ -296,7 +303,10 @@ extern char gResetReason[12];   // why the board last rebooted, for /api/status
 // Arduino-free so the native tests compile the firmware's own table rather than a copy of it.
 #define FLAPSET_DEFAULT " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw"
 #define MODULES_FILE     "/modules.dat"
-#define MODULES_MAGIC    0x53464733UL   // "SFG3" (bumped: PersistedModule gained the flap set)
+#define MODULES_MAGIC    0x53464734UL   // "SFG4" (bumped: PersistedModule gained the driver
+                                        // board. A file written by an older gateway is
+                                        // ignored, and the wall refills it on the next roll
+                                        // call -- the file is a cache, not the truth.)
 
 /* ---- Companion settings blob (FFat) -- v3.1 --------------------------------
  * The companion app can park its settings here so its container stays stateless.

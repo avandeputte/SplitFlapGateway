@@ -1,5 +1,71 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.3.0 — 2026-11-09
+
+**There is a second driver board. The gateway can now see which one each module is — and will
+not send a module an image its board cannot run.**
+
+Module firmware **v36** brings a second driver board. The two differ in one thing: where the
+RS-485 transceiver is wired. The **v4** board (Adam's) has it on pins that are not the chip's
+USART, so the bus is bit-banged; the **v5** board puts it on USART0's alternate pins, so the
+bus is the hardware USART and the transceiver's driver-enable is handled by the USART itself.
+A module tells the two apart from a strap on `PC0` and **an image runs only on its own board**.
+
+### Added
+
+- **The Modules tab shows the board.** A module's card reads *FW: v36 · Board v5*, and the
+  info dialog has a **Driver Board** row. A module that does not report one is a v4, and the
+  dialog says why it is blank: v36 is the first firmware that reports a board, and the v5 board
+  has no firmware older than that.
+- **`GET /api/flap/modules` carries `board`** (0 = not reported), persisted across reboots --
+  only a version reply carries it, and the `A` dump the registry otherwise lives on does not.
+
+### Fixed
+
+- **An unprovisioned module that has left no longer sits in the list.** A module with no ID
+  advertises its serial every 10-15 seconds, unprompted, so silence from one IS evidence --
+  unlike a provisioned module, which only speaks when addressed and is therefore kept for ever.
+  One that has not advertised for **two minutes** is dropped, and comes straight back if it
+  starts again. On the wall here that cleared four cards for modules that had been provisioned
+  or unplugged, three minutes after the gateway restarted.
+- **A command-line update could reboot the board mid-image.** `espota` and the Arduino IDE got
+  none of the quiescing a browser upload has had since 3.12: MQTT kept its buffers, the station
+  kept dropping into modem sleep, and the watchdog supervisor did not know an update was running
+  -- so on a busy wall the upload tripped the task watchdog and the board restarted part way
+  through (`reset: TASK_WDT`, the image unwritten). Both doors now quiesce the same way. The
+  upload that had been failing finished on the next try.
+- **A bus update of a v5 module could not work.** The v5 board's bootloader is version 2 and
+  its status frame is 42 bytes, not 41: it appends the board after the page bitmap. The gateway
+  checked the length and dropped the frame, so a module that had answered looked like one that
+  never did, and every update of a v5 module failed within a second with *"no module answered
+  in its bootloader"*. It accepts both lengths now, and reads the board from the longer one.
+  *(Measured afterwards: module 14, a v5 board, took the v5 image in one pass, 240 pages,
+  49.3 s.)*
+
+### Changed
+
+- **An update sends each module only an image its board can run.** The stored image says which
+  board it is for -- the Module Firmware card reads *"Firmware v36 for board v5 is uploaded"* --
+  and a run skips the modules that are a different board, counting them in the status
+  (*"9 module(s) left out: another board"*). If none is left, the attempt is refused outright
+  rather than started. The bootloader's own answer is checked again before any page is sent, so
+  a stale registry cannot get a module the wrong image either.
+
+  A module that does not report a board is treated as a **v4**. That is a construction, not a
+  guess: every image a v5 board can run reports its board. The failure is deliberately
+  asymmetric -- a silent v5 module is skipped and says so, where the opposite mistake would
+  send an image the board cannot run and leave the module in its bootloader until the right one
+  arrives.
+
+- **A release now carries one image per board**, so a mixed wall takes two runs, one image
+  each. The documentation ([Bus Protocol](https://splitflap.iothing.net/docs/Bus-Protocol/),
+  [Updating modules over the bus](https://splitflap.iothing.net/docs/Module-Firmware-Updates/))
+  describes both boards and what each reply looks like.
+
+- **The persisted module registry gained a field**, so the file an older gateway wrote is
+  ignored once and rebuilt from the wall at the next roll call. Nothing is lost that the bus
+  cannot say again.
+
 ## v4.2.0 — 2026-10-25
 
 **A name you choose, and a browser update with room to work.**

@@ -35,6 +35,13 @@
 #define MODFW_FILE            "/modfw.bin"
 #define MODFW_TMP             "/modfw.tmp"
 #define MODULE_FW_BOOTLOADER  35       // first module firmware that carries the bootloader
+#define MODULE_FW_BOARD_TAG   36       // first module firmware that REPORTS its driver board
+// Since module firmware v36 the image names the board it is for, at flash 0x3FFC -- which is
+// offset 15,356 in the 15,360-byte firmware-update.bin, four bytes from the end (0x3FFD is
+// reserved, and the last two are the image CRC). An image built before v36 has 0xFF there, and
+// those are all v4 images: the v5 board has no firmware older than v36.
+#define MODFW_BOARD_AT        (MODFW_IMAGE_BYTES - 4)
+#define MODFW_BOARD_DEFAULT   4        // what an untagged image is, by construction
 #define MODFW_TO_ALL          0xFF
 
 // Quiet after a frame's last byte, from BUS-UPDATE.md's timing table.
@@ -57,6 +64,7 @@ enum ModFwPhase : uint8_t {
 
 struct ModFwTarget {
   uint8_t id;
+  uint8_t board;           // its driver board (4, 5, ...), 0 = not known
   uint8_t fwBefore;        // what it ran when the run started
   uint8_t fwAfter;         // what it reports afterwards (0 = did not answer)
   uint16_t pagesLeft;      // pages it still needs, as of the last status
@@ -73,6 +81,8 @@ struct ModFwState {
   volatile int      pagesSent= 0;        // in the current pass
   volatile int      pagesThisPass = 0;
   volatile int      ok       = 0;        // modules now running the new firmware
+  volatile uint8_t  imageBoard   = 0;    // the board the image being sent is for
+  volatile uint8_t  skippedBoard = 0;    // modules left out because they are another board
   volatile unsigned long startedMs = 0, elapsedMs = 0;
   char              err[72]  = "";
   ModFwTarget*      list     = NULL;     // PSRAM, MAX_MODULES entries
@@ -84,7 +94,10 @@ void modfwInit();                                   // once, from setup()
    version it holds (0 when that cannot be told -- see modfwImageVersion). Cached: the answer
    only changes when an image is uploaded or deleted, and re-reading 15 KB of flash on every
    status poll would add cache stalls to a run whose timing is being measured in milliseconds. */
-bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version = NULL);
+// `board` is the driver board the stored image is for: 4 or 5, and 4 for an image built
+// before the tag existed (there was no other board then).
+bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version = NULL,
+                    int* board = NULL);
 void modfwImageForget();      // after an upload or a delete: the cache is stale
 /* The version the image will install, read out of the image itself.
    The module firmware keeps it as a short NUL-terminated digit string, so the image is scanned
@@ -105,8 +118,10 @@ void modfwStatusEmit(void (*emit)(const char* chunk));
 // One module's bootloader status, for the dashboard's "is this module ready" check. Sends an
 // S frame and waits; false when nothing answers (which is what a module without the
 // bootloader does).
+// `board` comes from the bootloader itself (version 2 and later report it); 0 means that
+// bootloader does not say, which makes it a v4.
 bool modfwProbe(int id, uint8_t* version, uint8_t* reason, uint8_t* flags,
-                uint16_t* imageCrc, int* pagesHeld);
+                uint16_t* imageCrc, int* pagesHeld, uint8_t* board = NULL);
 // Receive hook: a bootloader frame ('#...') arrived. Called from the RS-485 task.
 void modfwNoteReply(const uint8_t* data, size_t len);
 

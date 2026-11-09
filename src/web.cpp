@@ -409,11 +409,11 @@ static void handleApiModules() {
     char obj[288];
     int on = snprintf(obj, sizeof(obj),
       "%s{\"id\":%d,\"sn\":\"%s\",\"provisioned\":%s,\"acked\":%s,\"flapIndex\":%d,"
-      "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"lastSeen\":%lu,\"lastSeenEpoch\":%lu,"
-      "\"dupSuspect\":%s}",
+      "\"flapChar\":\"%s\",\"fwVersion\":\"%s\",\"board\":%u,\"lastSeen\":%lu,"
+      "\"lastSeenEpoch\":%lu,\"dupSuspect\":%s}",
       emitted ? "," : "", (int)m.id, m.serialNum, m.provisioned ? "true" : "false",
       m.acked ? "true" : "false",
-      m.flapIndex, flapBuf, m.fwVersion, m.lastSeen, m.lastSeenEpoch,
+      m.flapIndex, flapBuf, m.fwVersion, (unsigned)m.board, m.lastSeen, m.lastSeenEpoch,
       m.dupSuspect ? "true" : "false");
     if (on < 0) on = 0;
     if (on > (int)sizeof(obj) - 1) on = (int)sizeof(obj) - 1;   // snprintf truncated
@@ -2423,19 +2423,19 @@ static void handleApiModFwProbe() {
   if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
   const int id = doc["id"] | -1;
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
-  uint8_t ver = 0, reason = 0, flags = 0; uint16_t img = 0; int held = 0;
-  if (!modfwProbe(id, &ver, &reason, &flags, &img, &held)) {
+  uint8_t ver = 0, reason = 0, flags = 0, board = 0; uint16_t img = 0; int held = 0;
+  if (!modfwProbe(id, &ver, &reason, &flags, &img, &held, &board)) {
     char buf[160];
     snprintf(buf, sizeof(buf),
       "{\"ok\":true,\"id\":%d,\"inBootloader\":false,\"note\":\"no answer: the module is running its firmware, or has no bootloader\"}", id);
     server.send(200, "application/json", buf);
     return;
   }
-  char buf[220];
+  char buf[250];
   snprintf(buf, sizeof(buf),
-    "{\"ok\":true,\"id\":%d,\"inBootloader\":true,\"bootloader\":%d,\"reason\":%d,\"flags\":%d,"
-    "\"imageCrc\":\"%04X\",\"pagesHeld\":%d,\"pagesNeeded\":%d}",
-    id, ver, reason, flags, img, held, MODFW_PAGES);
+    "{\"ok\":true,\"id\":%d,\"inBootloader\":true,\"bootloader\":%d,\"board\":%d,\"reason\":%d,"
+    "\"flags\":%d,\"imageCrc\":\"%04X\",\"pagesHeld\":%d,\"pagesNeeded\":%d}",
+    id, ver, board ? board : MODFW_BOARD_DEFAULT, reason, flags, img, held, MODFW_PAGES);
   server.send(200, "application/json", buf);
 }
 

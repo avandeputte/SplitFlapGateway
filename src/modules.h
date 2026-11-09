@@ -16,6 +16,12 @@ struct SFModule {
   int      flapIndex;        // last known flap index (-1 = unknown)
   char     flapChar;         // last known displayed char (0 = unknown)
   char     fwVersion[8];     // firmware version string
+  // The DRIVER BOARD this module is built on, from the tail of a 'v' reply (module firmware
+  // v36+): 4 is Adam's board, 5 the one whose RS-485 transceiver sits on the hardware USART.
+  // 0 means not known -- firmware older than v36 does not say, and every such module is a v4
+  // by construction, since the v5 board has no image before v36. Persisted: only a 'v' reply
+  // carries it, and the 'A' dump the registry otherwise lives on does not.
+  uint8_t  board;            // 4, 5, ... or 0 = not known
   unsigned long lastSeen;    // millis() of last activity (resets on reboot)
   unsigned long lastSeenEpoch; // RTC wall-clock epoch of last activity (survives reboot)
   // Quiet Time: the display the host last requested while quiet (not yet shown).
@@ -89,6 +95,7 @@ struct PersistedModule {
   // 45-module wall, and it changes only when someone deliberately changes it ('N').
   int16_t       flapCount;                    // -99 = not known
   char          flapChars[SF_MAX_FLAPS + 1];  // "" = not known
+  uint8_t       board;                        // driver board (4, 5, ...), 0 = not known
 };
 
 struct ModulesFileHeader {

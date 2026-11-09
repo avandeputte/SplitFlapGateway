@@ -576,3 +576,34 @@ A rename is then `MDNS.end()` plus that function, and it is on the wire in under
 The general lesson is about verification, not about this library: a setter that validates
 nothing and returns `*this` for chaining can only be confirmed by looking at what it was
 supposed to change -- here, the multicast traffic, not the gateway's own idea of its name.
+
+## A reply that got longer: the v5 bootloader's status frame (v4.3)
+
+Module firmware v36 brought a second driver board, and with it two replies that grew a field.
+One was handled by a parser that already tolerated a tail (`v` splits on `:` and ignores what
+it does not know). The other was not:
+
+```c
+if (n != 41) return;        // a bootloader status frame is 41 bytes
+```
+
+The v5 board's bootloader is version 2 and appends the board after the page bitmap, so its
+status frame is 42. The gateway dropped it on the length check — before the CRC, which was
+perfectly good — and a module that had answered was indistinguishable from one that never did.
+Every bus update of a v5 module therefore failed inside a second with "no module answered in
+its bootloader", which reads like a dead module rather than a protocol mismatch.
+
+Two things worth keeping from it:
+
+- **An exact-length check is a version check in disguise.** The frame carries its own CRC, so
+  the length was never what made it trustworthy. `n != 41 && n != 42` is the fix; the shape to
+  prefer is "at least the fields I need, and the CRC decides", which is what the `m`-protocol
+  parsers already do.
+- **The symptom pointed away from the cause.** The module was in its bootloader, answering, and
+  the bus monitor showed its reply going past — the frame is in the ring either way, since the
+  monitor records what arrives and this parser runs after it. Reading the trace rather than the
+  error message is what found it; the error message was about the gateway's own expectations.
+
+The board itself is checked twice before an image is sent: once from the registry, which is how
+the targets are chosen, and again from the bootloader's own status frame, which is the
+authority — a registry entry can be hours old, and the module in front of you cannot be.

@@ -62,12 +62,25 @@ void otaInit() {
   // they would fight over an MQTT client id, so the second one gets renamed in Settings. The
   // board id is still what makes the MQTT client id unique -- see boardId24() in common.h.
 
+  // An espota / Arduino IDE push gets the same quiet as a browser upload. It did not, and on a
+  // busy wall that showed: the supervisor in main.cpp skips its stall detection while
+  // gOtaInProgress is set, MQTT keeps its buffers, and the station keeps dropping into modem
+  // sleep -- so an upload that outran the flash write tripped the task watchdog and rebooted the
+  // board mid-image. The browser path has quiesced like this since 3.12; this is the same thing
+  // for the other door.
   ArduinoOTA.onStart([]() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
-    printf("[OTA] Starting %s update\n", type.c_str());
+    printf("[OTA] Starting %s update (heap=%u)\n", type.c_str(), ESP.getFreeHeap());
+    gOtaInProgress = true;
+    if (mqtt.connected()) { mqtt.disconnect(); printf("[OTA] MQTT paused during upload\n"); }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSetApActive(false);
+      WiFi.setSleep(false);
+    }
   });
   ArduinoOTA.onEnd([]() {
     printf("[OTA] Update complete -- rebooting\n");
+    // gOtaInProgress stays set: the board restarts into the new image in a moment.
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     static uint8_t lastPct = 255;
@@ -84,7 +97,9 @@ void otaInit() {
     else if (error == OTA_CONNECT_ERROR) msg = "Connect failed";
     else if (error == OTA_RECEIVE_ERROR) msg = "Receive failed";
     else if (error == OTA_END_ERROR)     msg = "End failed";
-    printf("[OTA] Error: %s\n", msg);
+    printf("[OTA] Error: %s (heap=%u, low-water %u)\n", msg, ESP.getFreeHeap(), ESP.getMinFreeHeap());
+    gOtaInProgress = false;        // the board stays up on its current image
+    otaRestoreWifi();
   });
 
   // mDNS is ours to manage (see otaStartMdns), so ArduinoOTA only listens on its UDP port.

@@ -1958,8 +1958,9 @@ paths:
       summary: Ask one module's bootloader how it is doing (v4.0)
       description: >
         A module running its firmware does not answer, which is itself the answer. One in
-        update mode reports the bootloader version, why it is there, which image it holds and
-        how many of its 240 pages.
+        update mode reports the bootloader version, why it is there, which image it holds, how
+        many of its 240 pages, and (v4.3) its driver board -- 4, or 5 from the v5 board's
+        bootloader, which is version 2 and says so in a status frame one byte longer.
       requestBody:
         required: true
         content:
@@ -2605,6 +2606,7 @@ components:
         updated:       { type: integer, description: "Modules now running the new firmware" }
         elapsed:       { type: integer, description: "ms" }
         error:         { type: string }
+        skippedBoard:  { type: integer, description: "Modules left out of this run because they are a different driver board from the image (v4.3)", example: 3 }
         image:
           type: object
           properties:
@@ -2612,6 +2614,8 @@ components:
             bytes:  { type: integer, example: 15360 }
             crc:    { type: string, example: "6E1C" }
             valid:  { type: boolean }
+            version: { type: integer, description: "The firmware version the image holds, 0 when it cannot be told", example: 36 }
+            board:  { type: integer, description: "The driver board the image is for (v4.3): 4 or 5. An image built before module firmware v36 is untagged and reports 4 -- there was no other board then", example: 5 }
             pages:  { type: integer, example: 240 }
         modules:
           type: array
@@ -2619,6 +2623,7 @@ components:
             type: object
             properties:
               id:           { type: integer }
+              board:        { type: integer, description: "The module's driver board as this run understands it (v4.3): reported by the module, or 4 for one that does not report a board" }
               from:         { type: integer, description: "The version it ran when the run started" }
               to:           { type: integer, description: "What it reports afterwards; 0 = not back yet" }
               inBootloader: { type: boolean }
@@ -2699,6 +2704,7 @@ components:
         flapIndex:   { type: integer, description: "Last known flap index (-1 = unknown)", example: 1 }
         flapChar:    { type: string,  description: "Last known displayed character -- what the flap SHOWS: a symbol flap as its symbol (v4.1), the double-quote flap as '\"', colour flaps as their letters", example: "A" }
         fwVersion:   { type: string,  description: "Firmware version string (empty for legacy v7-or-earlier modules, which do not answer the version command)", example: "12" }
+        board:       { type: integer, description: "The module's driver board (v4.3): 4, or 5 for the board whose RS-485 transceiver is on the hardware USART. 0 means it has not said -- only module firmware v36 and later reports it, in the tail of a version reply, and every module that does not is a v4", example: 5 }
         lastSeen:    { type: integer, description: "millis() of last activity (0 if not seen since boot; restored entries start at 0)", example: 45000 }
         lastSeenEpoch: { type: integer, description: "RTC wall-clock epoch (seconds) of last activity; survives reboot. 0 if the RTC clock has never been set.", example: 1781210380 }
         acked:       { type: boolean, description: "true once the module acknowledged provisioning (an acked module is, by definition, not legacy)", example: true }

@@ -11,7 +11,8 @@
 // ---- file-private forward declarations ----
 static SFModule* sfFindBySN(const char* sn);
 static SFModule* sfUpsert(uint8_t id, const char* sn);
-static bool sfApplyVersionFields(uint8_t id, const char* fwCopy, const char* sn);
+static bool sfApplyVersionFields(uint8_t id, const char* fwCopy, const char* sn,
+                                 uint8_t board = 0);
 static bool sfDedupeBySNLocked(const char* sn);
 static bool sfNoteCorruptVersionReply(uint8_t id);
 static bool sfValidSN(const char* sn);
@@ -181,6 +182,7 @@ void sfModulesSave() {
     recs[n].acked         = m.acked;
     strlcpy(recs[n].fwVersion, m.fwVersion, sizeof(recs[n].fwVersion));
     recs[n].lastSeenEpoch = m.lastSeenEpoch;
+    recs[n].board         = m.board;
     recs[n].flapCount     = m.flapCount;
     strlcpy(recs[n].flapChars, m.flapChars, sizeof(recs[n].flapChars));
     n++;
@@ -252,6 +254,7 @@ void sfModulesLoad() {
     m->provisioned   = recs[i].provisioned;
     m->acked         = recs[i].acked;
     strlcpy(m->fwVersion, recs[i].fwVersion, sizeof(m->fwVersion));
+    m->board         = recs[i].board;   // only a 'v' reply carries it; keep it across boots
     m->flapCount = recs[i].flapCount;                                  // ~90 s of bus time,
     strlcpy(m->flapChars, recs[i].flapChars, sizeof(m->flapChars));    // not re-read at boot
     m->lastSeenEpoch = recs[i].lastSeenEpoch;
@@ -290,21 +293,53 @@ void sfModulesClear() {
 // Version queries are sent OUTSIDE sfMutex (rs485Send re-takes the lock via
 // frame tracking, so probing under it would deadlock): IDs to probe are
 // collected under the lock, then queried after release.
-// Periodic RE-QUERY of quiet modules (v3.12: this used to be a prune). A module not
-// heard from in MODULE_STALE_SECS gets a bare version query so its record (firmware,
-// serial, last-seen) stays current and a swapped or re-flashed module is noticed. It is
-// NEVER removed for not answering: the registry is permanent, and only Identify All,
-// De-provision or a corrupt record takes an entry out. After MODULE_PROBE_MAX_TRIES
-// unanswered queries the module is left alone for MODULE_REPROBE_BACKOFF_MS, then asked
-// again. A reply (any frame -> sfTouch) clears the probe state.
+// Two jobs, once a minute.
+//
+// PROVISIONED modules are RE-QUERIED, never removed (v3.12: this used to be a prune). One not
+// heard from in MODULE_STALE_SECS gets a bare version query so its record (firmware, serial,
+// last-seen) stays current and a swapped or re-flashed module is noticed. It is NEVER removed
+// for not answering: the registry is permanent, and only Identify All, De-provision or a
+// corrupt record takes an entry out. After MODULE_PROBE_MAX_TRIES unanswered queries the
+// module is left alone for MODULE_REPROBE_BACKOFF_MS, then asked again. A reply (any frame ->
+// sfTouch) clears the probe state.
+//
+// UNPROVISIONED modules are DROPPED after UNPROV_STALE_MS of not advertising. They are the
+// opposite case: they announce themselves unprompted every 10-15 s, so silence is evidence
+// rather than the absence of it.
 void sfModulesPruneStale() {
   unsigned long nowEp = rtcEpochNow();
-  if (!nowEp) return;  // no valid clock yet
   unsigned long nowMs = millis();
   static uint8_t toProbe[MAX_MODULES];
   int probeN = 0;
 
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+
+  // Unprovisioned modules first, and they are the one kind that CAN be dropped for going
+  // quiet: an advertising module speaks every 10-15 s on its own, so silence means it is no
+  // longer there. (A provisioned module only speaks when addressed, which is why the registry
+  // keeps those for ever and re-queries them instead.) Dropping them keeps the Modules tab
+  // honest -- a module that was provisioned from another gateway, or simply unplugged, used to
+  // sit in the list as a card for something that no longer exists.
+  for (int i = sfModuleCount - 1; i >= 0; i--) {
+    SFModule& m = sfModules[i];
+    if (m.provisioned && m.id != 255) continue;
+    // lastSeen is millis() of the last frame from it, 0 if it has not been heard THIS boot (a
+    // restored record, or one just created). Either way the clock starts now and runs out in
+    // UNPROV_STALE_MS.
+    if (m.lastSeen == 0) { m.lastSeen = nowMs; continue; }
+    if (nowMs - m.lastSeen < UNPROV_STALE_MS) continue;
+    DBG("[MOD] unprovisioned %s has not advertised in %lu s -- dropped\n",
+        m.serialNum[0] ? m.serialNum : "(no serial)", (nowMs - m.lastSeen) / 1000UL);
+    for (int j = i; j < sfModuleCount - 1; j++) sfModules[j] = sfModules[j + 1];
+    sfModuleCount--;
+    memset(&sfModules[sfModuleCount], 0, sizeof(SFModule));
+    sfModulesDirty = true;
+  }
+
+  // The re-query half needs a wall clock (last-seen is kept in RTC epoch so it survives a
+  // reboot); the sweep above does not, and runs whether or not the clock has been set.
+  if (!nowEp) { if (sfMutex) xSemaphoreGive(sfMutex); return; }
+
   for (int i = 0; i < sfModuleCount; i++) {
     SFModule& m = sfModules[i];
     if (!m.provisioned || m.id == 255) continue;   // an advertising module has no id to query
@@ -1540,13 +1575,18 @@ static bool sfValidSN(const char* sn) {
 // only the firmware is updated. The entry is re-found by id under sfMutex (the
 // upsert pointer can be invalidated by concurrent compaction), and any other
 // entry holding the same serial is collapsed so a serial maps to one record.
-static bool sfApplyVersionFields(uint8_t id, const char* fwCopy, const char* sn) {
+// `board` is the driver board from a 'v' reply's tail, or 0 when the reply did not carry one
+// -- which is every reply from firmware older than v36, and every 'A' dump whatever the
+// firmware. 0 therefore means "this reply says nothing about the board", NOT "no board": a
+// known board is kept rather than cleared, so an 'A' dump never erases what a 'v' reply found.
+static bool sfApplyVersionFields(uint8_t id, const char* fwCopy, const char* sn, uint8_t board) {
   if (sn && sn[0] && !sfValidSN(sn)) return false;
   xSemaphoreTake(sfMutex, portMAX_DELAY);
   SFModule* mm = sfFindById(id);
   if (mm) {
     if (strcmp(mm->fwVersion, fwCopy) != 0) sfModulesDirty = true;  // persist new fw
     strlcpy(mm->fwVersion, fwCopy, sizeof(mm->fwVersion));
+    if (board && mm->board != board) { mm->board = board; sfModulesDirty = true; }
     // A clean version/all reply parsed for this ID -> the duplicate-ID suspicion
     // (if any) is resolved; reset the heuristic.
     mm->dupRejectCount = 0;
@@ -1719,27 +1759,35 @@ void sfParseResponse(const uint8_t* data, size_t len) {
   if (!m) return;
   char cmd = *p++;
 
-  // Version response: m<id>v:<version>:<moduleId>:<serialNumber>
-  // Legacy format m<id>v:<version> also accepted.
+  // Version response: m<id>v:<version>:<moduleId>:<serialNumber>:<board>
+  // <board> is the driver board (4 or 5), APPENDED in module firmware v36 -- an older module
+  // ends at the serial number, and the field is simply absent. Legacy m<id>v:<version> also
+  // accepted.
   if (cmd == 'v' && *p == ':') {
     char verBuf[64];
     strlcpy(verBuf, p + 1, sizeof(verBuf));
     // Strip trailing whitespace/newlines
     for (int k = (int)strlen(verBuf)-1; k >= 0 && (verBuf[k] == '\n' || verBuf[k] == '\r' || verBuf[k] == ' '); k--)
       verBuf[k] = '\0';
-    // Split into up to 3 fields on ':'
-    char* field[3] = {nullptr, nullptr, nullptr};
+    // Split into up to 4 fields on ':'
+    char* field[4] = {nullptr, nullptr, nullptr, nullptr};
     field[0] = verBuf;
     int fi = 1;
-    for (char* cp = verBuf; *cp && fi < 3; cp++) {
+    for (char* cp = verBuf; *cp && fi < 4; cp++) {
       if (*cp == ':') { *cp = '\0'; field[fi++] = cp + 1; }
     }
     int reportedId = (field[1] && field[1][0]) ? atoi(field[1]) : -1;
     char fwCopy[8] = "?";
     if (field[0] && field[0][0]) strlcpy(fwCopy, field[0], sizeof(fwCopy));
+    // One digit, and nothing else: a garbled tail leaves the board unknown rather than
+    // inventing a board number. Not range-checked against {4,5} on purpose -- a later board
+    // should show up in the dashboard without the gateway needing to learn about it first.
+    uint8_t board = 0;
+    if (field[3] && field[3][0] >= '1' && field[3][0] <= '9' && field[3][1] == '\0')
+      board = (uint8_t)(field[3][0] - '0');
     // Validate + write fwVersion/serial under the lock (re-finds the entry by id,
     // collapses any duplicate-serial record). A corrupt SN rejects the frame.
-    if (!sfApplyVersionFields((uint8_t)id, fwCopy, field[2])) {
+    if (!sfApplyVersionFields((uint8_t)id, fwCopy, field[2], board)) {
       DBG("[SF] rejecting corrupt version response for module %d (sn:%s)\n",
           id, field[2] ? field[2] : "");
       sfParseRejects++;

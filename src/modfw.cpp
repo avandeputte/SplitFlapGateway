@@ -15,6 +15,7 @@ static struct {
   uint8_t version, reason, flags;
   uint16_t imageCrc;
   uint8_t  pages[32];
+  uint8_t  board;          // from a version-2 status frame; 0 = the bootloader did not say
 } gBootSt;
 
 void modfwInit() {
@@ -42,14 +43,18 @@ static void bootFrame(const uint8_t* data, size_t n) {
 }
 
 void modfwNoteReply(const uint8_t* data, size_t len) {
-  // '#' + 82 hex + '\n' for a 41-byte status frame; anything else is not for us.
+  // '#' + hex + '\n'. A status frame is 41 bytes from bootloader version 1, and 42 from
+  // version 2 -- the v5 board's bootloader, which appends the board it is running on. Reject
+  // the frame on its length alone and a v5 module looks exactly like a module that never
+  // answered, which is how this first showed up: the enter command went out, the module
+  // replied, and the update failed with "no module answered in its bootloader".
   if (len < 3 || data[0] != '#') return;
   size_t hexLen = len - 1;
   while (hexLen && (data[hexLen] == '\n' || data[hexLen] == '\r')) hexLen--;
   if (hexLen % 2) return;
   const size_t n = hexLen / 2;
-  if (n != 41) return;
-  uint8_t d[41];
+  if (n != 41 && n != 42) return;
+  uint8_t d[42];
   for (size_t i = 0; i < n; i++) {
     char hi = (char)data[1 + i * 2], lo = (char)data[2 + i * 2];
     auto nib = [](char c) -> int {
@@ -70,6 +75,7 @@ void modfwNoteReply(const uint8_t* data, size_t len) {
   gBootSt.flags    = d[4];
   gBootSt.imageCrc = (uint16_t)((d[5] << 8) | d[6]);
   memcpy(gBootSt.pages, d + 7, 32);
+  gBootSt.board    = (n == 42) ? d[39] : 0;   // only the v5 bootloader says, and it says 5
   gBootSt.ts = millis();
 }
 
@@ -94,13 +100,14 @@ static bool bootStatus(uint8_t id, int tries = 3) {
 }
 
 bool modfwProbe(int id, uint8_t* version, uint8_t* reason, uint8_t* flags,
-                uint16_t* imageCrc, int* pagesHeld) {
+                uint16_t* imageCrc, int* pagesHeld, uint8_t* board) {
   if (id < 0 || id > 254) return false;
   if (!bootStatus((uint8_t)id, 2)) return false;
   if (version)  *version  = gBootSt.version;
   if (reason)   *reason   = gBootSt.reason;
   if (flags)    *flags    = gBootSt.flags;
   if (imageCrc) *imageCrc = gBootSt.imageCrc;
+  if (board)    *board    = gBootSt.board;
   if (pagesHeld) {
     int held = 0;
     for (int p = MODFW_FIRST_PAGE; p <= MODFW_LAST_PAGE; p++)
@@ -181,21 +188,40 @@ int modfwImageVersion(const char* path) {
 // Cached, because a status poll every two seconds should not re-read and re-CRC 15 KB of flash
 // while an update's timing is being measured in milliseconds.
 static struct { bool known = false, exists = false, valid = false;
-                size_t bytes = 0; uint16_t crc = 0; int version = 0; } gImg;
+                size_t bytes = 0; uint16_t crc = 0; int version = 0; int board = 0; } gImg;
+
+// The board the stored image is for, from the tag at MODFW_BOARD_AT. An image from before the
+// tag existed reads 0xFF there and is a v4 image by construction: the v5 board's first firmware
+// is v36, which is also the first to carry the tag.
+static int imageBoard(const char* path) {
+  if (!sfFsReady || !FFat.exists(path)) return 0;
+  File f = FFat.open(path, "r");
+  if (!f) return 0;
+  int b = 0;
+  if (f.size() == MODFW_IMAGE_BYTES && f.seek(MODFW_BOARD_AT)) {
+    const int c = f.read();
+    b = (c >= 1 && c <= 9) ? c : MODFW_BOARD_DEFAULT;     // 0xFF (untagged) -> v4
+  }
+  f.close();
+  return b;
+}
 
 void modfwImageForget() { gImg.known = false; }
 
-bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version) {
+bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version, int* board) {
   if (!gImg.known) {
     gImg.known = true;
     gImg.exists = (sfFsReady && FFat.exists(MODFW_FILE));
-    gImg.bytes = 0; gImg.crc = 0; gImg.valid = false; gImg.version = 0;
+    gImg.bytes = 0; gImg.crc = 0; gImg.valid = false; gImg.version = 0; gImg.board = 0;
     if (gImg.exists) {
       File f = FFat.open(MODFW_FILE, "r");
       if (f) { gImg.bytes = f.size(); f.close(); }
       char err[72];
       gImg.valid = modfwValidateFile(MODFW_FILE, &gImg.crc, err, sizeof(err));
-      if (gImg.valid) gImg.version = modfwImageVersion(MODFW_FILE);
+      if (gImg.valid) {
+        gImg.version = modfwImageVersion(MODFW_FILE);
+        gImg.board   = imageBoard(MODFW_FILE);
+      }
     }
   }
   if (!gImg.exists) return false;
@@ -203,6 +229,7 @@ bool modfwImageInfo(size_t* bytes, uint16_t* crc, bool* valid, int* version) {
   if (crc)     *crc     = gImg.crc;
   if (valid)   *valid   = gImg.valid;
   if (version) *version = gImg.version;
+  if (board)   *board   = gImg.board;
   return true;
 }
 
@@ -273,7 +300,24 @@ static void taskModFw(void* pv) {
     busHold("modupdate", BUS_EXCLUSIVE, 180000UL);
     ModFwTarget& t = gModFw.list[i];
     t.inBootloader = bootStatus(t.id);
-    if (t.inBootloader) { ready++; traceNote("# module %d: bootloader v%d, reason %d", t.id, gBootSt.version, gBootSt.reason); }
+    if (t.inBootloader) {
+      // The bootloader's own account of which board it is on (version 2 and later; an older
+      // one does not say, and is a v4). This is the authority -- the registry's answer came
+      // from a version reply that may be hours old -- so a module that contradicts the image
+      // here is dropped before a single page goes to it.
+      const uint8_t blBoard = gBootSt.board ? gBootSt.board : (uint8_t)MODFW_BOARD_DEFAULT;
+      if (gModFw.imageBoard && blBoard != gModFw.imageBoard) {
+        t.inBootloader = false;
+        t.board = blBoard;
+        traceNote("! module %d is a board v%d and this image is for v%d -- left alone",
+                  t.id, blBoard, gModFw.imageBoard);
+        continue;
+      }
+      t.board = blBoard;
+      ready++;
+      traceNote("# module %d: bootloader v%d, board v%d, reason %d",
+                t.id, gBootSt.version, blBoard, gBootSt.reason);
+    }
     else                  traceNote("! module %d did not answer in its bootloader", t.id);
     if (gModFw.cancel) finish(MODFW_CANCELLED, "cancelled");
   }
@@ -395,9 +439,15 @@ bool modfwStart(const int* ids, int n, char* err, size_t errLen) {
   if (!gModFw.list) { strlcpy(err, "out of memory", errLen); return false; }
   if (!loadImage(err, errLen)) return false;
 
+  // Which board this image is for. An image only runs on its own board: on the wrong one the
+  // firmware sees the strap, leaves the bus pins alone and goes back to its bootloader, where it
+  // waits for a right image. Recoverable over the bus, but it takes the module off the wall for
+  // the length of another update, so the gateway does not do it on purpose.
+  const int imgBoard = imageBoard(MODFW_FILE);
+
   // Only modules that report the bootloader's firmware. Anything older would ignore the enter
   // command and never answer a status request, and there is no point sending it 15 KB.
-  int count = 0;
+  int count = 0, wrongBoard = 0, firstWrongId = -1, firstWrongBoard = 0;
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
   for (int i = 0; i < sfModuleCount && count < MAX_MODULES; i++) {
     const SFModule& m = sfModules[i];
@@ -408,17 +458,40 @@ bool modfwStart(const int* ids, int n, char* err, size_t errLen) {
     for (int k = 0; k < n && !wanted; k++) if (ids[k] == (int)m.id) wanted = true;
     if (!wanted) continue;
     if (fw < MODULE_FW_BOOTLOADER) continue;
+    // What board this module is. A module that REPORTS one is taken at its word; one that does
+    // not is a v4, and that is a construction rather than a guess: every image a v5 board can
+    // run says so, because the v5 board's first firmware is the one that added the field. The
+    // failure this protects is asymmetric -- treating a silent module as a v4 costs at worst a
+    // skipped update, visible in the status, while treating it as a v5 sends an image its board
+    // cannot run and drops it into its bootloader until the right one arrives.
+    const int board = m.board ? m.board : MODFW_BOARD_DEFAULT;
+    if (imgBoard && board != imgBoard) {
+      if (firstWrongId < 0) { firstWrongId = m.id; firstWrongBoard = board; }
+      wrongBoard++;
+      continue;
+    }
     ModFwTarget& t = gModFw.list[count++];
-    t.id = m.id; t.fwBefore = (uint8_t)fw; t.fwAfter = 0;
+    t.id = m.id; t.board = (uint8_t)board; t.fwBefore = (uint8_t)fw; t.fwAfter = 0;
     t.pagesLeft = MODFW_PAGES; t.inBootloader = false; t.complete = false;
     memset(t.pages, 0, sizeof(t.pages));
   }
   if (sfMutex) xSemaphoreGive(sfMutex);
+  if (!count && wrongBoard) {
+    snprintf(err, errLen, "this image is for board v%d; %s v%d. Upload the v%d image",
+             imgBoard, wrongBoard == 1 ? "that module is a" : "those modules are a",
+             firstWrongBoard, firstWrongBoard);
+    return false;
+  }
   if (!count) {
     snprintf(err, errLen, "no module runs firmware v%d or later, so none has a bootloader",
              MODULE_FW_BOOTLOADER);
     return false;
   }
+  if (wrongBoard)
+    printf("[MODFW] skipping %d module(s) built on another board (image is for v%d)\n",
+           wrongBoard, imgBoard);
+  gModFw.skippedBoard = (uint8_t)(wrongBoard > 255 ? 255 : wrongBoard);
+  gModFw.imageBoard   = (uint8_t)imgBoard;
   gModFw.targets = count; gModFw.pass = 0; gModFw.pagesSent = 0; gModFw.pagesThisPass = 0;
   gModFw.ok = 0; gModFw.cancel = false; gModFw.err[0] = 0;
   gModFw.startedMs = millis(); gModFw.elapsedMs = 0;
@@ -452,28 +525,29 @@ static const char* phaseName() {
 }
 
 void modfwStatusEmit(void (*emit)(const char* chunk)) {
-  size_t bytes = 0; uint16_t crc = 0; bool valid = false; int version = 0;
-  const bool have = modfwImageInfo(&bytes, &crc, &valid, &version);
-  char out[360];
+  size_t bytes = 0; uint16_t crc = 0; bool valid = false; int version = 0, board = 0;
+  const bool have = modfwImageInfo(&bytes, &crc, &valid, &version, &board);
+  char out[420];
   int n = snprintf(out, sizeof(out),
     "{\"ok\":true,\"state\":\"%s\",\"targets\":%d,\"pass\":%d,\"pagesSent\":%d,\"pagesThisPass\":%d,"
-    "\"updated\":%d,\"elapsed\":%lu,\"error\":\"%s\","
-    "\"image\":{\"stored\":%s,\"bytes\":%u,\"crc\":\"%04X\",\"valid\":%s,\"version\":%d,\"pages\":%d},\"modules\":[",
+    "\"updated\":%d,\"elapsed\":%lu,\"error\":\"%s\",\"skippedBoard\":%u,"
+    "\"image\":{\"stored\":%s,\"bytes\":%u,\"crc\":\"%04X\",\"valid\":%s,\"version\":%d,\"board\":%d,"
+    "\"pages\":%d},\"modules\":[",
     phaseName(), (int)gModFw.targets, (int)gModFw.pass, (int)gModFw.pagesSent,
     (int)gModFw.pagesThisPass, (int)gModFw.ok,
     (unsigned long)(gModFw.phase >= MODFW_DONE ? gModFw.elapsedMs
                                                : (gModFw.startedMs ? millis() - gModFw.startedMs : 0)),
-    gModFw.err, have ? "true" : "false", (unsigned)bytes, crc, valid ? "true" : "false",
-    version, MODFW_PAGES);
+    gModFw.err, (unsigned)gModFw.skippedBoard, have ? "true" : "false", (unsigned)bytes, crc,
+    valid ? "true" : "false", version, board, MODFW_PAGES);
   (void)n;
   emit(out);
   if (gModFw.list) {
     for (int i = 0; i < gModFw.targets; i++) {
       const ModFwTarget& t = gModFw.list[i];
-      char row[120];
+      char row[140];
       snprintf(row, sizeof(row),
-        "%s{\"id\":%d,\"from\":%d,\"to\":%d,\"inBootloader\":%s,\"pagesLeft\":%d}",
-        i ? "," : "", (int)t.id, (int)t.fwBefore, (int)t.fwAfter,
+        "%s{\"id\":%d,\"board\":%d,\"from\":%d,\"to\":%d,\"inBootloader\":%s,\"pagesLeft\":%d}",
+        i ? "," : "", (int)t.id, (int)t.board, (int)t.fwBefore, (int)t.fwAfter,
         t.inBootloader ? "true" : "false", (int)t.pagesLeft);
       emit(row);
     }
