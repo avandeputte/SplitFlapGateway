@@ -35,13 +35,30 @@ void rs485SendChecked(const char* frame) {
   size_t n = strlen(frame);
   while (n && (frame[n-1] == '\n' || frame[n-1] == '\r')) n--;   // the CRC covers the frame only
   if (!n || n + CRC_PREFIX_BYTES + 2 > TX_MAX_BYTES) return;
+  // The frame is built in ONE static buffer (it is up to 1 KB, and the callers are on small
+  // stacks), and this is called from taskWeb, taskNetwork, taskRS485 and every job task. The
+  // buffer used to be filled BEFORE rs485Send took the transmit lock, so two callers could
+  // overlap: the first, still waiting for a quiet bus, then sent the second's bytes under its
+  // own length. The lock is held from the first byte written to the last byte sent. Order is
+  // chkMutex -> txMutex, and nothing that holds txMutex ever comes back here.
   static uint8_t out[TX_MAX_BYTES];
+  static SemaphoreHandle_t chkMutex = NULL;
+  static portMUX_TYPE      chkInit  = portMUX_INITIALIZER_UNLOCKED;
+  if (!chkMutex) {
+    SemaphoreHandle_t m = xSemaphoreCreateMutex();
+    portENTER_CRITICAL(&chkInit);
+    if (!chkMutex) { chkMutex = m; m = NULL; }
+    portEXIT_CRITICAL(&chkInit);
+    if (m) vSemaphoreDelete(m);                      // lost the race to create it
+  }
+  if (chkMutex) xSemaphoreTake(chkMutex, portMAX_DELAY);
   const uint16_t crc = sfCrc16((const uint8_t*)frame, n);
   int w = snprintf((char*)out, sizeof(out), "~%04X", crc);
   memcpy(out + w, frame, n);
   w += (int)n;
   out[w++] = '\n';                                   // always terminated, by the format's rule
   rs485Send(out, (size_t)w, true);                   // raw: the framing is ours, not the normalizer's
+  if (chkMutex) xSemaphoreGive(chkMutex);
 }
 
 void* psramAlloc(const char* name, size_t bytes) {
@@ -72,6 +89,20 @@ void psramAllocInit() {
 // Enqueue one frame for paced delivery at dueMs. SPSC ring: taskWeb is the only producer,
 // taskRS485 the only consumer, guarded by txQMutex (never held across the actual rs485Send,
 // which takes txMutex -- txMutex is never nested under txQMutex).
+static uint32_t txQLastDue = 0;          // due time of the newest queued frame (under txQMutex)
+
+uint32_t rs485PaceStart(uint32_t stepMs) {
+  uint32_t due = millis();
+  if (!txQueue || !txQMutex) return due;
+  if (xSemaphoreTake(txQMutex, pdMS_TO_TICKS(10)) != pdTRUE) return due;
+  if (txQTail != txQHead) {                              // frames still waiting: queue behind them
+    const uint32_t after = txQLastDue + stepMs;
+    if ((int32_t)(after - due) > 0) due = after;
+  }
+  xSemaphoreGive(txQMutex);
+  return due;
+}
+
 bool rs485SendScheduled(const uint8_t* data, size_t len, uint32_t dueMs) {
   if (!txQueue || !txQMutex) return false;
   if (len == 0 || len > TXQ_FRAME_MAX) return false;   // too long -> caller sends inline
@@ -83,6 +114,7 @@ bool rs485SendScheduled(const uint8_t* data, size_t len, uint32_t dueMs) {
     txQueue[txQHead].len   = (uint16_t)len;
     memcpy(txQueue[txQHead].data, data, len);
     txQHead = next;
+    txQLastDue = dueMs;
     ok = true;
   }
   xSemaphoreGive(txQMutex);
@@ -180,7 +212,13 @@ void ringDrain(void (*emit)(const char* chunk)) {
     first = false;
   }
   for (uint32_t k = 0; k < take; k++) {
-    const RS485Msg& m = msgRing[(cur + k) % MSG_RING_SIZE];
+    // Copied out under the lock. Reading the slot in place raced the writer: when this reader
+    // has been lapped, the first row it wants is the very next one taskRS485 overwrites, and a
+    // row torn mid-copy (a length from one frame, bytes from another) broke that poll's JSON.
+    static RS485Msg m;                       // static: ~1.1 KB, single caller (taskWeb)
+    if (msgMutex) xSemaphoreTake(msgMutex, portMAX_DELAY);
+    m = msgRing[(cur + k) % MSG_RING_SIZE];
+    if (msgMutex) xSemaphoreGive(msgMutex);
     if (!first) RING_PUT(",");
     first = false;
     // JSON-safe UTF-8: escapes "/\, strips newlines, maps unprintable bytes to a space, and
@@ -556,10 +594,20 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
   // sfMutex/msgMutex -- order is txMutex -> {sfMutex,msgMutex}, never inverted.)
   if (txMutex) xSemaphoreTake(txMutex, portMAX_DELAY);
   {
+    // gLastRxMs is advanced by taskRS485's read loop -- which is not running if the sender
+    // IS taskRS485 (a scheduled frame, a deferred query), or if taskRS485 is parked behind
+    // txMutex waiting for us. In both cases the marker froze, the guard saw a "quiet" bus
+    // 12 ms later and transmitted into the middle of a module's 600-byte reply. So the wait
+    // watches the UART itself: bytes arriving while we stand here count as activity whoever
+    // is, or is not, reading them.
     unsigned long waitStart = millis();
+    int pending = rs485.available();
     while (millis() - gLastRxMs < TX_BUS_GUARD_MS &&
            millis() - waitStart < TX_BUS_WAIT_CAP_MS) {
       vTaskDelay(pdMS_TO_TICKS(2));
+      const int a = rs485.available();
+      if (a > pending) gLastRxMs = millis();
+      pending = a;
     }
   }
   rs485.write(data, bare);                                  // the bare command...

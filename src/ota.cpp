@@ -71,12 +71,10 @@ void otaInit() {
   ArduinoOTA.onStart([]() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
     printf("[OTA] Starting %s update (heap=%u)\n", type.c_str(), ESP.getFreeHeap());
+    gOtaProgressMs = millis() | 1;
     gOtaInProgress = true;
-    if (mqtt.connected()) { mqtt.disconnect(); printf("[OTA] MQTT paused during upload\n"); }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiSetApActive(false);
-      WiFi.setSleep(false);
-    }
+    if (gMqttUp) { gMqttDropReq = true; printf("[OTA] MQTT paused during upload\n"); }
+    if (WiFi.status() == WL_CONNECTED) wifiSetApActive(false);
   });
   ArduinoOTA.onEnd([]() {
     printf("[OTA] Update complete -- rebooting\n");
@@ -84,6 +82,7 @@ void otaInit() {
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     static uint8_t lastPct = 255;
+    gOtaProgressMs = millis() | 1;
     uint8_t pct = (uint8_t)(progress * 100 / total);
     if (pct != lastPct && pct % 10 == 0) {
       printf("[OTA] Progress: %u%%\n", pct);
@@ -240,12 +239,11 @@ static char otaFailMsg[192] = "";
 // Whether the first chunk's header has been checked yet (see the app-descriptor test below).
 static bool otaHeaderSeen = false;
 
-// Restore normal WiFi after a failed/aborted OTA. During an upload we force
-// modem sleep off and (if it was up) the AP down to free RAM; afterwards we
-// reconcile to the correct state: AP stays down while the station is connected,
-// and comes back as a fallback only if the station is not connected.
+// Restore normal WiFi after a failed/aborted OTA. During an upload the AP is taken down
+// (if it was up) to free RAM; afterwards we reconcile to the correct state: AP stays down
+// while the station is connected, and comes back as a fallback only if it is not. (Modem
+// sleep used to be toggled here too. It is off permanently now -- see setup().)
 static void otaRestoreWifi() {
-  WiFi.setSleep(true);
   // AP is a fallback: bring it back only if the station is not connected.
   bool staUp = (WiFi.status() == WL_CONNECTED);
   wifiSetApActive(!staUp);
@@ -275,20 +273,20 @@ void handleOTAUpload() {
     // upload needs. gOtaInProgress also makes the network task skip its periodic
     // status/display/discovery publishes. This addresses mid-upload connection
     // drops seen under heap fragmentation (esp. with Home Assistant enabled).
+    gOtaProgressMs = millis() | 1;
     gOtaInProgress = true;
-    if (mqtt.connected()) { mqtt.disconnect(); printf("[OTA] MQTT paused during upload\n"); }
+    if (gMqttUp) { gMqttDropReq = true; printf("[OTA] MQTT paused during upload\n"); }
     // Free internal RAM for the transfer. A large firmware streams in faster than
     // flash can absorb it, so WiFi/lwIP receive buffers pile up; on this already
     // heap-constrained, fragmented gateway that can exhaust the heap mid-upload
-    // (observed min-free-heap dropping to ~512 bytes -> connection reset). Two
-    // levers help: (a) drop the SoftAP so its interface buffers/housekeeping are
-    // released (only safe when the station is connected, else we'd lose access),
-    // and (b) disable modem sleep so the station drains the RX queue at full
-    // speed, reducing buffer buildup. Both are restored if the upload fails.
+    // (observed min-free-heap dropping to ~512 bytes -> connection reset). The
+    // lever here is to drop the SoftAP so its interface buffers/housekeeping are
+    // released (only safe when the station is connected, else we'd lose access);
+    // it is restored if the upload fails. (Modem sleep, the other lever, is off
+    // permanently since 4.4 -- see setup().)
     if (WiFi.status() == WL_CONNECTED) {
       wifiSetApActive(false);   // drop fallback AP if it happens to be up
-      WiFi.setSleep(false);
-      printf("[OTA] AP down + modem sleep off for upload (heap=%u)\n", ESP.getFreeHeap());
+      printf("[OTA] AP down for upload (heap=%u)\n", ESP.getFreeHeap());
     }
     // UPDATE_SIZE_UNKNOWN lets the Update library size the partition itself.
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
@@ -302,6 +300,7 @@ void handleOTAUpload() {
     // can't touch its watchdog from its loop -- feed it here on every chunk so a
     // large/slow upload can't trip the 30s web-stall reboot.
     wdgWebMs = millis();
+    gOtaProgressMs = wdgWebMs | 1;
 
     // Check the FIRST chunk before streaming 1.5 MB that cannot possibly work. An ESP32
     // application image carries the app descriptor's magic word at offset 0x20; a full-flash

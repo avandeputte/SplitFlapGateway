@@ -145,7 +145,7 @@ void rtcFormatTime(char* out, size_t outLen) {
   static const int cumDays[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
   long y = yr;
   long days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
-  days += cumDays[(mo - 1) % 12];
+  days += cumDays[(mo >= 1 && mo <= 12) ? mo - 1 : 0];   // a chip that reads month 0 must not index -1
   // Add leap day if past Feb in a leap year
   bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
   if (leap && mo > 2) days += 1;
@@ -170,7 +170,7 @@ unsigned long rtcEpochNow() {
   static const int cumDays[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
   long y = yr;
   long days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
-  days += cumDays[(mo - 1) % 12];
+  days += cumDays[(mo >= 1 && mo <= 12) ? mo - 1 : 0];   // a chip that reads month 0 must not index -1
   bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
   if (leap && mo > 2) days += 1;
   days += (dy - 1);

@@ -90,7 +90,7 @@ static bool bootStatus(uint8_t id, int tries = 3) {
     bootFrame(f, 2);
     const unsigned long deadline = millis() + MODFW_STATUS_WAIT_MS;
     while ((long)(millis() - deadline) < 0) {
-      wdgWebMs = millis();
+      wdgWebFeed();
       vTaskDelay(pdMS_TO_TICKS(10));
       if (gBootSt.ts) { gBootSt.waitId = -1; return true; }
     }
@@ -142,7 +142,7 @@ bool modfwValidateFile(const char* path, uint16_t* crcOut, char* err, size_t err
       for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
     }
     left -= take;
-    wdgWebMs = millis();
+    wdgWebFeed();
   }
   uint8_t tail[2] = {0, 0};
   f.read(tail, 2);
@@ -179,7 +179,7 @@ int modfwImageVersion(const char* path) {
       }
       digits = 0; value = 0; prevDigit = false;
     }
-    wdgWebMs = millis();
+    wdgWebFeed();
   }
   f.close();
   return (found == 1) ? version : 0;  // more than one candidate: say nothing rather than guess
@@ -424,6 +424,13 @@ static void taskModFw(void* pv) {
   gModFw.ok = good;
   finish(good == gModFw.targets ? MODFW_DONE : MODFW_FAILED,
          good == gModFw.targets ? "" : "not every module came back on the new firmware");
+}
+
+bool modfwRunning() {
+  return hTaskModFw ||
+         gModFw.phase == MODFW_ENTERING || gModFw.phase == MODFW_CONFIRMING ||
+         gModFw.phase == MODFW_SENDING  || gModFw.phase == MODFW_VERIFYING ||
+         gModFw.phase == MODFW_GOING    || gModFw.phase == MODFW_CHECKING;
 }
 
 bool modfwStart(const int* ids, int n, char* err, size_t errLen) {

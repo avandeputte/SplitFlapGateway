@@ -39,6 +39,7 @@
 #include "mqtt.h"
 #include "ota.h"
 #include "web.h"
+#include "perf.h"
 #include "tasks.h"
 
 #endif // SFGW_GATEWAY_H

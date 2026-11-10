@@ -81,6 +81,20 @@ void loadConfig() {
 }
 
 void saveConfig() {
+  // One saver at a time. taskWeb (any Settings change) and taskNetwork (the companion's URL)
+  // both land here on the SAME Preferences object: overlapped, the first one's prefs.end()
+  // closed the handle under the second, whose remaining put*() calls then failed silently --
+  // a setting that was accepted, answered {"ok":true}, and never stored.
+  static SemaphoreHandle_t saveMutex = NULL;
+  static portMUX_TYPE      saveInit  = portMUX_INITIALIZER_UNLOCKED;
+  if (!saveMutex) {
+    SemaphoreHandle_t m = xSemaphoreCreateMutex();
+    portENTER_CRITICAL(&saveInit);
+    if (!saveMutex) { saveMutex = m; m = NULL; }
+    portEXIT_CRITICAL(&saveInit);
+    if (m) vSemaphoreDelete(m);
+  }
+  if (saveMutex) xSemaphoreTake(saveMutex, portMAX_DELAY);
   prefs.begin("splitflap", false);
   prefs.putString("wSSID",  cfg.wifiSSID);
   prefs.putString("ntp",    cfg.ntpServer);
@@ -114,4 +128,5 @@ void saveConfig() {
   // v3.13
   prefs.putUChar ("stepMs",    cfg.stepMs);
   prefs.end();
+  if (saveMutex) xSemaphoreGive(saveMutex);
 }

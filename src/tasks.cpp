@@ -46,6 +46,7 @@ void taskRS485(void* pv) {
   }
 
   while (true) {
+    perfLoopTick(PERF_T_RS485);
     while (rs485.available()) {
       int b = rs485.read();
       if (b < 0) break;
@@ -90,7 +91,12 @@ void taskRS485(void* pv) {
         incidentLog(255, 'D', 0, (uint16_t)lineLen);   // which module it was, nobody can say
         if (traceActive()) {
           traceNote("! discarded %u bytes with no terminator", (unsigned)lineLen);
+          // Under msgMutex, like every other traceFrame() call (they all come through
+          // ringPush): the formatter has ONE line buffer, and a soak task transmitting on the
+          // other core at this moment used to garble exactly the line worth reading.
+          if (msgMutex) xSemaphoreTake(msgMutex, portMAX_DELAY);
           traceFrame('!', lineBuf, lineLen, lineLen);    // whole, not cut: these bytes ARE the evidence
+          if (msgMutex) xSemaphoreGive(msgMutex);
         }
         printf("[RX] discarded %u bytes with no terminator (frame too long or corrupt)\n",
                (unsigned)lineLen);
@@ -123,7 +129,12 @@ void taskRS485(void* pv) {
             printf("[RX] checksum failed on a %u-byte frame (wanted %04lX, got %04X)\n",
                    (unsigned)lineLen, want, got);
             incidentLog(fid >= 0 && fid < 255 ? (uint8_t)fid : 255, 'C', 0, (uint16_t)lineLen);
-            if (traceActive()) { traceNote("! checksum failed"); traceFrame('!', lineBuf, lineLen, lineLen); }
+            if (traceActive()) {
+              traceNote("! checksum failed");
+              if (msgMutex) xSemaphoreTake(msgMutex, portMAX_DELAY);
+              traceFrame('!', lineBuf, lineLen, lineLen);
+              if (msgMutex) xSemaphoreGive(msgMutex);
+            }
             // still logged to the monitor below, then dropped
           }
         }
@@ -224,6 +235,10 @@ void taskRS485(void* pv) {
       // Nor during a restore-on-boot run: its verify phase captures ANY dump reply, and a
       // trickle 'A' landing in that window would be read as the wrong module's EEPROM.
       if (!gOtaInProgress && !busBusy() && nowMs - lastFlapQ >= FLAPSET_QUERY_MS) {
+        // Stamped HERE, not only when a query goes out. On a wall whose reels are all known
+        // nothing is ever sent, so the stamp never moved and this block -- a lock and a walk
+        // of the whole registry -- ran on every 5 ms pass of the bus task, for ever.
+        lastFlapQ = nowMs;
         int askId = -1;
         if (sfMutex && xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           for (int i = 0; i < sfModuleCount; i++) {
@@ -329,6 +344,7 @@ static void quietScheduleTick() {
 // boot again. The schedule now ticks on taskNetwork (6 KB). (v3.13.1)
 void taskRTC(void* pv) {
   while (true) {
+    perfLoopTick(PERF_T_RTC);
     rtcRead();
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -337,6 +353,7 @@ void taskRTC(void* pv) {
 void taskWeb(void* pv) {
   unsigned long clientSince = 0;   // millis() when current client first seen
   while (true) {
+    perfLoopTick(PERF_T_WEB);
     wdgWebMs = millis();      // touch BEFORE handling (covers in-handler stalls)
     server.handleClient();
 
@@ -347,6 +364,10 @@ void taskWeb(void* pv) {
     // wedge handleClient() and stall the web task -> "Web=0" watchdog reboot.
     WiFiClient c = server.client();
     if (c && c.connected()) {
+      // A client that is connected after handleClient() returns has not sent its request (or
+      // has not gone away after its response): the server is held, serving nobody. Counted,
+      // because from outside this is indistinguishable from a slow handler.
+      perfNoteWait(5);
       if (clientSince == 0) clientSince = millis();
       else if (millis() - clientSince > 8000UL) {   // 8s hard cap per connection
         c.stop();                                    // force-close the stale socket
@@ -371,15 +392,17 @@ void taskWeb(void* pv) {
 
 bool          staWasUp    = false;
 unsigned long wifiRetryMs = 0;
+static unsigned long ntpTryMs = 0;       // millis() of the last NTP attempt
 
 void taskNetwork(void* pv) {
   // WiFi init done in setup() - this task only polls and reconnects
   while (true) {
+    perfLoopTick(PERF_T_NET);
     bool staUp = (WiFi.status() == WL_CONNECTED);
     if (staUp && !staWasUp) {
       staWasUp = true;
       wifiSetApActive(false);   // station is up -> drop the fallback AP
-      if (!ntpSynced) ntpSynced = rtcNTPSync();
+      if (!ntpSynced) { ntpSynced = rtcNTPSync(); ntpTryMs = millis(); }
       { IPAddress _a = WiFi.localIP();
   printf("[WiFi] Connected IP=%d.%d.%d.%d\n", _a[0],_a[1],_a[2],_a[3]); }
     } else if (!staUp && staWasUp) {
@@ -401,39 +424,110 @@ void taskNetwork(void* pv) {
       WiFi.disconnect();
       WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
     }
+    // NTP used to be tried exactly once per WiFi connection, so a time server that was
+    // unreachable at boot (router still starting, DNS not up yet) left the clock unsynced for
+    // the whole uptime, and changing the server in Settings set a flag nothing read. Now: at
+    // once when asked, and otherwise every 15 minutes until it succeeds -- not more often,
+    // because a wall on a network with no route to a time server pays the full timeout on
+    // this task for every attempt.
+    if (staUp && !gOtaInProgress &&
+        (gNtpResyncReq || (!ntpSynced && millis() - ntpTryMs > 900000UL))) {
+      gNtpResyncReq = false;
+      ntpTryMs  = millis();
+      ntpSynced = rtcNTPSync();
+    }
+    // Requests from other tasks to drop the MQTT session (common.h). Handled here, by the one
+    // task that owns the client, and before the OTA check below -- an update starting is the
+    // main reason to be asked.
+    if (gMqttDropReq || gMqttReconfigReq) {
+      const bool reconf = gMqttReconfigReq;
+      gMqttDropReq = false; gMqttReconfigReq = false;
+      mqtt.disconnect();
+      gMqttUp = false;
+      if (reconf) {
+        // PubSubClient caches the broker it was last told to dial, so a changed setting has
+        // to be handed to it again or the reconnect keeps dialling the old one.
+        if (strlen(cfg.mqttHost)) mqtt.setServer(cfg.mqttHost, cfg.mqttPort);
+        mqttFailCount = 0;                          // a fresh broker gets a fresh strike budget
+        mqttRetryMs   = millis() - 30001UL;         // and is dialled now, not in 30 s
+      }
+    }
     if (staUp && strlen(cfg.mqttHost) && !gOtaInProgress) {
-      if (!mqtt.connected() && millis() - mqttRetryMs > 30000UL) {
+      bool up = mqtt.connected();
+      if (!up && millis() - mqttRetryMs > 30000UL) {
         mqttRetryMs = millis();
         mqttConnect();
-        if (!mqtt.connected()) {
+        up = mqtt.connected();
+        if (!up) {
           mqttFailCount++;
-          // After 5 consecutive failures with WiFi "up", the TCP stack
-          // is likely wedged. Force a full WiFi reconnect to recover.
+          // Five consecutive failures USED to mean "the TCP stack is wedged: drop WiFi and
+          // rejoin". It usually means nothing of the kind -- the broker is down, Home
+          // Assistant is restarting, the password is wrong -- and the cure then took the
+          // whole gateway off the network every two and a half minutes for as long as the
+          // broker stayed away: the dashboard, the companion and the REST API all paid for
+          // a fault that was not theirs. So the rejoin now needs evidence that it is the
+          // stack: the failure was at the transport (never reached a broker at all), AND
+          // nobody has got a web request through in five minutes either, AND it was not
+          // already tried in the last half hour.
           if (mqttFailCount >= 5) {
-            printf("[MQTT] %d consecutive failures -- forcing WiFi reconnect\n",
-                   mqttFailCount);
             mqttFailCount = 0;
-            WiFi.disconnect(true);
-            delay(500);
-            WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
-            wifiRetryMs = millis();
+            const int  st        = mqtt.state();
+            const bool transport = (st == -2 || st == -4);      // connect failed / timed out
+            const bool webIdle   = perfSinceLastRequestMs() > 300000UL;
+            static unsigned long lastRejoinMs = 0;
+            if (transport && webIdle && (!lastRejoinMs || millis() - lastRejoinMs > 1800000UL)) {
+              lastRejoinMs = millis() | 1;
+              printf("[MQTT] broker unreachable and no web traffic for 5 min -- rejoining WiFi\n");
+              WiFi.disconnect(true);
+              delay(500);
+              WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
+              wifiRetryMs = millis();
+            } else {
+              printf("[MQTT] still failing (rc=%d) -- will keep retrying every 30 s\n", st);
+            }
           }
         } else {
           mqttFailCount = 0;
         }
       }
-      if (mqtt.connected()) {
+      gMqttUp = up;
+      if (up) {
         mqtt.loop();
-        // Drain the outbound queue -- all mqtt.publish calls happen here
-        if (mqttQMutex && mqttQueue && xSemaphoreTake(mqttQMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          while (mqttQTail != mqttQHead) {
-            MqttQItem& item = mqttQueue[mqttQTail];
-            mqtt.publish(item.topic, (uint8_t*)item.payload, item.len, false);
-            mqttQTail = (mqttQTail + 1) % MQTT_Q_SIZE;
+        // Drain the outbound queue -- all mqtt.publish calls happen here.
+        //
+        // One item at a time, copied out UNDER the lock and published AFTER releasing it.
+        // publish() is a socket write: on a slow link it blocks for as long as the TCP send
+        // buffer stays full, and this loop used to hold mqttQMutex across every one of them.
+        // Every producer -- taskRS485, on each frame it receives or sends -- then waited out
+        // its 10 ms try-lock and DROPPED the message, so a slow broker both stalled the bus
+        // task per frame and lost the frames it was stalling for. Same shape as
+        // rs485PollScheduled(): the lock guards the queue, never the I/O.
+        if (mqttQMutex && mqttQueue) {
+          static MqttQItem out;                       // static: ~1.1 KB, not on this stack
+          for (int n = 0; n < MQTT_Q_SIZE; n++) {     // bounded: one queue's worth per pass
+            bool have = false;
+            if (xSemaphoreTake(mqttQMutex, pdMS_TO_TICKS(10)) != pdTRUE) break;
+            if (mqttQTail != mqttQHead) {
+              const MqttQItem& item = mqttQueue[mqttQTail];
+              strlcpy(out.topic, item.topic, sizeof(out.topic));
+              memcpy(out.payload, item.payload, item.len);
+              out.len = item.len; out.retain = item.retain;
+              mqttQTail = (mqttQTail + 1) % MQTT_Q_SIZE;
+              have = true;
+            }
+            xSemaphoreGive(mqttQMutex);
+            if (!have) break;
+            // Each publish can block for as long as the socket takes to accept it (10 s if
+            // the broker has stopped reading), so this loop feeds the watchdog itself -- three
+            // slow ones in a row used to be a "network task stalled" reboot -- and stops at
+            // the first failure rather than queueing up behind a link that has gone.
+            wdgNetMs = millis();
+            if (!mqtt.publish(out.topic, (uint8_t*)out.payload, out.len, out.retain)) break;
           }
-          xSemaphoreGive(mqttQMutex);
         }
       }
+    } else {
+      gMqttUp = false;
     }
     if (!gOtaInProgress && millis() - lastStatusMs > STATUS_INTERVAL_MS) {
       lastStatusMs = millis();
@@ -468,9 +562,13 @@ void taskNetwork(void* pv) {
     if (sfModulesDirty && !gOtaInProgress) {
       if (sfModulesDirtyMs == 0) sfModulesDirtyMs = millis();
       if (millis() - sfModulesDirtyMs > MODULE_SAVE_DEBOUNCE_MS) {
-        sfModulesSave();
+        // Clear the flag BEFORE the write, not after it. The save is a flash write that takes
+        // a real fraction of a second, and it snapshots the registry at its start: a change
+        // made by another task while it runs used to be wiped out by the `= false` that
+        // followed, and then sat unsaved until something else happened to change.
         sfModulesDirty   = false;
         sfModulesDirtyMs = 0;
+        sfModulesSave();
       }
     }
     // Quiet-time schedule, every 5 s (prompt flip at a window boundary). Here and not on

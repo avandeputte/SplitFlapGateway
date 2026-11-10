@@ -132,14 +132,14 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "4.3.0"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "4.4.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
 // differences that matter (a fixed reel per module vs one shared reel; colours as flaps vs
 // colours as names) are exactly what capabilities describes.
 #define PRODUCT_NAME         "Split-Flap Gateway"
-#define API_VERSION          "3.2.0"
+#define API_VERSION          "3.3.0"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -410,6 +410,7 @@ extern volatile bool          gCompanionUrlDirty;
 extern volatile unsigned long gCompanionUrlDirtyMs;  // millis() of last companion post
 extern volatile bool gDisplayDirty;
 extern volatile bool gOtaInProgress;
+extern volatile unsigned long gOtaProgressMs;
 // Last flap byte transmitted to each module id (= grid cell, row-major). Lets the
 // display wall show EVERY cell that was written -- provisioned or not -- straight
 // from the frame stream, independent of the module registry. 0 = nothing sent.
@@ -422,6 +423,25 @@ extern volatile unsigned long gLastRxMs;
 extern volatile unsigned long wdgNetMs;
 extern volatile unsigned long wdgWebMs;
 extern TaskHandle_t hTaskRTC, hTaskRS485, hTaskOTA, hTaskWeb, hTaskNet;
+// Feed the web task's watchdog -- but only FROM the web task. The bus helpers that wait for a
+// reply are shared with the Soak, Probe, Restore and module-update tasks, and they used to
+// stamp wdgWebMs wherever they ran: a web task that wedged during an hour-long soak was being
+// vouched for every 10 ms by the soak, and the supervisor could not see it until the job ended.
+static inline void wdgWebFeed() {
+  if (xTaskGetCurrentTaskHandle() == hTaskWeb) wdgWebMs = millis();
+}
+// The MQTT session, as taskNetwork last saw it. EVERYTHING outside taskNetwork reads this and
+// not mqtt.connected(): PubSubClient::connected() is not a query -- it recv()s on the socket
+// and, if the link has dropped, stop()s the client, freeing its buffers in whatever task
+// asked. Asked from taskWeb (every status poll) or taskRS485 (every frame) while taskNetwork
+// is inside mqtt.loop() on the same socket, that is a use-after-free with a broker restart
+// as its trigger. One owner, one flag.
+extern volatile bool gMqttUp;
+// Requests TO the owner: drop the session (an update is starting), or drop it and re-read the
+// broker settings (they were just changed). taskNetwork acts on them within one pass.
+extern volatile bool gMqttDropReq, gMqttReconfigReq;
+// Set by Settings when the time server or zone changes: sync again now (taskNetwork).
+extern volatile bool gNtpResyncReq;
 extern bool ntpSynced;
 extern unsigned long staDownSince;
 

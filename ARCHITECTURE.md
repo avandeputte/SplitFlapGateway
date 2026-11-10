@@ -19,8 +19,18 @@ The firmware runs five FreeRTOS tasks plus `loop()`:
 
 Shared state is protected by four mutexes: `sfMutex` (module registry),
 `msgMutex` (RS-485 ring buffer), `timeMutex` (time formatting — newlib time
-functions are not thread-safe), and `mqttQMutex` (MQTT outbound queue). Only
-`taskNetwork` ever calls `mqtt.publish()`.
+functions are not thread-safe), and `mqttQMutex` (MQTT outbound queue).
+
+**Only `taskNetwork` touches the MQTT client — including to ask whether it is connected**
+(v4.4). `PubSubClient::connected()` is not a query: it `recv()`s on the socket and, if the
+link has dropped, `stop()`s the client in the calling task. Every other task reads
+`gMqttUp`, and asks for a disconnect or a change of broker by setting `gMqttDropReq` /
+`gMqttReconfigReq`. The outbound queue's lock is held to copy one item out, never across
+the publish.
+
+`RS485` and `Network` have 8 KB stacks, `Web` 8 KB, the job tasks 6–8 KB. A monitor record
+(`RS485Msg`) is 1.1 KB and is built on the sender's stack, so no task that can transmit
+should have less than 6 KB.
 
 ## Watchdog
 
@@ -41,6 +51,15 @@ Two boot-time guards prevent false reboots during startup:
   future" (`wdg > now`, possible only from transient boot-time skew) as healthy,
   rather than letting the unsigned subtraction underflow to a huge value that
   would look like a 49-day stall.
+
+**Only the web task feeds the web heartbeat** (v4.4). The reply-wait helpers are shared with
+the soak, probe, restore and module-update tasks, and used to stamp `wdgWebMs` wherever they
+ran, which hid a wedged web task for as long as a job was running. They call `wdgWebFeed()`,
+which does nothing off `taskWeb`.
+
+An update in flight (`gOtaInProgress`) suspends both reboots on purpose. Every chunk stamps
+`gOtaProgressMs`, and three minutes without one clears the flag, so a stalled upload cannot
+leave the board without its watchdog.
 
 ## Web server: why the synchronous `WebServer`, not `ESPAsyncWebServer`
 
@@ -607,3 +626,44 @@ Two things worth keeping from it:
 The board itself is checked twice before an image is sent: once from the registry, which is how
 the targets are chosen, and again from the bootloader's own status frame, which is the
 authority — a registry entry can be hours old, and the module in front of you cannot be.
+
+## What "the dashboard is slow" turned out to be (v4.4)
+
+Five causes, none of them in the dashboard, each invisible from outside because a
+one-connection server makes every cause look the same: every request is slow.
+
+| Cause | Cost | Fix |
+|---|---|---|
+| WiFi modem sleep (the Arduino default) | a beacon interval per round trip | `WiFi.setSleep(false)` |
+| `WIFI_FAST_SCAN` joins the first AP heard, not the strongest | 40 ms vs 465 ms ping, by the luck of the boot | all-channel scan, sort by signal |
+| `ESP.getSketchSize()` in `/api/status` | SHA-256 of the image, ~170 ms per poll | measured once |
+| `WebServer::sendContent()` = 3 socket writes per chunk | 15 runt segments for a module list | chunks coalesced (`HealWebServer`, web.h) |
+| The dashboard polled every pane, always | ~3 requests a second per open tab | poll the visible pane, nothing when hidden |
+
+Things worth keeping:
+
+- **Measure inside.** `GET /api/perf` times every request in a middleware and attributes it
+  to an endpoint and a client. Handler time of 4 ms against a request time of 150 ms is the
+  link; the reverse is the firmware. Without it the three were indistinguishable.
+- **A request costs two round trips, whatever the handler does.** The server closes each
+  connection, so SYN/SYN-ACK and request/response are both paid every time. On a link with
+  a 40 ms round trip, 80–120 ms per request is the floor.
+- **A response larger than ~2.8 KB costs a round trip per ~2.8 KB.** `NetworkClient::write()`
+  waits in `select()` for the socket to be writable, and lwIP calls a socket writable only
+  while more than half its 5.7 KB send buffer is free. So the 49 KB page is ~17 round trips
+  of the link, which is why it is served compressed, and why a JSON response that fits one
+  flush is worth keeping that way.
+- **`NetworkClient::write()` does not honour the connection timeout.** It retries for 10 s
+  and leaves the socket open, so a peer that stopped reading costs 10 s per write. The chunk
+  writer treats one short write as the end of the response.
+- **TCP_NODELAY alone made it worse.** With Nagle off and three writes per chunk, the old
+  173 KB page went out as ~500 runt packets. Coalescing first, then NODELAY.
+
+### The single reply slot
+
+`gDump` and `gDiag.q` are one-slot mailboxes: arm with an id, send, wait for `ts`. They were
+written for the web task alone and are now also used by the soak, probe and restore tasks.
+Two rules keep that safe: the waiter accepts a reply only if `gotId` is the id it asked
+(the restore, which asks by serial, uses `SF_WAIT_ANY` and owns the bus exclusively), and the
+web handlers that use the slot answer 409 while a soak or probe is running.
+

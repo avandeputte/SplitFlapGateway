@@ -88,7 +88,9 @@ void rs485SendStr(const char* s);
 // it here, then returns immediately. taskRS485 -- which already wakes every 5 ms -- sends
 // each frame when its due time arrives. The web server never blocks; the cascade is
 // unchanged (the 5 ms tick quantises step_ms, which is 5..30 ms anyway).
-#define TXQ_SIZE       128     // scheduled frames in flight (~3 full pages)
+// One slot more than the largest batch (512 frames): a frame that did not fit used to be sent
+// inline at once -- AHEAD of the 127 queued before it, and unpaced. 640 x 54 B = 35 KB of PSRAM.
+#define TXQ_SIZE       640
 #define TXQ_FRAME_MAX  48      // display/index/home frames fit; longer ones send inline
 struct TxQItem { uint32_t dueMs; uint16_t len; uint8_t data[TXQ_FRAME_MAX]; };
 extern TxQItem* txQueue;                 // PSRAM ring (SPSC: taskWeb in, taskRS485 out)
@@ -98,6 +100,11 @@ extern StaticSemaphore_t txQMutexBuf;
 // Enqueue one frame for delivery at dueMs (millis timebase). Returns false if it will not
 // fit (too long, or queue full) -- caller should then send it inline via rs485Send.
 bool rs485SendScheduled(const uint8_t* data, size_t len, uint32_t dueMs);
+// When a new paced run should start: now, or `stepMs` after the last frame still waiting in
+// the queue. Each request used to start its own clock at millis(), so a second batch arriving
+// while the first was still draining was already "due" frame by frame as the first finished,
+// and went out back to back -- the unpaced burst that pacing exists to prevent.
+uint32_t rs485PaceStart(uint32_t stepMs);
 // Send every queued frame whose due time has arrived. Called by taskRS485 each tick.
 void rs485PollScheduled(uint32_t now);
 

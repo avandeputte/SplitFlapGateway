@@ -110,6 +110,7 @@ bool modfwValidateFile(const char* path, uint16_t* crcOut, char* err, size_t err
 // Start a run over `ids` (or every eligible module when n == 0). False, with a reason, if the
 // image is missing, nothing is eligible, or the bus is busy with something else.
 bool modfwStart(const int* ids, int n, char* err, size_t errLen);
+bool modfwRunning();          // an update is in flight (any active phase)
 void modfwCancel();
 /* Streamed: a wall can hold 255 modules, and a row apiece is far too much for a static
    buffer in a memory this board is short of. At 18 modules the old fixed buffer truncated the

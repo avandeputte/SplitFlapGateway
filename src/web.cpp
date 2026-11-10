@@ -1,4 +1,5 @@
 #include "gateway.h"
+#include <esp_wifi.h>
 #include "web_ui.h"
 
 
@@ -184,20 +185,9 @@ static void handleLogo() {
   server.send(200, "image/svg+xml", LOGO_SVG);
 }
 
-// Stream a byte range of the static page in watchdog-friendly chunks so a slow
-// client can't trip the stall detector mid-send.
-static void streamPage(const char* p, size_t n) {
-  const size_t CHUNK = 1024;
-  for (size_t off = 0; off < n; off += CHUNK) {
-    size_t c = (n - off < CHUNK) ? (n - off) : CHUNK;
-    server.sendContent_P(p + off, c);
-    wdgWebMs = millis();
-  }
-}
-
 // GET /lang/<code>  -- one UI translation dictionary (v3.5)
 //
-// The dashboard's English is the text already in PAGE_HTML, so English costs nothing
+// The dashboard's English is the text already in the page, so English costs nothing
 // and needs no request. Every other language is a gzipped JSON dict generated into
 // web_ui.h by tools/build_ui.py, and the browser fetches only the one it needs.
 //
@@ -227,36 +217,30 @@ static void handleLang(size_t idx) {
 
 // GET /
 static void handleRoot() {
-  wdgWebMs = millis();                 // streaming response can take a while
+  wdgWebMs = millis();
   // Cap per-write blocking so a stalled browser cannot wedge taskWeb. This must be
   // setConnectionTimeout(): NetworkClient keeps its own `_timeout` (which is what seeds
-  // SO_SNDTIMEO) and does NOT override Stream::setTimeout(), so the old setTimeout(3000)
-  // set the *read* timeout and capped nothing at all -- the comment above was a lie.
+  // SO_SNDTIMEO) and does NOT override Stream::setTimeout().
   server.client().setConnectionTimeout(3000);   // 3s per socket write
   // The page is baked into the firmware, so its bytes change only when the firmware
   // is rebuilt -- and every rebuild changes __TIME__. Serve it with that as an ETag
   // and honour If-None-Match: navigating away and back then costs a tiny 304 instead
-  // of re-downloading the whole ~53 KB page, while a reflash still busts the cache and
-  // delivers the new UI. (The old no-store forced a full re-download on every visit.)
+  // of re-downloading the page, while a reflash still busts the cache and delivers
+  // the new UI.
   static const char* PAGE_ETAG = "\"" __DATE__ "-" __TIME__ "\"";
   server.sendHeader("ETag", PAGE_ETAG);
   server.sendHeader("Cache-Control", "no-cache");   // revalidate, but cheaply (304)
   if (server.header("If-None-Match") == PAGE_ETAG) { server.send(304, "text/html", ""); return; }
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/html", "");
-  // Stream the static page (web_ui.h), substituting the single {FWVER} token
-  // with the firmware version so the page stays tied to the FW_VERSION macro.
-  const char*  page  = PAGE_HTML;
-  const size_t total = sizeof(PAGE_HTML) - 1;
-  const char*  mark  = strstr(page, "{FWVER}");
-  if (mark) {
-    streamPage(page, (size_t)(mark - page));
-    server.sendContent(FW_VERSION);
-    streamPage(mark + 7, total - (size_t)(mark + 7 - page));  // 7 = strlen("{FWVER}")
-  } else {
-    streamPage(page, total);
-  }
-  server.sendContent("");             // terminate the chunked response
+  // The page is stored GZIPPED and sent as one body with its length up front (v4.4). It used to
+  // be 173 KB of raw markup streamed in 1 KB chunks -- ~170 chunks, three socket writes each --
+  // and on a slow link that took 2-20 s, every one of them with the one-connection server
+  // unable to answer anything else: the dashboard's own polls queued behind its own page. It is
+  // ~49 KB now, in one write. The firmware version used to be spliced into the stream at a
+  // {FWVER} token, which is the only reason the page was not compressed; the page now reads the
+  // version from /api/config, which it loads anyway.
+  server.sendHeader("Content-Encoding", "gzip");
+  server.send_P(200, "text/html", (PGM_P)PAGE_GZ, PAGE_GZ_LEN);
+  wdgWebMs = millis();
 }
 
 // GET /api/rs485/messages
@@ -315,7 +299,7 @@ static void handleApiSendBatch() {
   { char cd[48]; snprintf(cd, sizeof(cd), "batch %u frames, step=%dms",
       (unsigned)frames.size(), step); ringPushCommand('R', cd); }
   int sent = 0;
-  uint32_t due = millis();           // frame i is due at now + i*step
+  uint32_t due = rs485PaceStart((uint32_t)step);   // now, or after whatever is still queued
   for (JsonVariant v : frames) {
     if (sent >= 512) break;          // bound the batch
     const char* f = v.as<const char*>();
@@ -849,6 +833,7 @@ static void handleApiVersion() {
   int id = doc["id"] | -1;
   DBG("[API] version query module %d\n", id);
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
+  if (gProbe.active || gSoak.active) { sendJsonError(409, "a bus probe or soak is running -- wait for it to finish"); return; }
 
   // Send a direct version query and wait for a fresh reply. The window scales
   // mildly with id (broadcast-stagger headroom); a direct query usually answers
@@ -1297,7 +1282,7 @@ static void handleApiDisplayCells() {
     ringPushCommand('R', cd); }
 
   int n = 0, sent = 0, skipped = 0;
-  uint32_t due = millis();
+  uint32_t due = rs485PaceStart((uint32_t)step);
   for (JsonObjectConst c : cells) {
     int id = start + n;
     if (id > 254) break;            // ran off the addressable range; stop counting here
@@ -1381,9 +1366,24 @@ static void handleApiStatus() {
   snprintf(bst, sizeof(bst), "{\"level\":%d,\"reason\":\"%s\",\"remaining\":%ld}",
            (int)busLevel(), busReason(), busRemainingSec());
   restoreStatusJson(rst, sizeof(rst), false);
-  char out[1280];
+  // ESP.getSketchSize() is not a lookup: it runs esp_image_verify() over the running image,
+  // which reads and SHA-256-hashes all ~1.6 MB of it -- about 170 ms of this task, on an
+  // endpoint every open dashboard polls every three seconds, on a server that handles one
+  // request at a time. The image cannot change while it is running, so it is measured once.
+  static uint32_t sketchBytes = 0, sketchSlot = 0;
+  if (!sketchBytes) { sketchBytes = ESP.getSketchSize(); sketchSlot = ESP.getFreeSketchSpace(); }
+  // The radio link, because "the dashboard is slow" is a link problem as often as a firmware
+  // one and until now nothing could tell the two apart from outside.
+  const bool staUp = (WiFi.status() == WL_CONNECTED);
+  wifi_ps_type_t psMode = WIFI_PS_NONE;      // 0 = radio always on, 1/2 = modem sleep
+  esp_wifi_get_ps(&psMode);
+  char bssid[20] = "";
+  if (staUp) { const uint8_t* b = WiFi.BSSID();
+               if (b) snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x", b[0],b[1],b[2],b[3],b[4],b[5]); }
+  char out[1400];
   snprintf(out, sizeof(out),
     "{\"uptime\":%lu,\"rx\":%lu,\"tx\":%lu,\"baud\":%lu,"
+    "\"rssi\":%d,\"channel\":%d,\"bssid\":\"%s\",\"ps\":%d,"
     "\"wifi\":%s,\"ip\":\"%d.%d.%d.%d\",\"apip\":\"%d.%d.%d.%d\","
     "\"heap\":%u,\"minheap\":%u,\"psram\":{\"size\":%u,\"free\":%u},"
     "\"flash\":{\"sketch\":%u,\"free\":%u},\"mqtt\":%s,\"modules\":%d,"
@@ -1393,13 +1393,14 @@ static void handleApiStatus() {
     "\"bus\":{\"rejects\":%lu,\"dropped\":%lu,\"dropBytes\":%lu,\"maxLen\":%lu,"
     "\"crcOk\":%lu,\"crcFail\":%lu,\"lock\":%s}}",
     millis()/1000, rxCount, txCount, cfg.rs485Baud,
-    (WiFi.status()==WL_CONNECTED)?"true":"false",
+    staUp ? (int)WiFi.RSSI() : 0, staUp ? (int)WiFi.channel() : 0, bssid, (int)psMode,
+    staUp?"true":"false",
     lip[0],lip[1],lip[2],lip[3],
     aip[0],aip[1],aip[2],aip[3],
     ESP.getFreeHeap(), ESP.getMinFreeHeap(),
     (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
-    (unsigned)ESP.getSketchSize(), (unsigned)ESP.getFreeSketchSpace(),
-    mqtt.connected()?"true":"false",
+    (unsigned)sketchBytes, (unsigned)sketchSlot,
+    gMqttUp?"true":"false",
     sfModuleCount,
     gResetReason, stk485, stkWeb, stkNet, stkOta, stkRtc, stkSoak, stkProbe,
     rtcBuf,
@@ -1474,14 +1475,10 @@ static void handleApiConfigMqtt() {
   saveConfig();
   DBG("[CFG] MQTT broker set to %s:%d  prefix=%s\n", cfg.mqttHost, cfg.mqttPort, cfg.mqttPrefix);
   server.send(200, "application/json", "{\"ok\":true}");
-  delay(100);
-  mqtt.disconnect();
-  // PubSubClient caches the broker it was last told to dial. mqttInit() is the only
-  // other caller and runs once at boot, so without this the new broker is saved and
-  // logged but never actually dialled: the reconnect keeps using the boot-time target
-  // (or none at all, if none was configured then) and fails forever with rc=-2.
-  if (strlen(cfg.mqttHost)) mqtt.setServer(cfg.mqttHost, cfg.mqttPort);
-  mqttFailCount = 0;   // a fresh broker gets a fresh strike budget
+  // The client belongs to taskNetwork (see gMqttUp in common.h): it drops the session,
+  // hands PubSubClient the new broker -- which it caches, so a saved setting that is not
+  // handed over is never dialled -- and reconnects, within one pass of its loop.
+  gMqttReconfigReq = true;
 }
 
 // POST /api/config/rs485
@@ -1577,7 +1574,7 @@ static void handleApiConfigSettings() {
     cfg.haEnabled = doc["haEnabled"].as<bool>();
     saveConfig();
     printf("[CFG] Home Assistant integration %s\n", cfg.haEnabled ? "enabled" : "disabled");
-    if (mqtt.connected()) {
+    if (gMqttUp) {
       if (cfg.haEnabled && !was) { haPublishDiscovery(true); mqttPublishStateTopics(); }
       else if (!cfg.haEnabled && was) { haPublishDiscovery(false); }  // remove entities
     }
@@ -1611,7 +1608,8 @@ static void handleApiConfigSettings() {
   if (doc["ntpServer"].is<const char*>()) {
     strlcpy(cfg.ntpServer, doc["ntpServer"] | DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
     if (!cfg.ntpServer[0]) strlcpy(cfg.ntpServer, DEFAULT_NTP_SERVER, sizeof(cfg.ntpServer));
-    ntpSynced = false;   // re-sync against the new server on next network tick
+    ntpSynced = false;
+    gNtpResyncReq = true;   // taskNetwork syncs against the new server on its next pass
     DBG("[CFG] NTP server set to %s\n", cfg.ntpServer);
   }
   if (doc["gridRows"].is<int>() || doc["gridCols"].is<int>()) {
@@ -1642,7 +1640,7 @@ static void handleApiConfigSettings() {
   // Only disconnect/reconnect if WiFi or MQTT credentials were in the payload
   bool hasWifi = doc["ssid"].is<const char*>() || doc["pass"].is<const char*>();
   bool hasMqtt = doc["mqHost"].is<const char*>() || doc["mqPort"].is<int>();
-  if (hasMqtt) mqtt.disconnect();
+  if (hasMqtt) gMqttReconfigReq = true;       // taskNetwork owns the client
   if (hasWifi) WiFi.disconnect();
 }
 
@@ -1979,6 +1977,12 @@ static void handleApiDump() {
   int id = doc["id"] | -99;
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
   DBG("[API] dump module %d\n", id);
+  // Not while a soak or a probe has the bus. They are only a BUSY hold, which this route
+  // passes -- but they use the SAME single reply slot from their own task, so a read started
+  // here re-arms it under them: the test then scores a miss for the reply we stole, and (until
+  // the wait learned to check whose reply it was) this request could return another module's
+  // EEPROM as this one's. handleApiDiag has always refused; these now do too.
+  if (gProbe.active || gSoak.active) { sendJsonError(409, "a bus probe or soak is running -- wait for it to finish"); return; }
 
   char sn[21] = "";
   char fwVer[8] = "";
@@ -2053,6 +2057,7 @@ static void handleApiAll() {
   int id = doc["id"] | -99;
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
   DBG("[API] all (version+EEPROM) module %d\n", id);
+  if (gProbe.active || gSoak.active) { sendJsonError(409, "a bus probe or soak is running -- wait for it to finish"); return; }
 
   char sn[21] = "", fwVer[8] = "";
   xSemaphoreTake(sfMutex, portMAX_DELAY);
@@ -2210,7 +2215,7 @@ static bool busReasonIsClientOwned(const char* r) {
 }
 static void handleApiBus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  static char out[384];
+  static char out[560];   // six holds at their longest are ~430 bytes
   busStatusJson(out, sizeof(out));
   server.send(200, "application/json", out);
 }
@@ -2229,7 +2234,7 @@ static void handleApiBusHold() {
   // operator afterwards when its request tag does not reach us (see busIsOperator).
   if (!busHold(reason, BUS_BUSY, (unsigned long)secs * 1000UL,
                (uint32_t)server.client().remoteIP())) { sendJsonError(503, "no free hold slot"); return; }
-  static char out[384];
+  static char out[560];   // six holds at their longest are ~430 bytes
   busStatusJson(out, sizeof(out));
   server.send(200, "application/json", out);
 }
@@ -2252,7 +2257,7 @@ static void handleApiBusRelease() {
     printf("[BUS] '%s' force-released by %s\n", reason, server.client().remoteIP().toString().c_str());
   }
   busRelease(reason);
-  static char out[384];
+  static char out[560];   // six holds at their longest are ~430 bytes
   busStatusJson(out, sizeof(out));
   server.send(200, "application/json", out);
 }
@@ -2452,6 +2457,7 @@ static void handleApiStats() {
   if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) { sendJsonError(400, "Bad JSON"); return; }
   int id = doc["id"] | -1;
   if (id < 0 || id > 254) { sendJsonError(400, "id required (0-254)"); return; }
+  if (gProbe.active || gSoak.active) { sendJsonError(409, "a bus probe or soak is running -- wait for it to finish"); return; }
   if (!sfSendAndCaptureQ(id, 1000)) { sendJsonError(504, "no snapshot from that module"); return; }
   char out[300];
   snprintf(out, sizeof(out),
@@ -2644,6 +2650,13 @@ static void handleApiMqttTest() {
   // CONNECT/CONNACK. CONNACK from a live broker arrives in milliseconds.
   PubSubClient testMq(testNet);
   testMq.setBufferSize(128);   // CONNECT/CONNACK only -- keep the heap use tiny
+  // PubSubClient waits for the CONNACK in a loop that never yields, for its socket timeout --
+  // 15 s by default. Something that accepts the TCP connection and then says nothing (a TLS
+  // listener, the wrong service on that port, a proxy with a dead backend) therefore pinned
+  // this task for 15 s with the idle task starved, and the task watchdog (5 s, panic) reset
+  // the board: pressing "Test" on a wrong port rebooted the gateway. 3 s is inside the
+  // watchdog and far longer than any live broker takes.
+  testMq.setSocketTimeout(3);
   bool mqOk;
   if (user[0]) mqOk = testMq.connect("sfgw-test", user, pass);
   else         mqOk = testMq.connect("sfgw-test");
@@ -3115,9 +3128,52 @@ static void handleApiRestoreBackupPut() {
   sendRestoreStatus(200);
 }
 
+static void handleApiPerf() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  const bool reset = server.hasArg("reset");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  perfEmit([](const char* c) { server.sendContent(c); });
+  server.sendContent("");
+  if (reset) perfReset();
+}
+
 void webInit() {
   static const char* COLLECT_HDRS[] = { "If-None-Match", "X-SF-Client" };
   server.collectHeaders(COLLECT_HDRS, 2);   // conditional GETs, and the dashboard's X-SF-Client tag
+  // Every request is timed and attributed (perf.h). The address is taken BEFORE the handler
+  // runs: by the time it returns the client may already be gone.
+  server.addMiddleware([](WebServer& s, Middleware::Callback next) {
+    const uint32_t ip = (uint32_t)s.client().remoteIP();
+    // TCP_NODELAY on every accepted socket. The server writes a response as several small
+    // sends -- a chunked sendContent() alone is three (size line, data, CRLF) -- and with
+    // Nagle on, each send after the first WAITS for the previous one to be ACKed. On this board
+    // that ACK arrives over WiFi, so every extra send cost 20-300 ms of this task doing
+    // nothing: /api/flap/modules, five sendContent calls for 2.7 KB, averaged 322 ms and
+    // peaked at 1.7 s, during which the one-connection server served nobody else.
+    s.client().setNoDelay(true);
+    server.chunkReset();                 // nothing from an abandoned response leaks into this one
+    char uri[40];
+    strlcpy(uri, s.uri().c_str(), sizeof(uri));        // cleared once the handler returns
+    // A JSON body is parsed into the INTERNAL heap, after the server has already read all of
+    // it into a String there: a 40 KB body costs ~40 KB twice, on a board with ~110 KB free
+    // and a supervisor that reboots under 20. The largest legitimate one (a 512-frame batch,
+    // a 255-cell page) is under 10 KB. The big uploads -- firmware, a backup, the companion's
+    // settings -- are streamed to flash by their own handlers and never appear as "plain".
+    if (s.clientContentLength() > 24576 && s.hasArg("plain")) {
+      s.sendHeader("Access-Control-Allow-Origin", "*");
+      s.send(413, "application/json", "{\"ok\":false,\"error\":\"request body too large (24 KB max)\"}");
+      perfNoteRequest(uri, ip, 0, 0);
+      return true;
+    }
+    const uint32_t low0 = ESP.getMinFreeHeap();
+    const uint32_t t0 = millis();
+    const bool r = next();
+    const uint32_t low1 = ESP.getMinFreeHeap();
+    perfNoteRequest(uri, ip, millis() - t0, low1 < low0 ? low1 : 0);
+    return r;
+  });
+  server.on("/api/perf",             HTTP_GET,     handleApiPerf);
   server.on("/",                     HTTP_GET,     handleRoot);
   server.on("/favicon.svg",          HTTP_GET,     handleFavicon);
   server.on("/logo.svg",             HTTP_GET,     handleLogo);

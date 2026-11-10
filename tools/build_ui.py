@@ -6,7 +6,7 @@
                        ENGLISH text ({"Save": "Enregistrer", ...})
         |
         v
-    src/web_ui.h       PAGE_HTML + every dictionary, gzipped, in flash
+    src/web_ui.h       the page and every dictionary, gzipped, in flash
 
 One firmware image ships every language; the browser fetches only the one it
 needs from GET /lang/<code>. English needs no dictionary at all -- it is the
@@ -39,15 +39,16 @@ HEADER = """#ifndef SFGW_WEB_UI_H
 // GENERATED FILE -- do not edit by hand.
 // Source: ui/index.html + ui/strings/*.json   Regenerate: python3 tools/build_ui.py
 //
-// Dashboard page markup (HTML + CSS + JS), served verbatim by handleRoot().
-// Streamed byte-for-byte; the page pulls all runtime values (config, modules,
-// bus) via the REST API. Included only by web.cpp, so the arrays have one home.
+// PAGE_GZ is the dashboard page (HTML + CSS + JS), GZIPPED, served by handleRoot()
+// with Content-Encoding: gzip in a single write. The page pulls every runtime value
+// (config, modules, bus, the firmware version) via the REST API, so nothing is
+// spliced into it at serve time. Included only by web.cpp, so the arrays have one home.
 //
 // UI_LANGS[] holds one gzipped JSON dictionary per language, served by
 // handleLang() at GET /lang/<code>. English is not in the table: it is the text
 // already in the page, and the per-key fallback for every other language.
 
-static const char PAGE_HTML[] = R"=====("""
+"""
 
 FOOTER = """
 #endif // SFGW_WEB_UI_H
@@ -102,8 +103,9 @@ def load_dicts() -> tuple[list[tuple[str, str, bytes]], list[str]]:
 
 def build() -> tuple[str, list]:
     page = (UI / "index.html").read_text(encoding="utf-8")
-    if ')====="' in page:
-        sys.exit("ERROR: ui/index.html contains the raw-string terminator )=====\"")
+    if "{FWVER}" in page:
+        sys.exit("ERROR: ui/index.html still has a {FWVER} token; the page is served "
+                 "gzipped now and reads the version from /api/config")
 
     dicts, warn = load_dicts()
 
@@ -119,7 +121,9 @@ def build() -> tuple[str, list]:
         token + '[{"code":"en","name":"English"}]',
         json.dumps(langs, ensure_ascii=False, separators=(",", ":")), 1)
 
-    parts = [HEADER, page, ')====="', ";\n\n"]
+    page_gz = gzip.compress(page.encode("utf-8"), 9, mtime=0)   # mtime=0 -> byte-stable
+    parts = [HEADER, c_bytes("PAGE_GZ", page_gz),
+             "static const size_t PAGE_GZ_LEN = sizeof(PAGE_GZ);\n\n"]
     for code, _name, gz in dicts:
         parts.append(c_bytes(f"LANG_{code.replace('-', '_').upper()}", gz))
     parts.append("\nstruct UiLang { const char* code; const char* name;"
@@ -148,8 +152,9 @@ def main() -> None:
     OUT.write_text(text, encoding="utf-8")
     dicts, _ = load_dicts()
     page_n = len((UI / "index.html").read_bytes())
+    page_gz_n = len(gzip.compress((UI / "index.html").read_bytes(), 9, mtime=0))
     gz_n = sum(len(g) for _, _, g in dicts)
-    print(f"page        {page_n:>8,} B")
+    print(f"page        {page_n:>8,} B  ({page_gz_n:,} B gzipped, as served)")
     for code, name, gz in dicts:
         print(f"  {code:<6} {len(gz):>6,} B gz   {name}")
     print(f"dicts       {gz_n:>8,} B  ({len(dicts)} languages)")

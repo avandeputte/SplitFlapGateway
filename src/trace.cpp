@@ -127,7 +127,7 @@ size_t traceEnd(const char* summary) {
     for (size_t k = 0; k < n; k++) chunk[k] = gBuf[(gTail + i + k) % TRACE_BYTES];
     written += f.write((const uint8_t*)chunk, n);
     i += n;
-    wdgWebMs = millis();
+    wdgWebFeed();
     // Yield every 32 KB rather than every chunk: a tick is 10 ms, and a 2 MB trace would
     // otherwise spend ten seconds asleep. The bus is already released, so this is only
     // politeness toward the web and network tasks.
@@ -162,7 +162,8 @@ void traceEmitFile(void (*emit)(const char* chunk)) {
     size_t n = f.readBytes(chunk, sizeof(chunk) - 1);
     chunk[n] = 0;
     emit(chunk);
-    wdgWebMs = millis();
+    wdgWebFeed();
+    if (server.clientDead()) break;        // nobody is reading: do not page 4 MB off flash for them
   }
   f.close();
 }

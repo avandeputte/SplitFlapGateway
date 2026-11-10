@@ -1,5 +1,147 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.4.0 — 2026-11-10
+
+**The dashboard was slow, and almost none of it was the dashboard. This release is what a
+profiler and a top-to-bottom review for speed and stability turned up.**
+
+Measured from a wired machine against the same wall, before and after:
+
+| | 4.3.0 | 4.4.0 |
+|---|---|---|
+| Time inside the gateway for `/api/status` | 170–290 ms | 5 ms |
+| Time inside the gateway for `/api/flap/modules` (14 modules) | 320 ms avg, 1.7 s worst | 4 ms |
+| Dashboard page | 173 KB, 1.8–6.4 s | 49 KB, typically 1.1–1.4 s |
+| Ping to the gateway, average | 113–134 ms | 35–95 ms (median 30–50) |
+
+(A module list longer than about 2.7 KB — sixteen modules — needs a second packet and so one
+more round trip of the link: 46 ms here.)
+
+What is left is the radio: every request is a new connection, so it costs two round trips, and
+on a busy 2.4 GHz channel a round trip is tens of milliseconds whatever the firmware does.
+`GET /api/perf` (below) tells the two apart.
+
+### Fixed — why it was slow
+
+- **The radio was asleep between beacons.** The Arduino default is modem sleep, so every
+  packet *to* the gateway waited at the access point for the next beacon. Modem sleep is now
+  off, permanently; the board is mains powered.
+- **The gateway joined whichever access point answered first, not the strongest.** On a
+  network with several, each reboot was a coin toss, and a station does not move afterwards.
+  Same wall, same hour, one reboot apart: ping median 40 ms on one access point, 465 ms with
+  10 % loss on another. It now scans every channel and joins the strongest signal.
+- **`/api/status` hashed the whole firmware image on every call.** `ESP.getSketchSize()` is
+  not a lookup; it verifies the running image. About 170 ms, every three seconds, per open
+  dashboard, on a server that handles one request at a time. Measured once now.
+- **Every streamed response went out as runt packets.** One chunk was three socket writes;
+  with five chunks in a module list that was fifteen small segments, each waiting on the
+  last. Chunks are now coalesced into full segments.
+- **The page is served compressed**, in one write, and its version footer is filled in by
+  the page itself.
+- **The dashboard polled everything, always.** The monitor was polled 1.75 times a second
+  on every tab, and a hidden browser tab kept going. A pane now polls only while it is the
+  one on screen, and a hidden tab polls nothing.
+- **A bus task walked the whole module registry every 5 ms** once every reel was known, for
+  ever. Once per two seconds, as intended.
+- **One module with an unknown reel turned every broadcast character into a frame per
+  module.** A wall with a single module that never reported its flap set (any v32 module
+  with a full map) paid N frames for every `m*-A`. One frame again whenever every module
+  would be sent the same byte.
+
+### Fixed — stability
+
+- **A frame addressed to id 255 could restart the gateway.** 255 is the registry's own
+  marker for "no id", and a line starting `m255` went on to compare against a missing
+  serial number. Ids above 254 are now rejected and counted, on both the reply and the
+  provisioning-ack paths. (`m300` was also being filed under module 44.)
+- **Pressing "Test" on a wrong MQTT port could restart the gateway.** Something that accepts
+  the connection and then says nothing held the web task in a loop that never yields, for
+  15 s; the task watchdog fires at 5. The test now gives up after 3 s. *(Checked against a
+  listener that accepts and stays silent: 3.2 s, no restart.)*
+- **A broker that stayed down took the gateway off WiFi every two and a half minutes.** Five
+  failed MQTT connections were read as "the network stack is wedged" and answered by
+  rejoining WiFi — which is rarely the cause and always costs the dashboard, the companion
+  and the API. It now takes a transport-level failure, five minutes with no web request
+  either, and at most one attempt per half hour.
+- **The MQTT client was used from three tasks.** Asking PubSubClient whether it is
+  connected can close the socket, in whatever task asked, while the network task is using
+  it. Only the network task touches the client now; everything else reads a flag or leaves
+  a request.
+- **A slow broker stalled the bus task and lost the frames it was stalling for.** The
+  outbound queue's lock was held across each publish. It is held only to copy one item out.
+  The same loop now feeds its own watchdog, so three slow publishes are no longer a
+  "network task stalled" restart.
+- **Home Assistant never saw the Maintenance switch or eleven of the diagnostic sensors.**
+  Their discovery topics are 48–53 characters and the queue stored 47. Discovery is also
+  retained now, as it was always meant to be, so the entities survive a Home Assistant
+  restart.
+- **A module change made while the registry was being saved was lost**, until something else
+  changed. The dirty flag was cleared after the write instead of before it.
+- **A failed registry save replaced the good file.** Write results were ignored, so on a
+  full filesystem a short file was renamed over the registry and the next boot started with
+  no modules. A save is now checked before it replaces anything, an interrupted one is
+  finished at boot, and "Clear all" can no longer be undone by a save already in flight.
+- **A read from the dashboard during a soak or a probe could return another module's
+  EEPROM.** They share one reply slot. The wait now checks whose reply arrived, and
+  `/api/flap/dump`, `/api/flap/all`, `/api/flap/stats` and `/api/flap/version` answer
+  **409** while a test owns the bus.
+- **A restore could start on top of a soak, a probe, a self-test or a module update**, and
+  read their replies as its own. It is refused, as a module update already was.
+- **On a large wall the restore's hold on the bus ran out mid-run** (past roughly 57 fully
+  calibrated modules), letting content and background queries back in during EEPROM writes.
+  The hold is renewed per module; so is the soak's during its snapshot.
+- **Every restore leaked the parsed backup** — about 50 KB for a 64-module wall.
+- **The gateway could transmit into a module's reply.** The "is the bus quiet" check relied
+  on a marker that stops moving exactly when the bus task is the sender, or is waiting for
+  the sender. It now watches the UART itself.
+- **Two checksummed frames built at once could be sent as one garbled one.** The frame
+  buffer was filled before the transmit lock was taken.
+- **A client that stopped reading froze the server for ten seconds per write** — a phone
+  that slept mid-response cost 20 s on a module list, minutes on a long monitor backlog. One
+  failed write now ends that response.
+- **The web watchdog could not see a stuck web task during a soak, restore or module
+  update**: those tasks were feeding it. Only the web task does now.
+- **An update that stalled could leave the gateway "updating" for ever**, with MQTT off and
+  both safety restarts disabled. Three minutes without a chunk ends it.
+- **NTP was tried once per WiFi connection.** A time server unreachable at boot meant no
+  sync for the whole uptime, and changing the server in Settings did nothing until a reboot.
+  It syncs at once when the setting changes, and otherwise retries every 15 minutes.
+- **Text sent with a negative start address broadcast its first characters to every
+  module.** Characters that fall off the wall are dropped.
+- Two settings saved at the same moment could silently lose one of them; a bus trace line
+  could be garbled by a transmit on the other core; one monitor row could be torn and break
+  that poll; three reply waits were not safe across the 49-day clock rollover; a clock chip
+  reading month 0 indexed before a table.
+
+### Added
+
+- **`GET /api/perf`** — who is asking the web server for what, and what it costs: requests
+  and time per endpoint and per client address, time spent holding a connection that sent
+  nothing, the longest gap in each task's loop, and which endpoint was running when the
+  heap reached a new low. `?reset=1` starts a new window. When "the dashboard is slow",
+  this says whether it is a request, a client, or the link.
+- **`GET /api/status` carries the radio link**: `rssi`, `channel`, `bssid` and `ps` (0 means
+  the radio never sleeps).
+
+### Changed
+
+- **A JSON request body over 24 KB is refused with 413.** The largest legitimate one is
+  under 10 KB; firmware, backups and the companion's settings are streamed and unaffected.
+- **A batch that arrives while another is still being paced out queues behind it** instead
+  of interleaving with it, and a batch of more than 127 frames no longer sends the overflow
+  ahead of the rest.
+- The bus and network tasks have 8 KB stacks (were 6), and the probe 6 KB (was 4): the bus
+  task had 1.1 KB to spare at its deepest.
+- API version **3.3.0**.
+
+### Known, not changed
+
+- Handlers that wait for a module's reply (`/api/flap/all`, `/api/flap/dump`, diagnostics,
+  `/api/flap/text` on a long line) still hold the one-connection server while they wait —
+  up to a few seconds against a silent module. Moving them to jobs is a larger change.
+- A garbled frame on a wall without checksums can still create a registry entry for an id
+  that does not exist (ids 0–254).
+
 ## v4.3.0 — 2026-11-09
 
 **There is a second driver board. The gateway can now see which one each module is — and will

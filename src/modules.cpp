@@ -35,6 +35,7 @@ SFModule* sfFindById(uint8_t id) {
 
 // Find module by serial number
 static SFModule* sfFindBySN(const char* sn) {
+  if (!sn || !sn[0]) return NULL;          // id 255 with no serial reaches here: see sfUpsert
   for (int i = 0; i < sfModuleCount; i++)
     if (strcmp(sfModules[i].serialNum, sn) == 0) return &sfModules[i];
   return NULL;
@@ -62,6 +63,10 @@ static bool sfDedupeBySNLocked(const char* sn) {
   }
   return changed;
 }
+
+// Bumped by sfModulesClear(), read by sfModulesSave(): a save that straddles a clear discards
+// itself instead of resurrecting the registry that was just wiped.
+static volatile uint32_t sfRegistryGen = 0;
 
 // Add or update a module entry
 static SFModule* sfUpsert(uint8_t id, const char* sn) {
@@ -191,20 +196,40 @@ void sfModulesSave() {
 
   // Write to a temp file then rename, so a crash mid-write can't corrupt
   // the existing good copy.
+  const uint32_t gen = sfRegistryGen;      // a Clear during this save must win (see below)
   File f = FFat.open(MODULES_FILE ".tmp", "w");
-  if (!f) { DBG("[MOD] open for write failed\n"); return; }
+  if (!f) { printf("[MOD] registry save: cannot open the temp file\n"); return; }
   ModulesFileHeader hdr = { MODULES_MAGIC, n };
-  f.write((const uint8_t*)&hdr, sizeof(hdr));
-  if (n > 0) f.write((const uint8_t*)recs, n * sizeof(PersistedModule));
+  size_t wrote = f.write((const uint8_t*)&hdr, sizeof(hdr));
+  if (n > 0) wrote += f.write((const uint8_t*)recs, n * sizeof(PersistedModule));
   f.close();
+  // Only a COMPLETE temp file may replace the good one. The results were ignored: on a full
+  // filesystem (the trace alone can be 4 MB) a short temp file was renamed over the registry,
+  // the next boot rejected it on its size, and the wall came up with no modules at all.
+  if (wrote != sizeof(hdr) + (size_t)n * sizeof(PersistedModule)) {
+    FFat.remove(MODULES_FILE ".tmp");
+    printf("[MOD] registry save FAILED (wrote %u bytes) -- kept the previous file\n", (unsigned)wrote);
+    return;
+  }
+  // "Clear all modules" removes the file. If it ran while this save was between its snapshot
+  // and its rename, the rename put the pre-clear registry straight back.
+  if (gen != sfRegistryGen) { FFat.remove(MODULES_FILE ".tmp"); return; }
   FFat.remove(MODULES_FILE);
-  FFat.rename(MODULES_FILE ".tmp", MODULES_FILE);
+  if (!FFat.rename(MODULES_FILE ".tmp", MODULES_FILE))
+    printf("[MOD] registry save: rename failed -- the new copy is in " MODULES_FILE ".tmp\n");
   DBG("[MOD] Saved %d modules to FATFS\n", n);
 }
 
 // Load persisted modules from the FATFS file at boot, pruning stale entries.
 void sfModulesLoad() {
   if (!sfFsReady) return;
+  // A save replaces the file by remove-then-rename (FAT has no atomic replace). Power lost
+  // between the two leaves only the temp file -- which is complete, or it would not have
+  // been allowed to replace anything. Finish the job instead of booting with an empty wall.
+  if (!FFat.exists(MODULES_FILE) && FFat.exists(MODULES_FILE ".tmp")) {
+    printf("[MOD] finishing an interrupted registry save\n");
+    FFat.rename(MODULES_FILE ".tmp", MODULES_FILE);
+  }
   if (!FFat.exists(MODULES_FILE)) { DBG("[MOD] no saved module file\n"); return; }
   File f = FFat.open(MODULES_FILE, "r");
   if (!f) { DBG("[MOD] open for read failed\n"); return; }
@@ -270,10 +295,11 @@ void sfModulesLoad() {
 // Wipe both the in-memory registry and the persisted file.
 void sfModulesClear() {
   if (sfMutex) xSemaphoreTake(sfMutex, portMAX_DELAY);
+  sfRegistryGen = sfRegistryGen + 1;       // invalidates a save already in flight
   sfModuleCount = 0;
   memset(sfModules, 0, sizeof(SFModule) * MAX_MODULES);
   if (sfMutex) xSemaphoreGive(sfMutex);
-  if (sfFsReady) FFat.remove(MODULES_FILE);
+  if (sfFsReady) { FFat.remove(MODULES_FILE); FFat.remove(MODULES_FILE ".tmp"); }
   sfModulesDirty = false;
   DBG("[MOD] Registry cleared (memory + FATFS)\n");
 }
@@ -499,7 +525,13 @@ void sfSendChar(int addr, char c) {
   }
   // Nothing provisioned, or one answer for the whole wall: the single frame it has always been.
   if (n == 0)                 { sfSendCharRaw(-1, flapResolveFor(in, NULL)); return; }
-  if (allKnown && allSame)    { sfSendCharRaw(-1, firstB);                   return; }
+  // (Not "only when every reel is known". A module whose reel is unknown resolves to the
+  // reel-independent byte, so if everybody agrees a single frame says exactly what N frames
+  // would -- and it also reaches a module the registry has not met. Requiring every reel to be
+  // known meant ONE module that never reported its set turned every broadcast character into
+  // a frame per module, for good.)
+  (void)allKnown;
+  if (allSame)                { sfSendCharRaw(-1, firstB);                   return; }
   for (int i = 0; i < n; i++) sfSendCharRaw(ids[i], outB[i]);
 }
 
@@ -1111,7 +1143,10 @@ bool sfProbeStart(int id, int rounds) {
   gProbe.startedMs = millis(); gProbe.elapsedMs = 0;
   gProbe.dropsBefore = rxDropped; gProbe.dropsDuring = 0;
   gProbe.done = false; gProbe.active = true;
-  if (xTaskCreatePinnedToCore(taskProbe, "Probe", 4096, NULL, 1, &hTaskProbe, 1) != pdPASS) {
+  // 6144, like Soak. At 4096 the deepest chain (version query -> rs485Send with its 1.1 KB
+  // monitor record -> the MQTT mirror's 1 KB buffer -> snprintf) measured 3.5 KB of frames
+  // before interrupt overhead, with a broker connected: no margin at all.
+  if (xTaskCreatePinnedToCore(taskProbe, "Probe", 6144, NULL, 1, &hTaskProbe, 1) != pdPASS) {
     hTaskProbe = NULL; gProbe.active = false;
     return false;
   }
@@ -1288,13 +1323,16 @@ bool sfSendAndCaptureDump(int id, const char* frame, unsigned long timeoutMs,
   gDump.ts  = 0;
   gDump.autoHome = gDump.curIndex = gDump.reportedId = -99;  // A-only; cleared per attempt
   gDump.flapCount = -99; gDump.flapChars[0] = 0;             // v31+ 'A' tail; cleared per attempt
+  gDump.gotId      = -1;
   gDump.waitId     = id;
   sfSendToModule(id, frame);     // checksummed if this module verifies them
   unsigned long deadline = millis() + timeoutMs;
-  while (millis() < deadline) {
-    wdgWebMs = millis();
+  while ((long)(millis() - deadline) < 0) {                  // rollover-safe
+    wdgWebFeed();
     vTaskDelay(pdMS_TO_TICKS(10));
-    if (gDump.ts != 0) { strlcpy(out, gDump.data, outLen); return true; }
+    // The slot is shared, so "a reply arrived" is not enough: it must be THIS module's. If
+    // another task re-armed the slot for a different id meanwhile, its reply is not ours.
+    if (gDump.ts != 0 && gDump.gotId == id) { strlcpy(out, gDump.data, outLen); return true; }
     if (abort && *abort) {
       // Give up waiting, but not the bus: the module may be half-way through a 700-byte
       // reply, and releasing the hold on top of that would put content into the middle of
@@ -1316,8 +1354,8 @@ bool sfSendAndCaptureQ(int id, unsigned long timeoutMs) {
   snprintf(frame, sizeof(frame), "m%dQ\n", id);
   sfSendToModule(id, frame);
   unsigned long deadline = millis() + timeoutMs;
-  while (millis() < deadline) {
-    wdgWebMs = millis();
+  while ((long)(millis() - deadline) < 0) {                  // rollover-safe
+    wdgWebFeed();
     vTaskDelay(pdMS_TO_TICKS(10));
     if (gDiag.q.ts != 0) { gDiag.q.waitId = -1; return true; }
   }
@@ -1339,8 +1377,8 @@ bool sfSendVersionAndWait(int id, unsigned long timeoutMs,
   xSemaphoreGive(sfMutex);
   sfQueryVersion(id);   // bare 'v' -- collision-safe
   unsigned long deadline = millis() + timeoutMs;
-  while (millis() < deadline) {
-    wdgWebMs = millis();
+  while ((long)(millis() - deadline) < 0) {                  // rollover-safe
+    wdgWebFeed();
     vTaskDelay(pdMS_TO_TICKS(10));
     bool got = false;
     xSemaphoreTake(sfMutex, portMAX_DELAY);
@@ -1449,7 +1487,11 @@ void sfSendText(int startAddr, const char* text, bool blankUnused) {
   for (size_t i = 0; i < len; i++) {
     // One character, one module: a symbol that this module cannot show still occupies its
     // place (as a stand-in or a blank), so nothing shifts left around it.
-    sfSendCharRaw((int)(startAddr + i), wire[i]);
+    const int id = startAddr + (int)i;
+    // Off the wall is off the wall. A negative id is sfSendCharRaw's way of saying BROADCAST,
+    // so text sent with a negative start used to put its first characters on every module.
+    if (id < 0 || id > 254) continue;
+    sfSendCharRaw(id, wire[i]);
     delay(10); // inter-message gap to avoid bus collision
   }
   // Optionally blank any previously-set modules beyond the text length
@@ -1713,9 +1755,9 @@ void sfParseResponse(const uint8_t* data, size_t len) {
       *colon = 0;
       const char* sn = tmp;
       int newId = atoi(colon + 1);
-      if (!sfValidSN(sn)) {
-        DBG("[SF] rejecting ack with corrupt SN: %s\n", sn);
-      sfParseRejects++;
+      if (!sfValidSN(sn) || newId < 0 || newId > 254) {
+        DBG("[SF] rejecting ack with corrupt SN or id: %s:%d\n", sn, newId);
+        sfParseRejects++;
         return;
       }
       xSemaphoreTake(sfMutex, portMAX_DELAY);
@@ -1749,7 +1791,13 @@ void sfParseResponse(const uint8_t* data, size_t len) {
   int  idLen = 0;
   while (*p && isdigit((unsigned char)*p) && idLen < 7) idStr[idLen++] = *p++;
   if (idLen == 0) return;
-  uint8_t id = (uint8_t)atoi(idStr);
+  // 0..254, or it is not a module. The id used to be cut to a byte unchecked: "m300..." was
+  // filed under module 44, and "m255..." -- 255 being the registry's own marker for "no id,
+  // look it up by serial" -- went on to strcmp() a NULL serial and took the bus task, and the
+  // board, down with it. One garbled frame on a wall without checksums was enough.
+  const int idNum = atoi(idStr);
+  if (idNum > 254) { sfParseRejects++; return; }
+  uint8_t id = (uint8_t)idNum;
 
   xSemaphoreTake(sfMutex, portMAX_DELAY);
   SFModule* m = sfUpsert(id, NULL);

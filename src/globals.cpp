@@ -53,6 +53,9 @@ volatile bool gDisplayDirty = false;
 // cause of mid-upload connection drops). Set by the OTA handlers; read by the
 // network task.
 volatile bool gOtaInProgress = false;
+// millis() of the last sign of life from that upload (start, or any chunk). The supervisor
+// in main.cpp clears a gOtaInProgress that has gone three minutes without one.
+volatile unsigned long gOtaProgressMs = 0;
 // Fallback SoftAP: the AP is only brought up when the station is NOT connected
 // to a configured network (so the config page stays reachable). Once the station
 // connects, the AP is dropped and the gateway runs STA-only. Tracks whether the
@@ -69,6 +72,9 @@ StaticSemaphore_t     timeMutexBuf;
 volatile unsigned long wdgRS485Ms   = 0;
 volatile unsigned long gLastRxMs    = 0;  // millis() of last byte received on the bus
 int                    mqttFailCount = 0;  // consecutive MQTT connect failures
+volatile bool          gMqttUp = false;           // see common.h
+volatile bool          gMqttDropReq = false, gMqttReconfigReq = false;
+volatile bool          gNtpResyncReq = false;
 volatile unsigned long wdgNetMs     = 0;
 volatile unsigned long wdgWebMs     = 0;
 // Task handles -- used for uxTaskGetStackHighWaterMark on the Status page so

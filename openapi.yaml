@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "3.2.0"
+  version: "3.3.0"
   description: |
     REST API for the ESP32-S3 Split-Flap Gateway firmware. The version above is the
     API version `GET /api/capabilities` reports as `api`; the firmware has its own.
@@ -1211,7 +1211,7 @@ paths:
                 properties:
                   product:  { type: string, example: "Split-Flap Gateway" }
                   fw:       { type: string, example: "3.7.0" }
-                  api:      { type: string, example: "3.2.0" }
+                  api:      { type: string, example: "3.3.0" }
                   grid:
                     type: object
                     properties:
@@ -1676,6 +1676,70 @@ paths:
               schema: { $ref: "#/components/schemas/BusHolds" }
         "400":
           $ref: "#/components/responses/BadRequest"
+
+  /api/perf:
+    get:
+      tags: [Status]
+      summary: Who is asking the web server for what, and what it costs (v4.4)
+      description: |
+        The gateway serves one connection at a time, so a slow dashboard is one of three
+        things -- too many requests, an expensive request, or a client that connected and said
+        nothing -- and from outside they look the same. This counts all three from inside.
+        Figures cover the window since boot or since the last `?reset=1`.
+
+        `ms` is time inside the handler, including writing the response to the socket; it does
+        not include the connection set-up, which is where a slow radio link shows. A handler
+        that takes 4 ms and a request that takes 150 ms means the link, not the firmware.
+      parameters:
+        - name: reset
+          in: query
+          required: false
+          description: Present (any value) to start a new window after this response
+          schema: { type: string }
+      responses:
+        "200":
+          description: The current window
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:             { type: boolean }
+                  windowMs:       { type: integer, description: "Length of the window" }
+                  requests:       { type: integer }
+                  handlerMs:      { type: integer, description: "Total time spent inside handlers" }
+                  silentClientMs: { type: integer, description: "Time the server was held by a client that had connected and not (yet) sent a request" }
+                  unattributed:   { type: integer, description: "Requests to endpoints beyond the 40 the table holds" }
+                  heap:           { type: integer, description: "Free internal heap now, bytes" }
+                  minHeap:        { type: integer, description: "Its lowest since boot" }
+                  maxBlock:       { type: integer, description: "Largest single allocation possible now" }
+                  loopGapMs:
+                    type: object
+                    description: "Longest gap between two passes of each task's main loop in this window: how long that task was stuck somewhere"
+                    properties:
+                      rs485:   { type: integer }
+                      web:     { type: integer }
+                      network: { type: integer }
+                      rtc:     { type: integer }
+                  endpoints:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uri:     { type: string }
+                        n:       { type: integer, description: "Requests" }
+                        ms:      { type: integer, description: "Total handler time" }
+                        max:     { type: integer, description: "Slowest single request" }
+                        lowHeap: { type: integer, description: "The heap's all-time low if a request to this endpoint set it, else 0" }
+                  clients:
+                    type: array
+                    description: "Up to eight client addresses. A reverse proxy shows as one client"
+                    items:
+                      type: object
+                      properties:
+                        ip: { type: string }
+                        n:  { type: integer }
+                        ms: { type: integer }
 
   /api/bus/incidents:
     get:
@@ -2725,6 +2789,10 @@ components:
       type: object
       properties:
         uptime:    { type: integer, description: "Seconds since boot", example: 3842 }
+        rssi:      { type: integer, description: "Signal strength of the access point the gateway is joined to, in dBm; 0 when the station is down (v4.4)", example: -42 }
+        channel:   { type: integer, description: "WiFi channel of that access point (v4.4)", example: 6 }
+        bssid:     { type: string,  description: "That access point's address. On a network with several, this is which one the gateway chose -- the strongest it heard when it connected (v4.4)", example: "1c:6a:1b:11:ec:88" }
+        ps:        { type: integer, description: "Radio power-save mode: 0 = always on (the firmware's setting since v4.4), 1 or 2 = modem sleep, which adds a beacon interval to every round trip", example: 0 }
         psram:
           type: object
           description: "On-board PSRAM in bytes (v3.16). The large runtime buffers live here, which is what keeps internal RAM free for WiFi and an OTA upload."

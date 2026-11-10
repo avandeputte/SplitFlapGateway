@@ -111,7 +111,26 @@ void setup() {
   // fallback AP up after a grace period (and drops it again once the station
   // connects), so a working WiFi link never leaves the AP running.
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);
+  // Modem sleep OFF. The Arduino default dozes the radio between DTIM beacons, so every packet
+  // sent TO the gateway waits at the access point for the next one -- 100-300 ms on a typical
+  // network, per round trip, on a server whose every request is a new TCP connection. Measured
+  // from a wired machine: ping averaged 128 ms dozing against a few ms awake, and a request
+  // the handler answered in 9 ms took 120-180 ms to complete. This is a mains-powered wall
+  // controller; the ~70 mA the radio saves by dozing buys nothing, and costs the whole UI.
+  WiFi.setSleep(false);
+  // Join the STRONGEST access point, not the first one heard. The default (WIFI_FAST_SCAN)
+  // stops at the first AP that answers with the right name, so on a network with several --
+  // any mesh, any house with a second AP -- which one the gateway lands on is a coin toss
+  // taken at every boot, and it never moves afterwards: a station only re-chooses when it
+  // loses its AP. Seen on a three-AP network, same wall, same hour, one reboot apart:
+  //     AP at -42 dBm:  ping median  40 ms, no loss
+  //     AP at -54 dBm:  ping median 465 ms, 10 % loss, single pings taking 4 s
+  // -- which is "the dashboard is unusable today and was fine yesterday". Scanning every
+  // channel and sorting by signal costs about two seconds at connect time and nothing after.
+  // Both settings are held by the WiFi object, so every later WiFi.begin() (the reconnects in
+  // taskNetwork, a change of network from Settings) uses them too.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   if (strlen(cfg.wifiSSID)) {
     WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
     staDownSince = millis();   // start the fallback grace timer from boot
@@ -139,10 +158,15 @@ void setup() {
 
   // 8. Spawn tasks after WiFi stack is ready
   xTaskCreatePinnedToCore(taskRTC,     "RTC",     3072, NULL, 2, &hTaskRTC,   0);   // 2048 left only ~750 B spare
-  xTaskCreatePinnedToCore(taskRS485,   "RS485",   6144, NULL, 3, &hTaskRS485, 0);
+  // RS485 and Network were 6144. Both build RS485Msg records (~1.1 KB each) on their stacks
+  // -- the receive path, rs485Send() and the monitor ring all do -- on top of the frame
+  // parser and a registry save, and the supervisor's own figures showed RS485 with 1152 bytes
+  // to spare at its deepest. That is one more local away from a canary reset on the task that
+  // must never go down. 8192 each; the 4 KB comes out of ~120 KB free.
+  xTaskCreatePinnedToCore(taskRS485,   "RS485",   8192, NULL, 3, &hTaskRS485, 0);
   xTaskCreatePinnedToCore(taskOTA,     "OTA",     4096, NULL, 1, &hTaskOTA,   1);
   xTaskCreatePinnedToCore(taskWeb,     "Web",     8192, NULL, 2, &hTaskWeb,   0);
-  xTaskCreatePinnedToCore(taskNetwork, "Network", 6144, NULL, 1, &hTaskNet,   1);
+  xTaskCreatePinnedToCore(taskNetwork, "Network", 8192, NULL, 1, &hTaskNet,   1);
 
   printf("[Boot] Ready\n");
 }
@@ -155,6 +179,19 @@ void loop() {
   // accumulate toward the FATFS reformat in setup().
   static bool panicCounterCleared = false;
   if (!panicCounterCleared && now > 60000UL) { sfPanicBoots = 0; panicCounterCleared = true; }
+
+  // An update that stopped making progress must not leave the gateway "updating" for ever.
+  // gOtaInProgress switches off a lot on purpose -- MQTT, the fallback AP, the registry save,
+  // and BOTH safety reboots below -- and every path that sets it is expected to clear it. One
+  // that does not (a client that vanishes in a way the server never reports, a restart that
+  // does not happen) would leave a wall that looks alive and has quietly lost its watchdog.
+  // Every chunk stamps gOtaProgressMs; three minutes without one is not an upload any more.
+  if (gOtaInProgress && gOtaProgressMs && now - gOtaProgressMs > 180000UL) {
+    printf("[OTA] no progress for 3 min -- abandoning the update, resuming normal service\n");
+    gOtaInProgress = false;
+    gOtaProgressMs = 0;
+    if (WiFi.status() != WL_CONNECTED) wifiSetApActive(true);
+  }
   if (now - lastWdgCheck >= 30000UL) {
     lastWdgCheck = now;
     // Rich periodic telemetry for troubleshooting. Heap + min-ever heap +
@@ -180,7 +217,7 @@ void loop() {
            (int)(WiFi.status()==WL_CONNECTED),
            (int)gApActive,
            (WiFi.status()==WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
-           (int)mqtt.connected(), sfModuleCount);
+           (int)gMqttUp, sfModuleCount);
 
     // NEVER reboot the board while a web-OTA upload is in flight -- neither for a stall nor for
     // low heap. A firmware upload DELIBERATELY drives internal heap to the floor: a 1.45 MB image
