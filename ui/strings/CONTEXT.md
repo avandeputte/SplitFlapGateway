@@ -10,34 +10,64 @@ and **Last Seen** are table headings.
 
 | English | Where | What kind of thing it is |
 |---|---|---|
+| `"+t("Show every kind of traffic")+"` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `"+t("Show the summary")+"` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `"? Anything it is doing stops, and display content resumes.` | — | (built at runtime) |
 | `' to` | — | RUNTIME MESSAGE (shown after an action, in sendChar()) |
+| `(RS-485 on the hardware USART)` | — | RUNTIME MESSAGE (shown after an action, in renderInfo()) |
 | `(adjusting)` | — | RUNTIME MESSAGE (shown after an action, in calWizNudge()) |
+| `(blank)` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |
+| `(color flap)` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |
 | `(custom)` | — | RUNTIME MESSAGE (shown after an action, in calWizShow()) |
 | `(default)` | — | RUNTIME MESSAGE (shown after an action, in calWizReset()); RUNTIME MESSAGE (shown after an action, in calWizShow()) |
 | `(offset` | — | RUNTIME MESSAGE (shown after an action, in calWizHomeNudge()) |
 | `(offset now` | — | RUNTIME MESSAGE (shown after an action, in calNudge()) |
+| `(pass` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `(raw)` | — | RUNTIME MESSAGE (shown after an action, in doSend()) |
+| `(symbol flap)` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |
+| `(two replies on top of each other)` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `(using default)` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |
 | `) and cleared custom value.` | — | RUNTIME MESSAGE (shown after an action, in calWizReset()) |
 | `). Click Home Motor to verify.` | — | RUNTIME MESSAGE (shown after an action, in calSaveHo()) |
 | `). Saved instantly.` | — | RUNTIME MESSAGE (shown after an action, in calNudge()) |
 | `). Saved.` | — | RUNTIME MESSAGE (shown after an action, in calWizHomeNudge()) |
-| `- check which module moves` | — | RUNTIME MESSAGE (shown after an action, in doHomeSN()) |
+| `, and asked alone it missed` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `, worst` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `- display content is paused until it finishes` | — | RUNTIME MESSAGE (shown after an action, in setMaintUI()) |
+| `- it will re-appear as a provisioned module in a few seconds.` | — | RUNTIME MESSAGE (shown after an action, in assignId()) |
+| `- the bus is reserved, every module command waits` | — | RUNTIME MESSAGE (shown after an action, in setMaintUI()) |
+| `- while this tab is open, display content from elsewhere is paused. Homing and calibration still work.` | — | RUNTIME MESSAGE (shown after an action, in setMaintUI()) |
 | `-- Destructive Actions` | — | RUNTIME MESSAGE (shown after an action, in openDel()) |
 | `-- the reel is spinning, please wait (up to ~15s)...` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
+| `. Each module's own before-values are still in the report above.` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
 | `... watch the reel.` | — | RUNTIME MESSAGE (shown after an action, in calTuneGoto()) |
+| `.local` | — | (built at runtime) |
 | `0 frames` | Bus Monitor tab (live RS-485 traffic) | INLINE TEXT; RUNTIME MESSAGE (shown after an action, in clearLog()) |
+| `10 minutes` | Status tab (diagnostics) | DROPDOWN OPTION |
+| `20 minutes` | Status tab (diagnostics) | DROPDOWN OPTION |
+| `30 minutes` | Status tab (diagnostics) | DROPDOWN OPTION |
+| `5 minutes` | Status tab (diagnostics) | DROPDOWN OPTION |
 | `? The reel will spin a full revolution to measure its steps per revolution.` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `? This cannot be undone.` | — | RUNTIME MESSAGE (shown after an action, in delAction()) |
-| `AABBCCDD...` | Provision tab (assign bus IDs) | INPUT PLACEHOLDER (example text) |
+| `A roll call reached modules the gateway does not list: a module that was never registered, or one whose ID was reassigned by hand.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `A value the test wrote could not be confirmed put back.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `AP IP` | Status tab (diagnostics) | TEXT |
 | `AP fallback:` | — | (built at runtime) |
 | `Absolute Target Step` | Calibration tab (tune a module's flap positions) | FORM LABEL (names the input below it -- a noun phrase) |
+| `Actions that reach` | — | (built at runtime) |
 | `Active Flap Count` | — | (built at runtime) |
 | `Adjust the value, then Test Position to move there. Lock to EEPROM when it looks right.` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
+| `After` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
+| `All modules de-provisioned. They will re-appear below as they start advertising.` | — | RUNTIME MESSAGE (shown after an action, in wwDeprovAll()) |
 | `Already at default (` | — | RUNTIME MESSAGE (shown after an action, in calWizReset()) |
 | `Already at default -- no change needed.` | — | RUNTIME MESSAGE (shown after an action, in calWizConfirm()) |
-| `Assign ID` | Provision tab (assign bus IDs) | BUTTON (an action -- use the imperative) |
+| `Answered` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
+| `Apply Flap Set to All Modules` | Modules tab (the module grid) | BUTTON (an action -- use the imperative) |
+| `Apply this flap set to every module on the bus? Any module you gave a different reel will be overwritten.` | — | RUNTIME MESSAGE (shown after an action, in wwFlapSet()) |
+| `Asking...` | — | RUNTIME MESSAGE (shown after an action, in poll()) |
+| `Asks this module for four replies of increasing size and reports which come back. Use it when a module seems silent: if the short ones answer and the long ones do not, the problem is the bus carrying a long frame, not the module.` | — | RUNTIME MESSAGE (shown after an action, in probeSection()) |
+| `Assign` | — | RUNTIME MESSAGE (shown after an action, in loadModules()) |
+| `Assigned ID` | — | RUNTIME MESSAGE (shown after an action, in assignId()) |
 | `Auckland (UTC+12/+13)` | Settings tab | DROPDOWN OPTION |
 | `Auto` | Settings tab | EMPHASIS |
 | `Auto (browser)` | — | RUNTIME MESSAGE (shown after an action, in go()) |
@@ -45,17 +75,33 @@ and **Last Seen** are table headings.
 | `Auto-scroll` | — | (built at runtime) |
 | `Automatically enable Quiet Time on a daily schedule. When the window opens the gateway blanks the display and stops moving flaps for normal updates. The display is restored when the window ends. Times are in your browser's local time zone.` | Settings tab | HELP TEXT (a full sentence) |
 | `Azores (UTC-1/0)` | Settings tab | DROPDOWN OPTION |
+| `B, shown truncated` | — | (built at runtime) |
+| `BLANK (home)` | — | RUNTIME MESSAGE (shown after an action, in calCharName()) |
 | `BLANK (home). Press Re-home, then nudge until the blank flap is centered. Nudges save instantly.` | Calibration tab (tune a module's flap positions) | TEXT |
 | `Back` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Backup Calibration` | Settings tab | HEADING (card title -- a noun phrase) |
 | `Backup created:` | — | (built at runtime) |
 | `Backup file` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Backup file to store on the gateway` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Backup stored on the gateway.` | — | RUNTIME MESSAGE (shown after an action, in rbUpload()) |
 | `Bangkok (UTC+7 no DST)` | Settings tab | DROPDOWN OPTION |
+| `Before the test wrote anything it read the calibration of` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
 | `Before you start (1 of 2)` | Calibration tab (tune a module's flap positions) | HEADING |
 | `Before you start (2 of 2)` | Calibration tab (tune a module's flap positions) | HEADING |
+| `Board` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `Board v` | — | RUNTIME MESSAGE (shown after an action, in boardLabel()) |
+| `Broadcast Replies Sent` | — | (built at runtime) |
 | `Broadcasts m*v to all modules so they report their version and serial number` | Modules tab (the module grid) | TOOLTIP |
 | `Broker Host / IP` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Broker OK - connected and authenticated` | — | RUNTIME MESSAGE (shown after an action, in testMqtt()) |
+| `Broker connect failed` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `Broker connected` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `Broker connection closed` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `Broker connection lost` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `Broker unreachable` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Bus Health` | Status tab (diagnostics) | HEADING |
+| `Bus reply-size probe` | — | RUNTIME MESSAGE (shown after an action, in probeSection()) |
+| `Bytes DID arrive while they had the bus and the gateway discarded them (too long, or never terminated), so the reply is being started and not surviving the trip.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Cached EEPROM -- click Re-read for a fresh value` | — | RUNTIME MESSAGE (shown after an action, in calRefresh()) |
 | `Calibrate` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Calibrate (Count Steps)` | Calibration tab (tune a module's flap positions) | EMPHASIS |
@@ -70,26 +116,39 @@ and **Last Seen** are table headings.
 | `Calibration timed out (no response from module).` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Calibration timed out (no response).` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Calibration wizard complete -- all flaps reviewed.` | — | RUNTIME MESSAGE (shown after an action, in calWizFinish()) |
-| `Cancel` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
+| `Cancel` | Calibration tab (tune a module's flap positions); Modules tab (the module grid); Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
+| `Cancel Restore` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Cancelled after` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
+| `Cancelled. The bus is free again.` | — | RUNTIME MESSAGE (shown after an action, in soakCancel()) |
+| `Cancelled. The bus is still held by:` | — | RUNTIME MESSAGE (shown after an action, in soakCancel()) |
+| `Cancelling...` | — | RUNTIME MESSAGE (shown after an action, in soakCancel()) |
 | `Character` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Character Map` | Calibration tab (tune a module's flap positions) | HEADING (card title -- a noun phrase) |
 | `Character Set` | — | (built at runtime) |
+| `Character Set (order = flap index)` | Modules tab (the module grid) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Character Set (order = flap index, blank = leave unchanged)` | Status tab (diagnostics) | FORM LABEL (names the input below it -- a noun phrase) |
-| `Choose a backup file first.` | Status tab (diagnostics) | INLINE TEXT |
-| `Clear` | Bus Monitor tab (live RS-485 traffic); Settings tab | BUTTON (an action -- use the imperative) |
+| `Character set is longer than 64 flaps.` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()) |
+| `Checksum Failures` | — | (built at runtime) |
+| `Checksummed frames (module firmware v33 and later): how many were verified, and how many were dropped because the wire had corrupted them. Failures should be zero.` | Status tab (diagnostics) | TOOLTIP |
+| `Checksums OK / Failed` | Status tab (diagnostics) | TEXT |
+| `Choose a backup file first.` | Status tab (diagnostics) | INLINE TEXT; RUNTIME MESSAGE (shown after an action, in rbUpload()) |
+| `Choose a file first.` | — | RUNTIME MESSAGE (shown after an action, in mfwUpload()) |
+| `Clear` | Bus Monitor tab (live RS-485 traffic); Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
 | `Clears the calibration flap map. The module keeps its ID but loses per-flap positions until re-calibrated.` | Modules tab (the module grid) | SMALL PRINT |
 | `Clock` | Status tab (diagnostics) | HEADING |
 | `Close` | Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
+| `Closed by the broker or the network` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Columns` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
-| `Companion` | Settings tab | EMPHASIS |
-| `Companion App` | Settings tab; Status tab (diagnostics) | HEADING; HEADING (card title -- a noun phrase) |
-| `Companion URL` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Combined dump (longest)` | — | RUNTIME MESSAGE (shown after an action, in probeLabel()) |
+| `Companion App` | Status tab (diagnostics) | HEADING |
 | `Confirm & Next →` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Confirm / adjust home position now` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Confirm home position` | Calibration tab (tune a module's flap positions) | HEADING |
-| `Connected` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
+| `Connected` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()); RUNTIME MESSAGE (shown after an action, in pollStatus()) |
+| `Connection History` | Settings tab | HEADING |
 | `Could not load display state` | — | RUNTIME MESSAGE (shown after an action, in refreshWall()) |
 | `Could not read file.` | Status tab (diagnostics) | INLINE TEXT |
+| `Could not release it:` | — | RUNTIME MESSAGE (shown after an action, in busForceRelease()) |
 | `Count Steps` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative); RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Count steps on module` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Counting...` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
@@ -98,22 +157,34 @@ and **Last Seen** are table headings.
 | `Current flap set unknown -- click Refresh for a fresh read.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `DUP?` | Status tab (diagnostics) | INLINE TEXT |
 | `Data (ASCII)` | Bus Monitor tab (live RS-485 traffic) | FORM LABEL (names the input below it -- a noun phrase) |
-| `De-provision` | Provision tab (assign bus IDs) | BUTTON (an action -- use the imperative) |
-| `De-provision Module` | Provision tab (assign bus IDs) | HEADING (card title -- a noun phrase) |
-| `De-provisioned` | — | RUNTIME MESSAGE (shown after an action, in doDeprovision()) |
+| `De-provision` | — | (built at runtime) |
+| `De-provision All` | Modules tab (the module grid) | HEADING |
+| `De-provision All Modules` | Modules tab (the module grid) | BUTTON (an action -- use the imperative) |
+| `De-provision every module? They all lose their IDs and go back to advertising, and you will have to assign IDs again.` | — | RUNTIME MESSAGE (shown after an action, in wwDeprovAll()) |
 | `Debug disabled` | — | RUNTIME MESSAGE (shown after an action, in saveDebug()) |
 | `Debug enabled` | — | RUNTIME MESSAGE (shown after an action, in saveDebug()) |
+| `Default step pacing (ms)` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Default:` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |
+| `Delay after boot (seconds)` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Delete Stored Backup` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Delete the backup stored on the gateway?` | — | RUNTIME MESSAGE (shown after an action, in rbDelete()) |
 | `Deprovision and reassign unique IDs.` | — | (built at runtime) |
 | `Destructive Actions` | Modules tab (the module grid) | INLINE TEXT |
 | `Dhaka (UTC+6 no DST)` | Settings tab | DROPDOWN OPTION |
 | `Diagnostics` | Status tab (diagnostics) | HEADING |
 | `Diagnostics -- Module` | — | RUNTIME MESSAGE (shown after an action, in runDiag()) |
+| `Discards and rejects should both stay at zero. If they climb, suspect the bus before the modules: check that the 120Ω termination jumper is fitted at both ends.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `Display` | — | TAB / LINK LABEL (a noun) |
 | `Display Layout` | Settings tab | HEADING (card title -- a noun phrase) |
+| `Down arrow` | — | RUNTIME MESSAGE (shown after an action, in flapSymLabel()) |
 | `Download Log` | Bus Monitor tab (live RS-485 traffic) | BUTTON (an action -- use the imperative) |
+| `Download that snapshot` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `Driver Board` | — | (built at runtime) |
+| `Dropping out at every size:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Dubai (UTC+4 no DST)` | Settings tab | DROPDOWN OPTION |
+| `Duration` | Status tab (diagnostics) | FORM LABEL (names the input below it -- a noun phrase) |
 | `EEPROM` | Status tab (diagnostics) | TEXT |
+| `EEPROM dump` | — | RUNTIME MESSAGE (shown after an action, in probeLabel()) |
 | `EEPROM is cached -- click Refresh for a fresh read` | — | RUNTIME MESSAGE (shown after an action, in done()) |
 | `EEPROM read fresh from module` | — | RUNTIME MESSAGE (shown after an action, in calRefresh()) |
 | `Enable Home Assistant integration` | — | (built at runtime) |
@@ -121,19 +192,28 @@ and **Last Seen** are table headings.
 | `Enable schedule` | — | (built at runtime) |
 | `Enable verbose serial output on the native USB serial port (115200 baud). Shows every RX/TX frame, MQTT events, and module activity.` | Settings tab | HELP TEXT (a full sentence) |
 | `Enter a character` | — | RUNTIME MESSAGE (shown after an action, in sendChar()) |
+| `Enter a flap count or a character set.` | — | RUNTIME MESSAGE (shown after an action, in wwFlapSet()) |
 | `Enter a flap count or character set.` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()) |
 | `Enter a flap number 1-` | — | RUNTIME MESSAGE (shown after an action, in bmJump()) |
 | `Enter a valid home offset.` | — | RUNTIME MESSAGE (shown after an action, in calSaveHo()) |
 | `Enter a valid step.` | — | RUNTIME MESSAGE (shown after an action, in calTuneGoto()); RUNTIME MESSAGE (shown after an action, in calTuneLock()) |
 | `Enter a valid total steps.` | — | RUNTIME MESSAGE (shown after an action, in calSaveTs()) |
+| `Enter an ID between 0 and 254 for that module.` | — | RUNTIME MESSAGE (shown after an action, in assignId()) |
 | `Enter an ID from 0 to 254.` | — | RUNTIME MESSAGE (shown after an action, in calSelectAny()) |
 | `Erase EEPROM` | — | (built at runtime) |
 | `Error` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `Error loading layout` | Status tab (diagnostics) | INLINE TEXT |
 | `Error loading layout.` | — | RUNTIME MESSAGE (shown after an action, in bmStart()) |
 | `Error reading module` | — | RUNTIME MESSAGE (shown after an action, in bmCell()) |
-| `Error:` | — | RUNTIME MESSAGE (shown after an action); RUNTIME MESSAGE (shown after an action, in bmCell()); RUNTIME MESSAGE (shown after an action, in calCountSteps()); RUNTIME MESSAGE (shown after an action, in calHomeMotor()); RUNTIME MESSAGE (shown after an action, in calNudge()); RUNTIME MESSAGE (shown after an action, in calRefresh()); RUNTIME MESSAGE (shown after an action, in calRevertHo()); RUNTIME MESSAGE (shown after an action, in calRevertTs()); RUNTIME MESSAGE (shown after an action, in calSaveHo()); RUNTIME MESSAGE (shown after an action, in calSaveTs()); RUNTIME MESSAGE (shown after an action, in calTuneGoto()); RUNTIME MESSAGE (shown after an action, in calTuneLock()); RUNTIME MESSAGE (shown after an action, in calTuneRevert()); RUNTIME MESSAGE (shown after an action, in calWizHomeNudge()); RUNTIME MESSAGE (shown after an action, in delAction()); RUNTIME MESSAGE (shown after an action, in doDeprovision()); RUNTIME MESSAGE (shown after an action, in doHomeSN()); RUNTIME MESSAGE (shown after an action, in doProvision()); RUNTIME MESSAGE (shown after an action, in doSend()); RUNTIME MESSAGE (shown after an action, in g()); RUNTIME MESSAGE (shown after an action, in homeAll()); RUNTIME MESSAGE (shown after an action, in refreshModules()); RUNTIME MESSAGE (shown after an action, in saveDebug()); RUNTIME MESSAGE (shown after an action, in saveFlapConfig()); RUNTIME MESSAGE (shown after an action, in saveGrid()); RUNTIME MESSAGE (shown after an action, in saveHa()); RUNTIME MESSAGE (shown after an action, in saveMqtt()); RUNTIME MESSAGE (shown after an action, in saveOTA()); RUNTIME MESSAGE (shown after an action, in saveTz()); RUNTIME MESSAGE (shown after an action, in saveWifi()); RUNTIME MESSAGE (shown after an action, in sendChar()); RUNTIME MESSAGE (shown after an action, in sendIndex()); RUNTIME MESSAGE (shown after an action, in sendText()); RUNTIME MESSAGE (shown after an action, in testMqtt()) |
+| `Error:` | — | RUNTIME MESSAGE (shown after an action); RUNTIME MESSAGE (shown after an action, in assignId()); RUNTIME MESSAGE (shown after an action, in bmCell()); RUNTIME MESSAGE (shown after an action, in calCountSteps()); RUNTIME MESSAGE (shown after an action, in calHomeMotor()); RUNTIME MESSAGE (shown after an action, in calNudge()); RUNTIME MESSAGE (shown after an action, in calRefresh()); RUNTIME MESSAGE (shown after an action, in calRevertHo()); RUNTIME MESSAGE (shown after an action, in calRevertTs()); RUNTIME MESSAGE (shown after an action, in calSaveHo()); RUNTIME MESSAGE (shown after an action, in calSaveTs()); RUNTIME MESSAGE (shown after an action, in calTuneGoto()); RUNTIME MESSAGE (shown after an action, in calTuneLock()); RUNTIME MESSAGE (shown after an action, in calTuneRevert()); RUNTIME MESSAGE (shown after an action, in calWizHomeNudge()); RUNTIME MESSAGE (shown after an action, in delAction()); RUNTIME MESSAGE (shown after an action, in doHomeSN()); RUNTIME MESSAGE (shown after an action, in doSend()); RUNTIME MESSAGE (shown after an action, in g()); RUNTIME MESSAGE (shown after an action, in homeAll()); RUNTIME MESSAGE (shown after an action, in mfwStart()); RUNTIME MESSAGE (shown after an action, in mfwUpload()); RUNTIME MESSAGE (shown after an action, in poll()); RUNTIME MESSAGE (shown after an action, in probeRun()); RUNTIME MESSAGE (shown after an action, in rbCancel()); RUNTIME MESSAGE (shown after an action, in rbDelete()); RUNTIME MESSAGE (shown after an action, in rbRunNow()); RUNTIME MESSAGE (shown after an action, in rbSave()); RUNTIME MESSAGE (shown after an action, in rbUpload()); RUNTIME MESSAGE (shown after an action, in refreshModules()); RUNTIME MESSAGE (shown after an action, in saveDebug()); RUNTIME MESSAGE (shown after an action, in saveFlapConfig()); RUNTIME MESSAGE (shown after an action, in saveGrid()); RUNTIME MESSAGE (shown after an action, in saveHa()); RUNTIME MESSAGE (shown after an action, in saveMdns()); RUNTIME MESSAGE (shown after an action, in saveMqtt()); RUNTIME MESSAGE (shown after an action, in saveOTA()); RUNTIME MESSAGE (shown after an action, in saveTz()); RUNTIME MESSAGE (shown after an action, in saveWifi()); RUNTIME MESSAGE (shown after an action, in sendChar()); RUNTIME MESSAGE (shown after an action, in sendIndex()); RUNTIME MESSAGE (shown after an action, in sendText()); RUNTIME MESSAGE (shown after an action, in soakRollback()); RUNTIME MESSAGE (shown after an action, in soakRun()); RUNTIME MESSAGE (shown after an action, in testMqtt()); RUNTIME MESSAGE (shown after an action, in wwDeprovAll()); RUNTIME MESSAGE (shown after an action, in wwFlapSet()) |
+| `Event` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
+| `Every frame of this run was recorded:` | — | RUNTIME MESSAGE (shown after an action, in traceInfo()) |
+| `Every module answered every size and every roll call, and every write read back and was put back.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Every module forgets its ID and goes back to advertising its serial number. Calibration is not touched.` | Modules tab (the module grid) | HELP TEXT (a full sentence) |
+| `Every module scored clean, but the gateway also received frames that never terminated or were too long to be a reply. Something else is talking on the bus.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Every module should be showing this flap:` | Calibration tab (tune a module's flap positions) | TEXT |
+| `Every reply came back, at every size. This module and its link are healthy.` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
+| `Every time the broker connection or the WiFi under it changed, and why. Survives a restart, not a power cut. A lost connection is retried every 30 seconds for as long as it takes.` | Settings tab | HELP TEXT (a full sentence) |
 | `Exit` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Expected: -` | Calibration tab (tune a module's flap positions) | TEXT |
 | `FW:` | — | (built at runtime) |
@@ -141,25 +221,38 @@ and **Last Seen** are table headings.
 | `Factory Reset` | — | (built at runtime) |
 | `Failed:` | — | RUNTIME MESSAGE (shown after an action, in testMqtt()) |
 | `Finish` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
+| `Finished after` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
+| `Finished in` | — | RUNTIME MESSAGE (shown after an action, in poll()) |
 | `Firmware` | — | (built at runtime) |
+| `Firmware uploaded and ready to send` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `Firmware v` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `Flap` | — | RUNTIME MESSAGE (shown after an action, in bmShow()); RUNTIME MESSAGE (shown after an action, in calWizShow()) |
+| `Flap Count (1-64)` | Modules tab (the module grid) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Flap Count (1-64, blank = leave unchanged)` | Status tab (diagnostics) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Flap Index (0-63)` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
-| `Flap Set` | Status tab (diagnostics) | TEXT |
+| `Flap Set` | Modules tab (the module grid); Status tab (diagnostics) | HEADING; TEXT |
 | `Flap count must be 1-64.` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()) |
+| `Flap count must be between 1 and 64.` | — | RUNTIME MESSAGE (shown after an action, in wwFlapSet()) |
+| `Frames Discarded` | Status tab (diagnostics) | TEXT |
 | `Frames RX` | Status tab (diagnostics) | TEXT |
 | `Frames TX` | Status tab (diagnostics) | TEXT |
+| `Frames that arrived complete but would not parse -- usually corruption on the wire.` | Status tab (diagnostics) | TOOLTIP |
 | `Free Heap` | Status tab (diagnostics) | TEXT |
 | `From` | — | (built at runtime) |
+| `GATEWAY` | — | INLINE TEXT |
+| `Gateway Firmware` | Settings tab | HEADING (card title -- a noun phrase) |
 | `Gateway Time` | Status tab (diagnostics) | TEXT |
+| `Gateway restarted` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `Gives the modules time to power up and finish their own homing before the restore starts.` | Settings tab | HELP TEXT (a full sentence) |
 | `Go` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Green = custom EEPROM value. Grey = firmware default. Click a character to tune its position, or run the wizard to step through every flap.` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
 | `HELLO WORLD` | Display tab (send text/characters to the wall) | INPUT PLACEHOLDER (example text) |
 | `Hall sensor self-test (T)` | Status tab (diagnostics) | H4 |
+| `Harmless in ones and twos. If the count is high, the bus is overflowing module receivers: shorten the run, check termination, and keep an eye on Frames Discarded.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Has the` | — | (built at runtime) |
 | `Have you run` | — | (built at runtime) |
+| `Heart` | — | RUNTIME MESSAGE (shown after an action, in flapSymLabel()) |
 | `Helsinki/Athens (UTC+2/+3)` | Settings tab | DROPDOWN OPTION |
-| `Home` | Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
 | `Home All` | Calibration tab (tune a module's flap positions); Display tab (send text/characters to the wall) | BUTTON (an action -- use the imperative) |
 | `Home Assistant` | Settings tab | HEADING (card title -- a noun phrase) |
 | `Home Assistant integration disabled` | — | RUNTIME MESSAGE (shown after an action, in saveHa()) |
@@ -170,22 +263,27 @@ and **Last Seen** are table headings.
 | `Home is centered -- start wizard` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Home offset reset to default (` | — | RUNTIME MESSAGE (shown after an action, in calRevertHo()) |
 | `Home offset saved (` | — | RUNTIME MESSAGE (shown after an action, in calSaveHo()) |
-| `Home this module to identify it` | — | (built at runtime) |
 | `Homed. Is the blank flap centered?` | — | RUNTIME MESSAGE (shown after an action, in calWizHomeStage()) |
 | `Homes every module (broadcasts m*h) so all reels return to their home flap` | Calibration tab (tune a module's flap positions); Display tab (send text/characters to the wall) | TOOLTIP |
-| `Homing SN:` | — | RUNTIME MESSAGE (shown after an action, in doHomeSN()) |
 | `Homing all modules – reels returning home` | — | (built at runtime) |
+| `Homing all modules...` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `Homing all modules…` | — | (built at runtime) |
 | `Homing module` | — | RUNTIME MESSAGE (shown after an action, in calHomeMotor()) |
+| `Homing that module - watch which tile moves.` | — | RUNTIME MESSAGE (shown after an action, in doHomeSN()) |
 | `Homing...` | — | RUNTIME MESSAGE (shown after an action, in calWizHomeStage()) |
 | `Hostname of the time server used to sync the clock. Default: pool.ntp.org` | Settings tab | HELP TEXT (a full sentence) |
 | `How the modules are physically arranged, for the Live Display on the Display tab. Modules map left-to-right, top-to-bottom by ID (module 0 = top-left).` | Settings tab | HELP TEXT (a full sentence) |
+| `ID` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `ID:` | — | (built at runtime) |
+| `Identify` | — | RUNTIME MESSAGE (shown after an action, in loadModules()) |
 | `Identify All` | Modules tab (the module grid) | BUTTON (an action -- use the imperative) |
 | `Identifying...` | — | RUNTIME MESSAGE (shown after an action, in refreshModules()) |
+| `Insert` | — | RUNTIME MESSAGE (shown after an action, in flapPalette()) |
 | `Invalid JSON file.` | Status tab (diagnostics) | INLINE TEXT |
+| `It is kept until the next run, clean or not, and it is what to send with a bug report.` | — | RUNTIME MESSAGE (shown after an action, in traceInfo()) |
 | `Jump to flap:` | Calibration tab (tune a module's flap positions) | INLINE TEXT |
-| `KB` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
+| `KB` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()); RUNTIME MESSAGE (shown after an action, in rbFileText()) |
+| `KB)` | — | (built at runtime) |
 | `Karachi (UTC+5 no DST)` | Settings tab | DROPDOWN OPTION |
 | `Known Modules` | Modules tab (the module grid) | HEADING (card title -- a noun phrase) |
 | `LEGACY` | Status tab (diagnostics) | INLINE TEXT |
@@ -193,39 +291,47 @@ and **Last Seen** are table headings.
 | `Language of this dashboard.` | — | (built at runtime) |
 | `Last Char` | — | (built at runtime) |
 | `Last Seen` | — | (built at runtime) |
+| `Last drop` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
 | `Last flap reached -- click Finish.` | — | RUNTIME MESSAGE (shown after an action, in bmNext()) |
+| `Last restore (` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `Layout saved` | — | RUNTIME MESSAGE (shown after an action, in saveGrid()) |
 | `Leave blank for no password` | Settings tab | INPUT PLACEHOLDER (example text) |
 | `Leave blank for open network` | Settings tab | INPUT PLACEHOLDER (example text) |
+| `Left arrow` | — | RUNTIME MESSAGE (shown after an action, in flapSymLabel()) |
 | `List cleared, identifying all modules -- refreshing in 2s` | — | RUNTIME MESSAGE (shown after an action, in refreshModules()) |
 | `Live Display` | Display tab (send text/characters to the wall) | HEADING (card title -- a noun phrase) |
 | `Loading board layout...` | — | RUNTIME MESSAGE (shown after an action, in bmStart()) |
 | `Loading layout...` | — | RUNTIME MESSAGE (shown after an action, in calLoadModules()) |
 | `Loading module list...` | — | RUNTIME MESSAGE (shown after an action, in doBackup()) |
 | `Loading modules...` | Calibration tab (tune a module's flap positions) | TEXT |
-| `Loading...` | Calibration tab (tune a module's flap positions); Display tab (send text/characters to the wall); Modules tab (the module grid); Provision tab (assign bus IDs) | TEXT |
+| `Loading...` | Calibration tab (tune a module's flap positions); Display tab (send text/characters to the wall); Modules tab (the module grid) | TEXT |
 | `Lock to EEPROM` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Locked to EEPROM at step` | — | RUNTIME MESSAGE (shown after an action, in calTuneLock()) |
 | `London (UTC+0/+1)` | Settings tab | DROPDOWN OPTION |
+| `Longest Reply` | Status tab (diagnostics) | TEXT |
 | `Look at the module. If it is centered, confirm. If not, nudge until it is.` | Calibration tab (tune a module's flap positions) | TEXT |
 | `Look at the wall. Click any module showing the wrong flap to nudge it (same controls as the single-module tuner), then advance to the next flap.` | Calibration tab (tune a module's flap positions) | TEXT |
+| `Lowercase letters, digits and hyphens only, starting and ending with a letter or digit.` | — | RUNTIME MESSAGE (shown after an action, in saveMdns()) |
+| `Lowercase letters, digits and hyphens.` | — | (built at runtime) |
 | `Lowest minimum-ever free stack across tasks. Trending toward 0 warns of a stack overflow before it crashes.` | Status tab (diagnostics) | TOOLTIP |
-| `MAINTENANCE MODE - external MQTT commands are being ignored` | — | (built at runtime) |
+| `MAINTENANCE - display content is paused` | — | INLINE TEXT |
 | `MQTT` | Settings tab; Status tab (diagnostics) | HEADING (card title -- a noun phrase); TEXT |
 | `MQTT saved - reconnecting...` | — | RUNTIME MESSAGE (shown after an action, in saveMqtt()) |
+| `MQTT settings saved` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `Maintenance mode is on` | — | RUNTIME MESSAGE (shown after an action, in setMaintUI()) |
 | `Maintenance mode is strongly recommended before calibrating, so external commands received via MQTT cannot move the reels mid-calibration.` | Calibration tab (tune a module's flap positions) | INLINE TEXT |
 | `Matches default -- cleared custom value.` | — | RUNTIME MESSAGE (shown after an action, in calWizConfirm()) |
 | `Measured` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Mechanical self-test (M)` | Status tab (diagnostics) | H4 |
 | `Min Heap Ever` | Status tab (diagnostics) | TEXT |
-| `Module` | Calibration tab (tune a module's flap positions) | HEADING (card title -- a noun phrase); RUNTIME MESSAGE (shown after an action, in bmCell()); RUNTIME MESSAGE (shown after an action, in calSelect()) |
+| `Mixed result -- run it again with more rounds to see whether it is intermittent.` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
+| `Module` | Calibration tab (tune a module's flap positions) | HEADING (card title -- a noun phrase); RUNTIME MESSAGE (shown after an action, in bmCell()); RUNTIME MESSAGE (shown after an action, in calSelect()); RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `Module #` | — | RUNTIME MESSAGE (shown after an action, in openDel()); RUNTIME MESSAGE (shown after an action, in openInfo()) |
 | `Module EEPROM` | Modules tab (the module grid) | INLINE TEXT |
+| `Module Firmware` | Modules tab (the module grid) | HEADING (card title -- a noun phrase) |
 | `Module ID` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
-| `Module ID (-1 = all modules)` | Provision tab (assign bus IDs) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Module ID (-1 = all)` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Modules` | Status tab (diagnostics) | TAB / LINK LABEL (a noun); TEXT |
-| `Modules without an ID broadcast their serial number every 10-15 seconds. Use Home to identify which physical module it is, then assign an ID.` | Provision tab (assign bus IDs) | HELP TEXT (a full sentence) |
 | `Monitor` | Bus Monitor tab (live RS-485 traffic) | HEADING (card title -- a noun phrase); TAB / LINK LABEL (a noun) |
 | `Moscow (UTC+3 no DST)` | Settings tab | DROPDOWN OPTION |
 | `Motor spinning` | — | (built at runtime) |
@@ -233,47 +339,65 @@ and **Last Seen** are table headings.
 | `Moving to step` | — | RUNTIME MESSAGE (shown after an action, in calTuneGoto()) |
 | `NTP Server` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `NTP Sync` | Status tab (diagnostics) | TEXT |
+| `Name` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Network` | Status tab (diagnostics) | HEADING |
+| `Network Name` | Settings tab | HEADING (card title -- a noun phrase) |
 | `Network name` | Settings tab | INPUT PLACEHOLDER (example text) |
-| `New ID (0-254)` | Provision tab (assign bus IDs) | FORM LABEL (names the input below it -- a noun phrase) |
+| `Never answered:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `New module? Running Calibrate is recommended to confirm this reel's actual step count and home offset. It spins one full revolution to measure steps/rev, then saves the result.` | Calibration tab (tune a module's flap positions) | INLINE TEXT |
 | `Next →` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `No -- run Calibrate now` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
+| `No backup stored on the gateway.` | — | RUNTIME MESSAGE (shown after an action, in rbFileText()) |
+| `No broker configured.` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
 | `No calibration data could be read.` | Status tab (diagnostics) | INLINE TEXT |
+| `No dump from:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `No firmware uploaded yet.` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `No layout.` | — | RUNTIME MESSAGE (shown after an action, in bmRenderGrid()) |
 | `No modules detected yet.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `No modules found in backup file.` | Status tab (diagnostics) | INLINE TEXT |
+| `No modules to test.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `No modules with serial numbers found. Run Identify All first.` | Status tab (diagnostics) | INLINE TEXT |
+| `No pre-test snapshot was taken:` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
 | `No response from module` | — | RUNTIME MESSAGE (shown after an action, in bmCell()) |
 | `No response from module -- click Re-read to try again.` | — | RUNTIME MESSAGE (shown after an action, in calRefresh()) |
 | `No response to the stats query -- the module did not answer (check it is powered and on the bus).` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
-| `No unprovisioned modules seen yet.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
+| `No trace stored yet.` | — | RUNTIME MESSAGE (shown after an action, in traceInfo()) |
+| `Not authorized` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Not connected` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
+| `Not one reply at any size, alone or in a roll call, over` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Not registered` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
+| `Nothing answered at all. The module is not reachable: check power, wiring and that this ID is the one it has.` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
+| `Nothing arrived at all while they had the bus: no bytes, nothing discarded. The reply is not being sent, or not being started.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Nothing recorded since the gateway started.` | — | RUNTIME MESSAGE (shown after an action, in incLoad()) |
 | `Nothing to send.` | — | RUNTIME MESSAGE (shown after an action, in doSend()) |
+| `Now` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `Nudge moves the reel and saves the offset instantly. Press Home to verify.` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
 | `Nudged` | — | RUNTIME MESSAGE (shown after an action, in calNudge()); RUNTIME MESSAGE (shown after an action, in calWizHomeNudge()) |
-| `OTA Firmware Update` | Settings tab | HEADING (card title -- a noun phrase) |
-| `OTA Password` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
-| `OTA password saved` | — | RUNTIME MESSAGE (shown after an action, in saveOTA()) |
 | `Off` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
-| `Open Firmware Updater →` | Settings tab | TAB / LINK LABEL (a noun) |
+| `Open the Modules tab: Identify lists everything on the bus. Provision the newcomer, or remove the duplicate.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Or pick one module to calibrate individually:` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
 | `Paris/Berlin (UTC+1/+2)` | Settings tab | DROPDOWN OPTION |
+| `Parse Rejects` | Status tab (diagnostics) | TEXT |
 | `Password` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Password changed` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Password cleared` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Password kept` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Password saved` | — | RUNTIME MESSAGE (shown after an action, in saveOTA()) |
+| `Password unchanged` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Pause` | — | (built at runtime) |
 | `Pending` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
 | `Port` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Possible Duplicate ID` | Status tab (diagnostics) | INLINE TEXT |
 | `Preserve current module IDs` | — | (built at runtime) |
 | `Prev` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
-| `Protects ArduinoOTA (IDE/command-line) uploads. The web updater above is always accessible.` | Settings tab | HELP TEXT (a full sentence) |
-| `Provision` | — | TAB / LINK LABEL (a noun) |
-| `Provision: Assign ID by Serial Number` | Provision tab (assign bus IDs) | HEADING (card title -- a noun phrase) |
+| `Protects uploads made from the Arduino IDE or the command line. The browser updater above is always available.` | Settings tab | HELP TEXT (a full sentence) |
 | `Provisioned` | — | (built at runtime) |
-| `Provisioning sent` | — | RUNTIME MESSAGE (shown after an action, in doProvision()) |
 | `Pub: .../rx   .../tx   .../status   .../flap/adv   .../flap/ack` | — | (built at runtime) |
+| `Put these modules right first:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `QUIET TIME - the display is blanked and flaps will not move. It is restored when Quiet Time ends (calibration still works)` | — | TEXT |
 | `Queued -- runs after the Hall test.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `Quiet Time Schedule` | Settings tab | HEADING (card title -- a noun phrase) |
+| `RESTORING CALIBRATION - every module command is refused until the restore completes` | — | (built at runtime) |
 | `RS-485 Bus` | Status tab (diagnostics) | HEADING |
 | `Raw — send verbatim, skip sanitizing & framing (debug)` | — | (built at runtime) |
 | `Re-home (verify)` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
@@ -281,11 +405,21 @@ and **Last Seen** are table headings.
 | `Re-homing...` | — | RUNTIME MESSAGE (shown after an action, in calWizHomeRehome()) |
 | `Re-read EEPROM` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Reading EEPROM from module` | — | RUNTIME MESSAGE (shown after an action, in calRefresh()) |
+| `Reading every module's calibration first, so the test can be undone:` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
 | `Reading module` | — | RUNTIME MESSAGE (shown after an action, in bmCell()); RUNTIME MESSAGE (shown after an action, in next()) |
 | `Reading module #` | — | (built at runtime) |
 | `Reading stats snapshot...` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `Reads the EEPROM calibration from every known module (by serial number) and saves it to a JSON file you can download. Make sure all modules have been identified first (see the Modules tab).` | Settings tab | HELP TEXT (a full sentence) |
-| `Refresh` | Calibration tab (tune a module's flap positions); Modules tab (the module grid) | BUTTON (an action -- use the imperative) |
+| `Reason` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
+| `Receive Overflows` | — | (built at runtime) |
+| `Recent anomalies` | Status tab (diagnostics) | HEADING |
+| `Refresh` | Calibration tab (tune a module's flap positions); Modules tab (the module grid); Settings tab; Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
+| `Rejected:` | — | RUNTIME MESSAGE (shown after an action, in mfwUpload()) |
+| `Release the bus` | — | RUNTIME MESSAGE (shown after an action, in setMaintUI()) |
+| `Release the bus hold for "` | — | (built at runtime) |
+| `Replies collide in broadcasts:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Replies the gateway threw away: longer than it can hold, or never terminated. A module that answers at length on a noisy bus shows up here rather than as silence.` | Status tab (diagnostics) | TOOLTIP |
+| `Reply` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
 | `Request failed` | — | RUNTIME MESSAGE (shown after an action, in homeAll()) |
 | `Reset error:` | — | RUNTIME MESSAGE (shown after an action, in calWizReset()) |
 | `Reset to Default` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
@@ -293,16 +427,34 @@ and **Last Seen** are table headings.
 | `Reset to default 2832` | Calibration tab (tune a module's flap positions) | TOOLTIP |
 | `Reset to default 4096` | Calibration tab (tune a module's flap positions) | TOOLTIP |
 | `Restore Calibration` | Settings tab | HEADING (card title -- a noun phrase) |
+| `Restore calibration on every boot` | Settings tab | INLINE TEXT |
+| `Restore calibration to every module from the stored backup now? Every other module command is refused until it completes.` | — | RUNTIME MESSAGE (shown after an action, in rbRunNow()) |
+| `Restore cancelled after` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `Restore complete:` | — | (built at runtime) |
+| `Restore did not run:` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `Restore from File` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Restore from the pre-test snapshot` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Restore on Boot` | Settings tab | HEADING (card title -- a noun phrase) |
+| `Restore starts in` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
+| `Restore the module from your calibration backup (Settings), or write the values shown with the calibration wizard, then run the soak again.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Restores all module settings to firmware defaults (home offset, total steps, flap map).` | Modules tab (the module grid) | SMALL PRINT |
+| `Restoring every module from the pre-test snapshot. Watch the banner for progress.` | — | RUNTIME MESSAGE (shown after an action, in soakRollback()) |
 | `Restoring module` | — | RUNTIME MESSAGE (shown after an action, in next()) |
 | `Revert` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Revert to Default` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
+| `Right arrow` | — | RUNTIME MESSAGE (shown after an action, in flapSymLabel()) |
 | `Rotations` | — | (built at runtime) |
 | `Rows` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Run Identify and compare serial numbers against the Modules tab. A module on old firmware uses different slot timing -- check versions.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Run Identify on the Modules tab: the unprovisioned list shows both serial numbers. Give one of them a new ID.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Run Restore Now` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Run Soak Test` | Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
 | `Run again` | Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
+| `Run probe` | — | RUNTIME MESSAGE (shown after an action, in probeSection()) |
+| `Run the Diagnostics snapshot: an EEPROM verify of FAILED means the chip's EEPROM is worn -- replace the module. If it passes, the write frame is being clipped on its way in: look for a module with a duplicated ID answering over it.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Run the calibrate command: the reel spins one full revolution to measure its steps per revolution` | Calibration tab (tune a module's flap positions) | TOOLTIP |
+| `Run the soak test for` | — | RUNTIME MESSAGE (shown after an action, in soakRun()) |
+| `Running: pass` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
 | `SN:` | — | (built at runtime) |
 | `SSID` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Sao Paulo (UTC-3/-2)` | Settings tab | DROPDOWN OPTION |
@@ -310,16 +462,20 @@ and **Last Seen** are table headings.
 | `Save Flap Config` | Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
 | `Save Layout` | Settings tab | BUTTON (an action -- use the imperative) |
 | `Save MQTT` | Settings tab | BUTTON (an action -- use the imperative) |
-| `Save OTA Password` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Save Name` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Save Password` | Settings tab | BUTTON (an action -- use the imperative) |
 | `Save Schedule` | Settings tab | BUTTON (an action -- use the imperative) |
 | `Save Time Settings` | Settings tab | BUTTON (an action -- use the imperative) |
 | `Save WiFi` | Settings tab | BUTTON (an action -- use the imperative) |
 | `Save error:` | — | RUNTIME MESSAGE (shown after an action, in calWizConfirm()) |
-| `Saved` | — | RUNTIME MESSAGE (shown after an action, in g()) |
+| `Saved - leave blank to keep` | — | RUNTIME MESSAGE (shown after an action, in pwHint()) |
 | `Saved - times are` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `Saved custom position` | — | RUNTIME MESSAGE (shown after an action, in calWizConfirm()) |
 | `Saved. Refreshing...` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()) |
-| `Saving...` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()) |
+| `Saved. Restore on boot is off.` | — | RUNTIME MESSAGE (shown after an action, in rbSave()) |
+| `Saved. The gateway now answers to` | — | RUNTIME MESSAGE (shown after an action, in saveMdns()) |
+| `Saved. The stored backup will be restored on every boot.` | — | RUNTIME MESSAGE (shown after an action, in rbSave()) |
+| `Saving...` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()); RUNTIME MESSAGE (shown after an action, in saveMdns()) |
 | `Self-Reported ID` | — | (built at runtime) |
 | `Send` | Bus Monitor tab (live RS-485 traffic) | BUTTON (an action -- use the imperative) |
 | `Send Character` | Display tab (send text/characters to the wall) | BUTTON (an action -- use the imperative) |
@@ -330,25 +486,35 @@ and **Last Seen** are table headings.
 | `Send by Index` | Display tab (send text/characters to the wall) | HEADING (card title -- a noun phrase) |
 | `Send to Display` | Display tab (send text/characters to the wall) | BUTTON (an action -- use the imperative) |
 | `Sends Reset (R): the module forgets its assigned ID and returns to advertising for re-provisioning.` | Modules tab (the module grid) | SMALL PRINT |
-| `Sends the Reset (R) command which erases the stored ID and returns the module to unprovisioned state.` | Provision tab (assign bus IDs) | HELP TEXT (a full sentence) |
 | `Sent` | — | RUNTIME MESSAGE (shown after an action, in doSend()); RUNTIME MESSAGE (shown after an action, in sendIndex()); RUNTIME MESSAGE (shown after an action, in sendText()) |
 | `Sent '` | — | RUNTIME MESSAGE (shown after an action, in sendChar()) |
+| `Sent to every module. They do not acknowledge it, so the list re-reads their reels in the background over the next minute or two.` | — | RUNTIME MESSAGE (shown after an action, in wwFlapSet()) |
 | `Serial Debug` | Settings tab | HEADING (card title -- a noun phrase) |
-| `Serial Number` | Provision tab (assign bus IDs) | FORM LABEL (names the input below it -- a noun phrase) |
+| `Serial Number` | — | (built at runtime) |
 | `Set by the ?lang= in the URL.` | — | RUNTIME MESSAGE (shown after an action, in go()) |
 | `Settings` | — | TAB / LINK LABEL (a noun) |
 | `Shanghai/HK/Singapore (UTC+8)` | Settings tab | DROPDOWN OPTION |
+| `Short = version, snapshot, roll call. Long = dump, combined dump, broadcast dump, each asked twice before it counts as a miss. Writes = a home offset and a map entry, each nudged and put back.` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `Short replies get through and long ones do not. That points at the bus rather than the module -- check the 120 ohm termination at both ends, and watch Frames Discarded on the Status tab.` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
+| `Show every kind of traffic` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
 | `Showing:` | — | (built at runtime) |
+| `Size` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
 | `Skip` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
+| `Smiley` | — | RUNTIME MESSAGE (shown after an action, in flapSymLabel()) |
+| `Soak Test` | Status tab (diagnostics) | HEADING |
 | `Spinning the reel to check the home sensor (~10-20s)...` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
 | `Split-Flap Gateway` | — | TITLE |
 | `Split-Flap-GW` | Settings tab | STRONG |
 | `Stack Min (task)` | Status tab (diagnostics) | TEXT |
 | `Start Module ID` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
+| `Starting...` | — | RUNTIME MESSAGE (shown after an action, in probeRun()); RUNTIME MESSAGE (shown after an action, in soakRun()) |
+| `Stats snapshot` | — | RUNTIME MESSAGE (shown after an action, in probeLabel()) |
 | `Stats snapshot (Q)` | Status tab (diagnostics) | H4 |
 | `Status` | — | TAB / LINK LABEL (a noun) |
 | `Steps / Rev` | — | (built at runtime) |
 | `Stops fetching new frames. Frames beyond the 64-entry ring are lost while paused.` | Bus Monitor tab (live RS-485 traffic) | TOOLTIP |
+| `Stored backup deleted.` | — | RUNTIME MESSAGE (shown after an action, in rbDelete()) |
+| `Stored backup:` | — | RUNTIME MESSAGE (shown after an action, in rbFileText()) |
 | `Sub: .../flap/set   .../flap/home   .../flap/provision   .../send` | — | (built at runtime) |
 | `Sydney (UTC+10/+11)` | Settings tab | DROPDOWN OPTION |
 | `Synced` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
@@ -357,24 +523,41 @@ and **Last Seen** are table headings.
 | `Test Position (GOTO)` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Testing...` | — | RUNTIME MESSAGE (shown after an action, in testMqtt()) |
 | `Text` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
-| `The SplitFlap Gateway Companion registers itself here automatically. When a URL is set, a` | — | (built at runtime) |
+| `That file is not module firmware.` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `The broker stopped answering` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `The bus is healthy.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `The bus loses long frames:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `The character set cannot be longer than 64 flaps.` | — | RUNTIME MESSAGE (shown after an action, in wwFlapSet()) |
+| `The companion registers this itself. There is nothing to set here.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
+| `The gap between modules when a page is sent as a cascade. The companion uses this as its default. Larger walls need more: about 25 ms is stable for 60 modules.` | Settings tab | HELP TEXT (a full sentence) |
+| `The gateway read every module's calibration before the test started, so it can put the whole wall back. Run the soak again afterwards.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `The name this gateway answers to on your network, so you do not have to remember its IP address. It is also the name the Arduino IDE and` | — | (built at runtime) |
+| `The saved password was kept.` | — | RUNTIME MESSAGE (shown after an action, in saveMqtt()) |
+| `The shortest reply fails as often as the longest, so frame length is not the problem.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `The stored backup is unusable -- upload a new one.` | — | RUNTIME MESSAGE (shown after an action, in rbFileText()) |
 | `The wizard relies on the measured step count to place each flap. If it is wrong, every flap will be off. Calibrate first if you haven't.` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
 | `These actions cannot be undone. You will be asked to confirm.` | Modules tab (the module grid) | HELP TEXT (a full sentence) |
 | `This flap should be showing on the reel (homed):` | Calibration tab (tune a module's flap positions) | TEXT |
 | `This flap should be showing on the reel:` | Calibration tab (tune a module's flap positions) | TEXT |
+| `This gateway is at` | — | RUNTIME MESSAGE (shown after an action, in mdnsShowUrl()) |
 | `This is the home offset. If the blank flap is off-center, every character will be too. Confirm it now if you haven't.` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
+| `This is the line, not the modules: check the 120 ohm termination at BOTH ends, the total cable length and any stub, and the baud rate. If the worst modules sit at one end of the run, start there.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Time` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
 | `Time settings saved` | — | RUNTIME MESSAGE (shown after an action, in saveTz()) |
 | `Timezone` | Settings tab | FORM LABEL (names the input below it -- a noun phrase); HEADING (card title -- a noun phrase) |
 | `To` | — | (built at runtime) |
 | `Tokyo (UTC+9 no DST)` | Settings tab | DROPDOWN OPTION |
+| `Too short to reach the write leg -- run 10 minutes or more for a verdict on writes.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Topic Prefix` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Total steps measured and saved:` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Total steps reset to default (` | — | RUNTIME MESSAGE (shown after an action, in calRevertTs()) |
 | `Total steps saved (` | — | RUNTIME MESSAGE (shown after an action, in calSaveTs()) |
 | `Tune` | Calibration tab (tune a module's flap positions) | HEADING |
 | `Tune:` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |
-| `Turn Off Maintenance` | — | BUTTON (an action -- use the imperative) |
+| `Turn Off Maintenance` | — | BUTTON (an action -- use the imperative); RUNTIME MESSAGE (shown after an action, in setMaintUI()) |
 | `Turn On Maintenance` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
+| `Two gateways on one network must not share a name` | Settings tab | EMPHASIS |
+| `Two modules share an ID:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `Two ways to calibrate, both using the same nudge controls and writing to each module's EEPROM: sweep the` | — | (built at runtime) |
 | `US Central (UTC-6/-5)` | Settings tab | DROPDOWN OPTION |
 | `US Eastern (UTC-5/-4)` | Settings tab | DROPDOWN OPTION |
@@ -383,51 +566,136 @@ and **Last Seen** are table headings.
 | `US Pacific (UTC-8/-7)` | Settings tab | DROPDOWN OPTION |
 | `UTC` | Settings tab | DROPDOWN OPTION |
 | `Unprovisioned` | Status tab (diagnostics) | INLINE TEXT |
-| `Unprovisioned Modules` | Provision tab (assign bus IDs) | HEADING (card title -- a noun phrase) |
 | `Unset in EEPROM -- now uses default (` | — | RUNTIME MESSAGE (shown after an action, in calTuneRevert()) |
+| `Up arrow` | — | RUNTIME MESSAGE (shown after an action, in flapSymLabel()) |
+| `Update` | Modules tab (the module grid) | BUTTON (an action -- use the imperative) |
+| `Update module firmware now? The wall is unavailable for about a minute and a half.` | — | RUNTIME MESSAGE (shown after an action, in mfwStart()) |
+| `Update the gateway →` | Settings tab | TAB / LINK LABEL (a noun) |
+| `Update your modules over the bus. They stay on the wall and keep their ID and calibration. It takes about a minute and a half, whether that is one module or fifty.` | — | (built at runtime) |
+| `Upload` | Modules tab (the module grid) | BUTTON (an action -- use the imperative) |
+| `Upload Password` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Upload a backup file to restore calibration to each module by serial number. Modules are matched by serial number, so IDs can differ from when the backup was made.` | Settings tab | HELP TEXT (a full sentence) |
-| `Upload new firmware directly from your browser — no USB cable or Arduino IDE required.` | Settings tab | HELP TEXT (a full sentence) |
+| `Upload to Gateway` | Settings tab | BUTTON (an action -- use the imperative) |
+| `Uploaded.` | — | RUNTIME MESSAGE (shown after an action, in mfwUpload()) |
+| `Uploading...` | — | RUNTIME MESSAGE (shown after an action, in mfwUpload()); RUNTIME MESSAGE (shown after an action, in rbUpload()) |
 | `Uptime` | Status tab (diagnostics) | TEXT |
 | `Used for bus monitor timestamps. Takes effect immediately after saving.` | Settings tab | HELP TEXT (a full sentence) |
 | `Username` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
+| `Verifying module` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
+| `Version (shortest)` | — | RUNTIME MESSAGE (shown after an action, in probeLabel()) |
+| `Was` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `Watch the Monitor tab for frames that are not replies to anything the gateway sent.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `What to do:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Whole Wall` | Modules tab (the module grid) | HEADING (card title -- a noun phrase) |
 | `WiFi` | Settings tab | HEADING (card title -- a noun phrase) |
 | `WiFi IP` | Status tab (diagnostics) | TEXT |
+| `WiFi connected` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `WiFi lost` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
 | `WiFi saved - reconnecting...` | — | RUNTIME MESSAGE (shown after an action, in saveWifi()) |
-| `Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …). Each glyph is one flap.` | Status tab (diagnostics) | TEXT |
+| `WiFi went down` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …), and the symbol flaps ♥ ↑ ↓ ☺ ← →. Each glyph is one flap, and 'q' is the double-quote flap.` | — | RUNTIME MESSAGE (shown after an action, in flapSetSection()) |
+| `Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …), and the symbol flaps ♥ ↑ ↓ ☺ ← →. Each glyph is one flap, index 0 is the blank/home flap, and ‘q’ is the double-quote flap.` | — | (built at runtime) |
+| `Write the calibration from the pre-test snapshot back to every module? The wall is locked while it runs, and homes afterwards.` | — | RUNTIME MESSAGE (shown after an action, in soakRollback()) |
+| `Writes do not stick:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Writing` | — | RUNTIME MESSAGE (shown after an action, in next()) |
+| `Writing calibration to module` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
+| `Wrong username or password` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Yes -- home is confirmed, start wizard` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Yes -- step count is confirmed` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
-| `all modules` | — | RUNTIME MESSAGE (shown after an action, in doDeprovision()); RUNTIME MESSAGE (shown after an action, in sendChar()) |
+| `a write did not land or could not be confirmed` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `a write did not read back` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `all modules` | — | RUNTIME MESSAGE (shown after an action, in sendChar()) |
+| `answered a broadcast twice: two modules on this ID` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `answered twice in` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `answers, but its dump never arrives whole` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `answers, but never sends its dump` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `been confirmed? When homed, the blank (black) flap should sit centered in the window.` | — | (built at runtime) |
 | `below to adjust it on its own.` | — | (built at runtime) |
 | `but save failed:` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `cell(s) shown` | — | RUNTIME MESSAGE (shown after an action, in buildWall()) |
+| `color flap` | — | RUNTIME MESSAGE (shown after an action, in calCharName()); RUNTIME MESSAGE (shown after an action, in flapPalette()); RUNTIME MESSAGE (shown after an action, in reelHtml()) |
 | `could not start calibration` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
+| `discover.` | — | (built at runtime) |
+| `double-quote flap` | — | RUNTIME MESSAGE (shown after an action, in reelHtml()) |
+| `download the trace` | — | RUNTIME MESSAGE (shown after an action, in traceInfo()) |
+| `every module on the bus` | Modules tab (the module grid) | EMPHASIS |
+| `fine alone, misses only in broadcasts` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `firmware-update.bin` | Modules tab (the module grid) | CODE |
+| `flap positions to module` | — | RUNTIME MESSAGE (shown after an action, in next()) |
 | `flap-by-flap (fast for a full wall -- every module shows the same flap at once and you nudge only the ones that look wrong), or pick a` | — | (built at runtime) |
 | `follows your browser, the same way the light/dark theme does. This is stored in your browser, not on the gateway, so it is per-device.` | — | (built at runtime) |
+| `for board v` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `frame(s) arrived corrupt.` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `frame(s) were discarded during the probe -- a reply did arrive but was too long or never terminated.` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
+| `frame(s) were discarded during the test: replies arrived that were too long or never terminated.` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `frames arrived corrupt` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `frames were discarded unfinished` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `frames were discarded unfinished, which is what a long frame breaking up looks like.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `from a module firmware release. Modules on firmware older than v35 are skipped.` | — | (built at runtime) |
+| `from your browser, no USB cable needed. For the` | — | (built at runtime) |
+| `full cycle` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `full cycles` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `grid -` | — | RUNTIME MESSAGE (shown after an action, in buildWall()) |
 | `healthy  ·` | — | (built at runtime) |
+| `home offset was` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `home position` | Calibration tab (tune a module's flap positions) | EMPHASIS |
+| `in a row` | — | RUNTIME MESSAGE (shown after an action, in cell()); RUNTIME MESSAGE (shown after an action, in finding()); RUNTIME MESSAGE (shown after an action, in ids()) |
+| `in one broadcast — including any the list does not know about yet.` | — | (built at runtime) |
 | `in progress...` | — | RUNTIME MESSAGE (shown after an action, in delAction()) |
-| `link appears in the header.` | — | (built at runtime) |
+| `is uploaded, ready to send` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `long read(s) only answered when asked twice` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `looks like a DUPLICATE ID -- nudging may move or save the wrong module. Continue?` | — | RUNTIME MESSAGE (shown after an action, in bmCell()) |
+| `map entry` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `min left` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
+| `min of traffic.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `min,` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
+| `min.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `missed, about` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
+| `misses at every size` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `module #` | — | RUNTIME MESSAGE (shown after an action, in sendChar()) |
+| `module(s) left out: another board` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
+| `module(s),` | — | RUNTIME MESSAGE (shown after an action, in rbFileText()) |
+| `modules into the gateway's flash.` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `modules'` | Settings tab | EMPHASIS |
+| `modules,` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `more rotations catch intermittent faults but take longer (5-20)` | — | (built at runtime) |
 | `n/a (legacy)` | Status tab (diagnostics) | INLINE TEXT |
 | `needs attention  ·` | — | (built at runtime) |
+| `never answered` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `no response` | — | RUNTIME MESSAGE (shown after an action, in bmCell()) |
 | `no response from module` | — | RUNTIME MESSAGE (shown after an action, in calRefresh()) |
+| `not answering` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `not connected` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
+| `not reported -- module firmware v36 is the first that says, and every board before it is a v4` | — | RUNTIME MESSAGE (shown after an action, in renderInfo()) |
+| `not tested (nothing it could answer)` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `occasional miss` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
+| `of everything, up to` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `of the 7 kinds of traffic` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `offset -` | Calibration tab (tune a module's flap positions) | TEXT |
 | `on module #` | — | RUNTIME MESSAGE (shown after an action, in delAction()) |
 | `on this module to confirm the reel's actual step count?` | — | (built at runtime) |
 | `or tune any ID:` | Calibration tab (tune a module's flap positions) | INLINE TEXT |
+| `own firmware, use Module Firmware on the Modules tab.` | — | (built at runtime) |
+| `passes.` | — | RUNTIME MESSAGE (shown after an action, in soakPoll()) |
 | `pool.ntp.org` | Settings tab | INPUT PLACEHOLDER (example text) |
+| `queries,` | — | RUNTIME MESSAGE (shown after an action, in finding()); RUNTIME MESSAGE (shown after an action, in soakPoll()) |
+| `recorded, showing the newest` | — | RUNTIME MESSAGE (shown after an action, in incLoad()) |
+| `replies came from IDs that are not in the module table` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `restore the wall from it` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `s -- all module commands are blocked.` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `s ago)` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
 | `sent.` | — | RUNTIME MESSAGE (shown after an action, in delAction()) |
+| `short replies fine, long ones lost` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `single module` | Calibration tab (tune a module's flap positions) | EMPHASIS |
+| `starting in` | — | RUNTIME MESSAGE (shown after an action, in setRestoreUI()) |
 | `step -` | Calibration tab (tune a module's flap positions) | TEXT |
 | `steps/rev. Saving to module...` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
+| `symbol flap` | — | RUNTIME MESSAGE (shown after an action, in calCharName()); RUNTIME MESSAGE (shown after an action, in reelHtml()) |
+| `this gateway` | Settings tab | EMPHASIS |
+| `two modules on this ID` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `uncheck to also reassign IDs from the backup)` | Settings tab | INLINE TEXT |
+| `waits for the self-tests above to finish` | — | RUNTIME MESSAGE (shown after an action, in probeSection()) |
 | `watch  ·` | — | (built at runtime) |
 | `whole board` | Calibration tab (tune a module's flap positions) | EMPHASIS |
+| `write round trips,` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `\|  Current EEPROM:` | — | RUNTIME MESSAGE (shown after an action, in calOpenTune()) |

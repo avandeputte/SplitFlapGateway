@@ -1422,6 +1422,10 @@ static void handleApiConfigGet() {
   doc["mqPort"]   = cfg.mqttPort;
   doc["mqUser"]   = cfg.mqttUser;
   doc["mqPfx"]    = cfg.mqttPrefix;
+  // v4.5: WHETHER a password is stored, never what it is. The form's password box is always
+  // empty on load, and with nothing to say so an empty box read as "the gateway lost it".
+  doc["mqPassSet"]   = (cfg.mqttPass[0] != 0);
+  doc["wifiPassSet"] = (cfg.wifiPass[0] != 0);
   doc["baud"]     = cfg.rs485Baud;
   doc["dataBits"] = cfg.rs485DataBits;
   doc["parity"]   = cfg.rs485Parity;
@@ -1437,9 +1441,27 @@ static void handleApiConfigGet() {
   doc["restoreDelay"]   = cfg.restoreDelaySec;
   doc["stepMs"]         = cfg.stepMs;             // v3.13: the companion's default step_ms
   doc["mdnsName"]       = otaMdnsName();          // v4.2: http://<mdnsName>.local
-  char out[880];   // headroom for "version" + JSON-escaped SSID/TZ strings
+  char out[960];   // headroom for "version" + JSON-escaped SSID/TZ strings
   serializeJson(doc, out, sizeof(out));
   server.send(200, "application/json", out);
+}
+
+// What a save did to the stored MQTT password, in one word (the CSET_* flags, mqtt.h).
+static const char* mqttPassWord(uint8_t fl) {
+  if (fl & CSET_PASS_CHANGED) return "changed";
+  if (fl & CSET_PASS_CLEARED) return "cleared";
+  if (fl & CSET_PASS_KEPT)    return "kept";
+  return cfg.mqttPass[0] ? "unchanged" : "none";
+}
+// Every save of the MQTT settings goes in the connection history and on the serial log,
+// with who sent it and what happened to the password: if a stored password ever goes
+// missing again, this row says when, and from which address.
+static void mqttSettingsNote(uint8_t fl) {
+  const IPAddress ip = server.client().remoteIP();
+  connLogAdd(CEV_SETTINGS, 0, (uint32_t)ip, fl);
+  printf("[CFG] MQTT settings saved by %s: broker %s:%d user '%s' prefix %s, password %s\n",
+         ip.toString().c_str(), cfg.mqttHost, cfg.mqttPort, cfg.mqttUser, cfg.mqttPrefix,
+         mqttPassWord(fl));
 }
 
 // POST /api/config/wifi
@@ -1450,11 +1472,23 @@ static void handleApiConfigWifi() {
   if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
     sendJsonError(400, "Bad JSON"); return;
   }
-  strlcpy(cfg.wifiSSID, doc["ssid"] | "", sizeof(cfg.wifiSSID));
-  strlcpy(cfg.wifiPass, doc["pass"] | "", sizeof(cfg.wifiPass));
+  // The same trap as the MQTT form (see handleApiConfigMqtt): the password box is empty on
+  // load, so "Save WiFi" without retyping it stored an empty password and took the gateway
+  // off the network. A blank password for the SAME network now keeps the stored one. A
+  // different network name with a blank password is an open network, as before; and
+  // "clearPass":true makes the same network open.
+  const char* newSsid = doc["ssid"] | "";
+  const char* newPass = doc["pass"] | "";
+  const bool  keep    = !newPass[0] && !(doc["clearPass"] | false) &&
+                        cfg.wifiPass[0] && strcmp(cfg.wifiSSID, newSsid) == 0;
+  if (!keep) strlcpy(cfg.wifiPass, newPass, sizeof(cfg.wifiPass));
+  strlcpy(cfg.wifiSSID, newSsid, sizeof(cfg.wifiSSID));
   saveConfig();
-  DBG("[CFG] WiFi SSID set to '%s'\n", cfg.wifiSSID);
-  server.send(200, "application/json", "{\"ok\":true}");
+  printf("[CFG] WiFi set to '%s' by %s (password %s)\n", cfg.wifiSSID,
+         server.client().remoteIP().toString().c_str(),
+         keep ? "kept" : (cfg.wifiPass[0] ? "set" : "none"));
+  server.send(200, "application/json",
+              keep ? "{\"ok\":true,\"password\":\"kept\"}" : "{\"ok\":true}");
   delay(100);
   WiFi.disconnect();
 }
@@ -1467,14 +1501,44 @@ static void handleApiConfigMqtt() {
   if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
     sendJsonError(400, "Bad JSON"); return;
   }
-  strlcpy(cfg.mqttHost,   doc["host"]   | "", sizeof(cfg.mqttHost));
-  cfg.mqttPort          = doc["port"]   | DEFAULT_MQTT_PORT;
-  strlcpy(cfg.mqttUser,   doc["user"]   | "", sizeof(cfg.mqttUser));
-  strlcpy(cfg.mqttPass,   doc["pass"]   | "", sizeof(cfg.mqttPass));
-  strlcpy(cfg.mqttPrefix, doc["prefix"] | DEFAULT_MQTT_PREFIX, sizeof(cfg.mqttPrefix));
+  // THE PASSWORD. GET /api/config never returns it, so the dashboard's password box is empty
+  // every time the page loads -- and this handler used to store whatever the box held. So
+  // "Save MQTT" after changing anything else (or nothing) replaced the stored password with
+  // an empty one: the session in progress carried on, and the next reconnect -- hours or
+  // days later, whenever the broker or the WiFi next blinked -- was refused for ever with
+  // "bad credentials". From outside: "it keeps losing the connection, and the password
+  // field is empty when I look". Both true, and neither the cause.
+  //
+  // A blank (or absent) password now means "leave the stored one alone". It is removed
+  // when the username is blank too (no authentication), or on an explicit "clearPass":true
+  // (a broker that takes a username with no password).
+  const char* newHost = doc["host"]   | "";
+  const int   newPort = doc["port"]   | DEFAULT_MQTT_PORT;
+  const char* newUser = doc["user"]   | "";
+  const char* newPass = doc["pass"]   | "";
+  const char* newPfx  = doc["prefix"] | DEFAULT_MQTT_PREFIX;
+  uint8_t fl = 0;
+  if (strcmp(cfg.mqttHost, newHost) || cfg.mqttPort != newPort) fl |= CSET_HOST;
+  if (strcmp(cfg.mqttUser, newUser))                             fl |= CSET_USER;
+  if (strcmp(cfg.mqttPrefix, newPfx))                            fl |= CSET_PREFIX;
+  if (newPass[0]) {
+    if (strcmp(cfg.mqttPass, newPass)) fl |= CSET_PASS_CHANGED;
+    strlcpy(cfg.mqttPass, newPass, sizeof(cfg.mqttPass));
+  } else if (!newUser[0] || (doc["clearPass"] | false)) {
+    if (cfg.mqttPass[0]) fl |= CSET_PASS_CLEARED;
+    cfg.mqttPass[0] = 0;
+  } else if (cfg.mqttPass[0]) {
+    fl |= CSET_PASS_KEPT;
+  }
+  strlcpy(cfg.mqttHost,   newHost, sizeof(cfg.mqttHost));
+  cfg.mqttPort = newPort;
+  strlcpy(cfg.mqttUser,   newUser, sizeof(cfg.mqttUser));
+  strlcpy(cfg.mqttPrefix, newPfx,  sizeof(cfg.mqttPrefix));
   saveConfig();
-  DBG("[CFG] MQTT broker set to %s:%d  prefix=%s\n", cfg.mqttHost, cfg.mqttPort, cfg.mqttPrefix);
-  server.send(200, "application/json", "{\"ok\":true}");
+  mqttSettingsNote(fl);
+  char resp[64];
+  snprintf(resp, sizeof(resp), "{\"ok\":true,\"password\":\"%s\"}", mqttPassWord(fl));
+  server.send(200, "application/json", resp);
   // The client belongs to taskNetwork (see gMqttUp in common.h): it drops the session,
   // hands PubSubClient the new broker -- which it caches, so a saved setting that is not
   // handed over is never dialled -- and reconnects, within one pass of its loop.
@@ -1512,11 +1576,38 @@ static void handleApiConfigSettings() {
   if (doc["ssid"].is<const char*>()) strlcpy(cfg.wifiSSID, doc["ssid"] | "", sizeof(cfg.wifiSSID));
   if (doc["pass"].is<const char*>()) strlcpy(cfg.wifiPass, doc["pass"] | "", sizeof(cfg.wifiPass));
   // MQTT
-  if (doc["mqHost"].is<const char*>())   strlcpy(cfg.mqttHost,   doc["mqHost"]   | "", sizeof(cfg.mqttHost));
-  if (doc["mqPort"].is<int>())           cfg.mqttPort = doc["mqPort"];
-  if (doc["mqUser"].is<const char*>())   strlcpy(cfg.mqttUser,   doc["mqUser"]   | "", sizeof(cfg.mqttUser));
-  if (doc["mqPass"].is<const char*>())   strlcpy(cfg.mqttPass,   doc["mqPass"]   | "", sizeof(cfg.mqttPass));
-  if (doc["mqPfx"].is<const char*>())    strlcpy(cfg.mqttPrefix, doc["mqPfx"]    | DEFAULT_MQTT_PREFIX, sizeof(cfg.mqttPrefix));
+  // Here a field is changed only if it is sent, so an explicit "mqPass":"" is a deliberate
+  // clear -- unlike /api/config/mqtt, where a blank password is the form's untouched box.
+  // Either way the change is filed in the connection history (mqttSettingsNote).
+  {
+    uint8_t fl = 0;
+    if (doc["mqHost"].is<const char*>()) {
+      const char* v = doc["mqHost"] | "";
+      if (strcmp(cfg.mqttHost, v)) fl |= CSET_HOST;
+      strlcpy(cfg.mqttHost, v, sizeof(cfg.mqttHost));
+    }
+    if (doc["mqPort"].is<int>()) {
+      const int v = doc["mqPort"];
+      if (cfg.mqttPort != v) fl |= CSET_HOST;
+      cfg.mqttPort = v;
+    }
+    if (doc["mqUser"].is<const char*>()) {
+      const char* v = doc["mqUser"] | "";
+      if (strcmp(cfg.mqttUser, v)) fl |= CSET_USER;
+      strlcpy(cfg.mqttUser, v, sizeof(cfg.mqttUser));
+    }
+    if (doc["mqPass"].is<const char*>()) {
+      const char* v = doc["mqPass"] | "";
+      if (strcmp(cfg.mqttPass, v)) fl |= v[0] ? CSET_PASS_CHANGED : CSET_PASS_CLEARED;
+      strlcpy(cfg.mqttPass, v, sizeof(cfg.mqttPass));
+    }
+    if (doc["mqPfx"].is<const char*>()) {
+      const char* v = doc["mqPfx"] | DEFAULT_MQTT_PREFIX;
+      if (strcmp(cfg.mqttPrefix, v)) fl |= CSET_PREFIX;
+      strlcpy(cfg.mqttPrefix, v, sizeof(cfg.mqttPrefix));
+    }
+    if (fl) mqttSettingsNote(fl);
+  }
   // RS485
   unsigned long newBaud = doc["baud"] | cfg.rs485Baud;
   cfg.rs485DataBits  = doc["dataBits"] | cfg.rs485DataBits;
@@ -2629,7 +2720,11 @@ static void handleApiMqttTest() {
       if (doc["host"].is<const char*>()) strlcpy(host, doc["host"] | "", sizeof(host));
       if (doc["port"].is<int>())         port = doc["port"] | cfg.mqttPort;
       if (doc["user"].is<const char*>()) strlcpy(user, doc["user"] | "", sizeof(user));
-      if (doc["pass"].is<const char*>()) strlcpy(pass, doc["pass"] | "", sizeof(pass));
+      // A blank password is the form's untouched box, i.e. "the one you have" -- as long as
+      // it is for the stored username. Testing with an empty one instead reported "bad
+      // credentials" for a configuration that was working, which sent people to retype it.
+      const char* p = doc["pass"] | "";
+      if (p[0] || strcmp(user, cfg.mqttUser) != 0) strlcpy(pass, p, sizeof(pass));
     }
   }
   if (!host[0]) { sendJsonError(400, "no broker host configured"); return; }
@@ -3138,6 +3233,67 @@ static void handleApiPerf() {
   if (reset) perfReset();
 }
 
+// GET /api/mqtt/log -- the connection history (mqtt.h): what the broker session and the WiFi
+// link under it have done, newest first, and the last drop on its own so a run of retries
+// cannot push it out of sight. Read-only, never gated.
+static void connEventJson(const ConnEvent& e, uint8_t bootNow, uint32_t nowEpoch, uint32_t nowUp,
+                          char* out, size_t len) {
+  char why[96];
+  connEventWhy(e, why, sizeof(why));
+  // How long ago: by the clock when both ends have one, else by uptime within this boot.
+  long ago = -1;
+  if (e.epoch && nowEpoch >= e.epoch)   ago = (long)(nowEpoch - e.epoch);
+  else if (e.boot == bootNow && nowUp >= e.upS) ago = (long)(nowUp - e.upS);
+  int n = snprintf(out, len,
+    "{\"kind\":\"%s\",\"t\":%lu,\"up\":%lu,\"ago\":%ld,\"thisBoot\":%s,\"rc\":%d,\"n\":%u,"
+    "\"rssi\":%d,\"why\":\"%s\"",
+    connEventKind(e.kind), (unsigned long)e.epoch, (unsigned long)e.upS, ago,
+    e.boot == bootNow ? "true" : "false", (int)e.rc, (unsigned)e.n, (int)e.rssi, why);
+  if (n < 0 || (size_t)n >= len) { strlcpy(out, "{}", len); return; }
+  if (e.kind == CEV_SETTINGS) {
+    const IPAddress ip(e.arg);
+    n += snprintf(out + n, len - n, ",\"ip\":\"%s\",\"password\":\"%s\"", ip.toString().c_str(),
+                  (e.flags & CSET_PASS_CHANGED) ? "changed" : (e.flags & CSET_PASS_CLEARED) ? "cleared" :
+                  (e.flags & CSET_PASS_KEPT) ? "kept" : "unchanged");
+  } else if (e.kind != CEV_BOOT && e.kind != CEV_MQTT_FAILED) {
+    // seconds the state that just ended had lasted: the session (lost/closed), the outage
+    // (mqtt-up, wifi-up), the association (wifi-down)
+    n += snprintf(out + n, len - n, ",\"after\":%lu", (unsigned long)e.arg);
+  }
+  if ((size_t)n < len - 1) { out[n++] = '}'; out[n] = 0; }
+}
+
+static void handleApiMqttLog() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  static ConnEvent ev[CONN_LOG_SIZE];           // taskWeb only: not on its stack
+  ConnEvent drop; uint8_t boot = 0;
+  const int n = connLogCopy(ev, CONN_LOG_SIZE, &drop, &boot);
+  const uint32_t nowEpoch = (uint32_t)rtcEpochNow();
+  const uint32_t nowUp    = (uint32_t)(millis() / 1000UL);
+  static char row[360];
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  snprintf(row, sizeof(row),
+    "{\"ok\":true,\"configured\":%s,\"connected\":%s,\"forS\":%lu,\"passwordSet\":%s,"
+    "\"connects\":%lu,\"drops\":%lu,\"failures\":%lu,\"uptime\":%lu,\"now\":%lu,\"lastDrop\":",
+    cfg.mqttHost[0] ? "true" : "false", gMqttUp ? "true" : "false",
+    gMqttSinceMs ? (unsigned long)((millis() - gMqttSinceMs) / 1000UL) : (unsigned long)nowUp,
+    cfg.mqttPass[0] ? "true" : "false",
+    (unsigned long)gMqttConnects, (unsigned long)gMqttDrops, (unsigned long)gMqttFails,
+    (unsigned long)nowUp, (unsigned long)nowEpoch);
+  server.sendContent(row);
+  if (drop.kind == CEV_MQTT_LOST) { connEventJson(drop, boot, nowEpoch, nowUp, row, sizeof(row)); server.sendContent(row); }
+  else server.sendContent("null");
+  server.sendContent(",\"events\":[");
+  for (int i = 0; i < n; i++) {
+    if (i) server.sendContent(",");
+    connEventJson(ev[i], boot, nowEpoch, nowUp, row, sizeof(row));
+    server.sendContent(row);
+  }
+  server.sendContent("]}");
+  server.sendContent("");
+}
+
 void webInit() {
   static const char* COLLECT_HDRS[] = { "If-None-Match", "X-SF-Client" };
   server.collectHeaders(COLLECT_HDRS, 2);   // conditional GETs, and the dashboard's X-SF-Client tag
@@ -3285,6 +3441,7 @@ void webInit() {
   server.on("/api/status",           HTTP_GET,     handleApiStatus);
   server.on("/api/mqtt/test",        HTTP_POST,    handleApiMqttTest);
   server.on("/api/mqtt/test",        HTTP_OPTIONS, handleOptions);
+  server.on("/api/mqtt/log",         HTTP_GET,     handleApiMqttLog);
   server.on("/api/maintenance",      HTTP_GET,     handleApiMaintenance);
   server.on("/api/maintenance",      HTTP_POST,    handleApiMaintenance);
   server.on("/api/maintenance",      HTTP_OPTIONS, handleOptions);

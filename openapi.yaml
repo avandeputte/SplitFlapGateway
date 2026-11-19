@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "3.3.0"
+  version: "3.4.0"
   description: |
     REST API for the ESP32-S3 Split-Flap Gateway firmware. The version above is the
     API version `GET /api/capabilities` reports as `api`; the firmware has its own.
@@ -1288,7 +1288,9 @@ paths:
         CONNECT/CONNACK exchange using a throwaway client, without touching the
         gateway's live MQTT connection. Body fields are optional; omitted fields
         default to the saved configuration, so settings can be verified before
-        saving.
+        saving. Since v4.5 a blank `pass` also means the saved password, as long as `user`
+        is the saved username: a form whose password box was left untouched used to test an
+        empty password and report "bad credentials" for a configuration that was working.
       requestBody:
         required: false
         content:
@@ -2422,16 +2424,23 @@ paths:
     post:
       tags: [Config]
       summary: Save WiFi credentials and reconnect
+      description: |
+        The password is never returned by `GET /api/config`, so a form built on it has an empty
+        password box. Since v4.5 a blank `pass` for the **same** `ssid` keeps the stored
+        password (the reply then carries `"password":"kept"`); before, it stored an empty one
+        and took the gateway off the network. A blank `pass` with a different `ssid` is an
+        open network, as always. Send `"clearPass":true` to make the same network open.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [ssid, pass]
+              required: [ssid]
               properties:
                 ssid: { type: string, example: "MyNetwork" }
-                pass: { type: string, example: "mypassword" }
+                pass: { type: string, example: "mypassword", description: "Blank or absent keeps the stored password when `ssid` is unchanged (v4.5)" }
+                clearPass: { type: boolean, description: "v4.5: remove the stored password even though `ssid` is unchanged" }
       responses:
         "200":
           $ref: "#/components/responses/Ok"
@@ -2440,6 +2449,16 @@ paths:
     post:
       tags: [Config]
       summary: Save MQTT broker settings and reconnect
+      description: |
+        **A blank or absent `pass` keeps the stored password (v4.5).** The password is never
+        returned by `GET /api/config`, so a form built on it has an empty password box, and
+        before v4.5 saving that form stored an empty password: the session in progress carried
+        on and the next reconnect was refused with "bad credentials" until someone typed it
+        again. The stored password is removed when `user` is blank (no authentication) or when
+        `"clearPass":true` is sent (a broker that takes a username and no password).
+
+        The reply says what happened to it, and every save is filed in the connection history
+        (`GET /api/mqtt/log`) with the address it came from.
       requestBody:
         required: true
         content:
@@ -2451,12 +2470,68 @@ paths:
                 host:   { type: string, example: "192.168.1.50" }
                 port:   { type: integer, default: 1883 }
                 user:   { type: string, example: "" }
-                pass:   { type: string, example: "" }
+                pass:   { type: string, example: "", description: "Blank or absent keeps the stored password (v4.5)" }
+                clearPass: { type: boolean, description: "v4.5: remove the stored password while keeping a username" }
                 prefix: { type: string, default: "splitflap" }
             example: { host: "192.168.1.50", port: 1883, user: "", pass: "", prefix: "splitflap" }
       responses:
         "200":
-          $ref: "#/components/responses/Ok"
+          description: Saved; the gateway reconnects at once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  password:
+                    type: string
+                    enum: [changed, kept, cleared, unchanged, none]
+                    description: "v4.5: what the save did to the stored password. `kept` = the field was blank and a stored password was left alone; `none` = there is no password"
+
+  /api/mqtt/log:
+    get:
+      tags: [Status]
+      summary: Connection history -- every drop, and why (v4.5)
+      description: |
+        What the broker session and the WiFi link under it have done, newest first: up to 24
+        rows, plus the most recent drop on its own so a run of retries cannot push it out.
+        The history is kept in RTC memory, so it survives a restart (including a crash or
+        watchdog restart) and is empty only after a power cut.
+
+        Kinds: `boot` (rc = the ESP reset reason), `wifi-up` (rc = channel), `wifi-down`
+        (rc = the WiFi stack's disconnect reason), `mqtt-up`, `mqtt-lost` (a session ended
+        unasked: rc -3 closed by the broker or the network, -4 the broker stopped answering
+        the keep-alive, -10 WiFi went down under it), `mqtt-failed` (a connect attempt failed:
+        rc -2 unreachable, -4 timed out, 4 wrong username or password, 5 not authorised;
+        consecutive identical failures fold into one row and `n` counts them), `mqtt-closed`
+        (the gateway closed it itself, for an update or to apply settings) and `settings`
+        (the MQTT settings were saved: from which `ip`, and what it did to the `password`).
+
+        A lost session is retried every 30 s for as long as WiFi is up.
+      responses:
+        "200":
+          description: The history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:          { type: boolean }
+                  configured:  { type: boolean, description: "A broker host is set" }
+                  connected:   { type: boolean }
+                  forS:        { type: integer, description: "Seconds in the current state (connected, or not)" }
+                  passwordSet: { type: boolean, description: "Whether a broker password is stored (never the password)" }
+                  connects:    { type: integer, description: "Sessions established since this boot" }
+                  drops:       { type: integer, description: "Sessions lost since this boot" }
+                  failures:    { type: integer, description: "Failed connect attempts since this boot" }
+                  uptime:      { type: integer, description: "Seconds" }
+                  now:         { type: integer, description: "The gateway's clock, Unix seconds; 0 if not set" }
+                  lastDrop:
+                    nullable: true
+                    allOf: [ { $ref: "#/components/schemas/ConnEvent" } ]
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConnEvent" }
 
   /api/config/rs485:
     post:
@@ -2868,6 +2943,22 @@ components:
             ota:   { type: integer, example: 2400 }
             rtc:   { type: integer, example: 900 }
 
+    ConnEvent:
+      type: object
+      description: One row of the connection history (v4.5)
+      properties:
+        kind:     { type: string, enum: [boot, wifi-up, wifi-down, mqtt-up, mqtt-lost, mqtt-failed, mqtt-closed, settings] }
+        t:        { type: integer, description: "Unix seconds; 0 if the clock was not set and has not been since" }
+        up:       { type: integer, description: "Uptime in seconds when it happened (of the boot it belongs to)" }
+        ago:      { type: integer, description: "Seconds ago, or -1 if that cannot be known (an undated row from an earlier boot)" }
+        thisBoot: { type: boolean }
+        rc:       { type: integer, description: "Reason code; its meaning depends on `kind`" }
+        n:        { type: integer, description: "Occurrences folded into this row" }
+        rssi:     { type: integer, description: "Signal strength in dBm when it happened; 0 if not associated" }
+        why:      { type: string, description: "The reason in English" }
+        after:    { type: integer, description: "Seconds the state that just ended had lasted: the session (mqtt-lost, mqtt-closed), the outage (mqtt-up, wifi-up) or the association (wifi-down). Absent on boot, mqtt-failed and settings" }
+        ip:       { type: string, description: "settings only: the client that saved them" }
+        password: { type: string, enum: [changed, kept, cleared, unchanged], description: "settings only" }
     Config:
       type: object
       properties:
@@ -2877,6 +2968,8 @@ components:
         mqPort:       { type: integer, example: 1883 }
         mqUser:       { type: string,  example: "" }
         mqPfx:        { type: string,  example: "splitflap" }
+        mqPassSet:    { type: boolean, description: "v4.5: whether a broker password is stored. The password itself is never returned" }
+        wifiPassSet:  { type: boolean, description: "v4.5: whether a WiFi password is stored" }
         baud:         { type: integer, example: 9600 }
         dataBits:     { type: integer, example: 8 }
         parity:       { type: integer, description: "0=None 1=Even 2=Odd", example: 0 }

@@ -399,7 +399,13 @@ void taskNetwork(void* pv) {
   while (true) {
     perfLoopTick(PERF_T_NET);
     bool staUp = (WiFi.status() == WL_CONNECTED);
+    // Connection history (mqtt.h): when the station and the broker session last changed.
+    static unsigned long staSinceMs = 0;       // when WiFi last went up or down
+    static bool          sessUp     = false;   // a broker session is established
     if (staUp && !staWasUp) {
+      connLogAdd(CEV_WIFI_UP, WiFi.channel(), (uint32_t)((millis() - staSinceMs) / 1000UL));
+      staSinceMs = millis();
+      gWifiDropReason = 0;      // armed for the next drop
       staWasUp = true;
       wifiSetApActive(false);   // station is up -> drop the fallback AP
       if (!ntpSynced) { ntpSynced = rtcNTPSync(); ntpTryMs = millis(); }
@@ -408,7 +414,10 @@ void taskNetwork(void* pv) {
     } else if (!staUp && staWasUp) {
       staWasUp = false;
       staDownSince = millis();
-      printf("[WiFi] Disconnected\n");
+      connLogAdd(CEV_WIFI_DOWN, gWifiDropReason, (uint32_t)((millis() - staSinceMs) / 1000UL));
+      printf("[WiFi] Disconnected after %lu s (reason %u)\n",
+             (millis() - staSinceMs) / 1000UL, (unsigned)gWifiDropReason);
+      staSinceMs = millis();
     }
     // Fallback AP: if the station has been down for a grace period (and a
     // network is configured), bring the AP up so the gateway stays reachable.
@@ -442,6 +451,12 @@ void taskNetwork(void* pv) {
     if (gMqttDropReq || gMqttReconfigReq) {
       const bool reconf = gMqttReconfigReq;
       gMqttDropReq = false; gMqttReconfigReq = false;
+      if (sessUp) {
+        sessUp = false;
+        connLogAdd(CEV_MQTT_CLOSED, reconf ? CEV_RC_SETTINGS : CEV_RC_UPDATE,
+                   (uint32_t)((millis() - gMqttSinceMs) / 1000UL));
+        gMqttSinceMs = millis();
+      }
       mqtt.disconnect();
       gMqttUp = false;
       if (reconf) {
@@ -454,11 +469,35 @@ void taskNetwork(void* pv) {
     }
     if (staUp && strlen(cfg.mqttHost) && !gOtaInProgress) {
       bool up = mqtt.connected();
+      if (sessUp && !up) {
+        // An established session ended and nobody here asked it to. PubSubClient's state
+        // says how: -3, the socket closed under it (the broker dropped us, or the network
+        // did); -4, the broker stopped answering the keep-alive. This line and the row it
+        // files are the answer to "it keeps losing the connection".
+        sessUp = false;
+        const int      st   = mqtt.state();
+        const uint32_t held = (uint32_t)((millis() - gMqttSinceMs) / 1000UL);
+        gMqttDrops++;
+        gMqttSinceMs = millis();
+        connLogAdd(CEV_MQTT_LOST, st, held);
+        printf("[MQTT] Connection lost after %lu s: rc=%d (%s), RSSI %d dBm\n",
+               (unsigned long)held, st, mqttStateName(st), (int)WiFi.RSSI());
+      }
+      if (up && !sessUp) {
+        // Filed as lost when WiFi dropped, and the TCP connection then outlived the outage
+        // (the station re-associated before the keep-alive ran out). Say so, or the log
+        // shows a drop with no reconnect after it.
+        sessUp = true;
+        connLogAdd(CEV_MQTT_UP, 0, (uint32_t)((millis() - gMqttSinceMs) / 1000UL), 1);
+        gMqttSinceMs = millis();
+      }
       if (!up && millis() - mqttRetryMs > 30000UL) {
         mqttRetryMs = millis();
         mqttConnect();
         up = mqtt.connected();
         if (!up) {
+          gMqttFails++;
+          connLogAdd(CEV_MQTT_FAILED, mqtt.state());
           mqttFailCount++;
           // Five consecutive failures USED to mean "the TCP stack is wedged: drop WiFi and
           // rejoin". It usually means nothing of the kind -- the broker is down, Home
@@ -488,6 +527,10 @@ void taskNetwork(void* pv) {
           }
         } else {
           mqttFailCount = 0;
+          sessUp = true;
+          gMqttConnects++;
+          connLogAdd(CEV_MQTT_UP, 0, gMqttSinceMs ? (uint32_t)((millis() - gMqttSinceMs) / 1000UL) : 0);
+          gMqttSinceMs = millis();
         }
       }
       gMqttUp = up;
@@ -527,6 +570,22 @@ void taskNetwork(void* pv) {
         }
       }
     } else {
+      if (sessUp) {
+        // The session went with something else: WiFi dropped under it, or an update began
+        // without asking for the drop first. Either way it is over, and it is filed as what
+        // it was -- with the WiFi stack's reason when that is the cause.
+        sessUp = false;
+        const uint32_t held = (uint32_t)((millis() - gMqttSinceMs) / 1000UL);
+        gMqttSinceMs = millis();
+        if (!staUp) {
+          gMqttDrops++;
+          connLogAdd(CEV_MQTT_LOST, CEV_RC_WIFI, held, gWifiDropReason);
+          printf("[MQTT] Connection lost after %lu s: WiFi went down (reason %u)\n",
+                 (unsigned long)held, (unsigned)gWifiDropReason);
+        } else {
+          connLogAdd(CEV_MQTT_CLOSED, gOtaInProgress ? CEV_RC_UPDATE : CEV_RC_SETTINGS, held);
+        }
+      }
       gMqttUp = false;
     }
     if (!gOtaInProgress && millis() - lastStatusMs > STATUS_INTERVAL_MS) {

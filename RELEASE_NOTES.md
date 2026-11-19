@@ -1,5 +1,68 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.5.0 — 2026-11-19
+
+**Saving the MQTT settings no longer erases the broker password, and the gateway now keeps a
+record of every connection drop and the reason for it.**
+
+The report was: "the gateway keeps losing the MQTT connection; when I go back in and enter the
+password it reconnects immediately; the password field is empty." The gateway does reconnect by
+itself — every 30 seconds, for as long as WiFi is up — so a session that stays down until the
+password is retyped means the stored password was no longer the right one.
+
+### Fixed
+
+- **"Save MQTT" with the password box empty erased the stored password.** The password is never
+  sent back to the dashboard, so its box is empty every time the page loads, and the gateway
+  stored whatever the box held. Saving after changing anything else on that card — or nothing —
+  replaced the password with an empty one. The session already running carried on, so nothing
+  looked wrong; the next reconnect, hours or days later when the broker or the WiFi next
+  blinked, was refused as "bad credentials" every 30 seconds until someone typed the password
+  again. **A blank password now keeps the stored one.** It is removed when the username is
+  blank too, or with `"clearPass":true` over the API.
+- **"Save WiFi" had the same trap**, with a worse outcome: the gateway left the network and
+  came back as its setup access point. A blank password for the *same* network name keeps the
+  stored one; a blank password with a different name is an open network, as before.
+- **"Test Connection" with the box empty tested an empty password**, and so reported "bad
+  credentials" for a configuration that was working — which is what sends people to retype
+  it. It now tests the stored password when the username is the stored one.
+- **The password boxes say when a password is stored** ("Saved - leave blank to keep") instead
+  of sitting empty, and no longer invite the browser's password manager to fill them in.
+
+### Added
+
+- **Connection History**, on **Settings ▸ MQTT** and at `GET /api/mqtt/log`: every change in the
+  broker session and the WiFi link under it, newest first, each with the time, the reason, how
+  long the thing had lasted and the signal strength at that moment.
+  - a session **lost**: closed by the broker or the network, the broker stopped answering the
+    keep-alive, or WiFi went down under it (with the WiFi stack's own reason);
+  - a connect attempt **failed**: unreachable, timed out, wrong username or password, not
+    authorised — repeats fold into one row with a count;
+  - WiFi up and down, a gateway restart and why, and a session the gateway closed itself;
+  - **every save of the MQTT settings**, from which address, and whether the password was
+    changed, kept or cleared.
+
+  The most recent drop is kept apart so a night of retries cannot push it out of the list.
+  The history lives in RTC memory: it survives a restart — including a crash or watchdog
+  restart — and is empty only after a power cut.
+- The same events on the serial log, e.g.
+  `[MQTT] Connection lost after 8123 s: rc=-3 (the connection was closed by the broker or the network), RSSI -61 dBm`.
+- `GET /api/config` reports `mqPassSet` and `wifiPassSet` — whether a password is stored, never
+  the password. `POST /api/config/mqtt` answers with what it did to the password.
+
+### Changed
+
+- API version **3.4.0**.
+
+### Tested
+
+On the wall, against a scripted broker: a save with a blank password kept the stored one (the
+broker received the same password on the reconnect), the test button with a blank box sent the
+stored password, and a closed socket, a broker gone silent, and refused logins each produced
+the right row. "Save WiFi" with a blank password rejoined the network in four seconds with the
+password intact, and left its own rows: WiFi down, the session lost with it, both back. The
+history was still there after the firmware was replaced underneath it.
+
 ## v4.4.0 — 2026-11-10
 
 **The dashboard was slow, and almost none of it was the dashboard. This release is what a

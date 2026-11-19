@@ -132,14 +132,14 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "4.4.0"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "4.5.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
 // differences that matter (a fixed reel per module vs one shared reel; colours as flaps vs
 // colours as names) are exactly what capabilities describes.
 #define PRODUCT_NAME         "Split-Flap Gateway"
-#define API_VERSION          "3.3.0"
+#define API_VERSION          "3.4.0"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured

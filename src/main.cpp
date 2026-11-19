@@ -110,6 +110,7 @@ void setup() {
   // is configured but the station fails to connect, the network task brings the
   // fallback AP up after a grace period (and drops it again once the station
   // connects), so a working WiFi link never leaves the AP running.
+  connLogInit();   // before the first WiFi.begin(): it listens for the disconnect reason
   WiFi.mode(WIFI_STA);
   // Modem sleep OFF. The Arduino default dozes the radio between DTIM beacons, so every packet
   // sent TO the gateway waits at the access point for the next one -- 100-300 ms on a typical

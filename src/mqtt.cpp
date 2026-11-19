@@ -434,6 +434,180 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+// PubSubClient's state codes, in words. Negative ones are the transport, positive ones are
+// the broker's own answer to CONNECT.
+const char* mqttStateName(int rc) {
+  switch (rc) {
+    case CEV_RC_WIFI: return "WiFi went down";
+    case -4: return "the broker stopped answering (timed out)";
+    case -3: return "the connection was closed by the broker or the network";
+    case -2: return "could not reach the broker (TCP connect failed)";
+    case -1: return "disconnected";
+    case  0: return "connected";
+    case  1: return "the broker refused the protocol version";
+    case  2: return "the broker rejected the client ID";
+    case  3: return "the broker is unavailable";
+    case  4: return "wrong username or password";
+    case  5: return "not authorised";
+    default: return "unknown";
+  }
+}
+
+// ---- connection history (see mqtt.h) ----
+// RTC memory: kept across any restart that is not a power cut. It is garbage after one, which
+// is what the magic and the range checks in connLogInit() are for.
+#define CONN_LOG_MAGIC 0x434C4731UL   // "CLG1" -- bump when ConnEvent changes shape
+struct ConnLogStore {
+  uint32_t  magic;
+  uint8_t   head;      // next slot to write
+  uint8_t   count;     // rows in use
+  uint8_t   boot;      // boot counter
+  uint8_t   _pad;
+  ConnEvent ev[CONN_LOG_SIZE];
+  ConnEvent lastDrop;  // newest CEV_MQTT_LOST, outside the ring
+};
+RTC_NOINIT_ATTR static ConnLogStore connLog;
+static portMUX_TYPE connLogMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t gMqttConnects = 0, gMqttDrops = 0, gMqttFails = 0;
+volatile unsigned long gMqttSinceMs = 0;
+volatile uint8_t gWifiDropReason = 0;
+
+void connLogInit() {
+  bool ok = (connLog.magic == CONN_LOG_MAGIC && connLog.head < CONN_LOG_SIZE &&
+             connLog.count <= CONN_LOG_SIZE);
+  if (ok) for (int i = 0; i < connLog.count; i++) {
+    const uint8_t k = connLog.ev[i].kind;
+    if (k == 0 || k >= CEV_KIND_MAX) { ok = false; break; }
+  }
+  if (!ok) { memset(&connLog, 0, sizeof(connLog)); connLog.magic = CONN_LOG_MAGIC; }
+  connLog.boot++;
+  // The first disconnect reason after a join is the one that explains the drop; the stack
+  // goes on to report "no AP found" for every failed rejoin after it. Runs on the event
+  // task: one byte, written only while it is zero.
+  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
+    if (!gWifiDropReason) gWifiDropReason = info.wifi_sta_disconnected.reason;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  connLogAdd(CEV_BOOT, (int)esp_reset_reason());
+}
+
+// The clock is not set until NTP answers, which is after the rows that matter most at boot
+// (the restart itself, WiFi coming up) have been filed. Once it is, give this boot's
+// undated rows the time they happened: now, less how long ago by uptime. Under connLogMux.
+static void connLogBackfill(uint32_t nowEpoch, uint32_t nowUp) {
+  if (!nowEpoch) return;
+  for (int i = 0; i < connLog.count; i++) {
+    ConnEvent& r = connLog.ev[i];
+    if (!r.epoch && r.boot == connLog.boot && nowUp >= r.upS && nowEpoch > nowUp - r.upS)
+      r.epoch = nowEpoch - (nowUp - r.upS);
+  }
+}
+
+void connLogAdd(uint8_t kind, int rc, uint32_t arg, uint8_t flags) {
+  ConnEvent e;
+  e.epoch = (uint32_t)rtcEpochNow();                     // 0 until the clock has been set
+  e.upS   = (uint32_t)(millis() / 1000UL);
+  e.arg   = arg;
+  e.n     = 1;
+  e.rc    = (int16_t)rc;
+  e.rssi  = (WiFi.status() == WL_CONNECTED) ? (int8_t)WiFi.RSSI() : 0;
+  e.kind  = kind;
+  e.flags = flags;
+  portENTER_CRITICAL(&connLogMux);
+  e.boot = connLog.boot;
+  connLogBackfill(e.epoch, e.upS);
+  // A broker that is down is retried every 30 s: one row that counts, not 24 that say the
+  // same thing and push the drop that started it out of the ring.
+  ConnEvent* last = connLog.count
+      ? &connLog.ev[(connLog.head + CONN_LOG_SIZE - 1) % CONN_LOG_SIZE] : nullptr;
+  if (kind == CEV_MQTT_FAILED && last && last->kind == kind && last->rc == e.rc &&
+      last->boot == e.boot) {
+    if (last->n < 0xFFFF) last->n++;
+    last->epoch = e.epoch; last->upS = e.upS; last->rssi = e.rssi;
+  } else {
+    connLog.ev[connLog.head] = e;
+    connLog.head = (uint8_t)((connLog.head + 1) % CONN_LOG_SIZE);
+    if (connLog.count < CONN_LOG_SIZE) connLog.count++;
+  }
+  if (kind == CEV_MQTT_LOST) connLog.lastDrop = e;
+  portEXIT_CRITICAL(&connLogMux);
+}
+
+const char* connEventKind(uint8_t kind) {
+  switch (kind) {
+    case CEV_BOOT:        return "boot";
+    case CEV_WIFI_UP:     return "wifi-up";
+    case CEV_WIFI_DOWN:   return "wifi-down";
+    case CEV_MQTT_UP:     return "mqtt-up";
+    case CEV_MQTT_LOST:   return "mqtt-lost";
+    case CEV_MQTT_FAILED: return "mqtt-failed";
+    case CEV_MQTT_CLOSED: return "mqtt-closed";
+    case CEV_SETTINGS:    return "settings";
+    default:              return "?";
+  }
+}
+
+static const char* resetName(int rr) {
+  switch (rr) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_SW:       return "software restart (an update, or a restart asked for)";
+    case ESP_RST_PANIC:    return "crash";
+    case ESP_RST_INT_WDT:  return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_BROWNOUT: return "brownout (supply voltage dipped)";
+    case ESP_RST_EXT:      return "reset pin";
+    case ESP_RST_USB:      return "USB reset";
+    default:               return "restart";
+  }
+}
+
+void connEventWhy(const ConnEvent& e, char* buf, size_t len) {
+  switch (e.kind) {
+    case CEV_BOOT:      strlcpy(buf, resetName(e.rc), len); break;
+    case CEV_WIFI_UP:   snprintf(buf, len, "channel %d", (int)e.rc); break;
+    case CEV_WIFI_DOWN:
+      if (e.rc) snprintf(buf, len, "%s", WiFi.disconnectReasonName((wifi_err_reason_t)e.rc));
+      else      strlcpy(buf, "no reason reported", len);
+      break;
+    case CEV_MQTT_UP:
+      strlcpy(buf, e.flags ? "the session outlived the WiFi outage" : "connected", len); break;
+    case CEV_MQTT_LOST:
+      if (e.rc == CEV_RC_WIFI && e.flags)
+        snprintf(buf, len, "WiFi went down (%s)", WiFi.disconnectReasonName((wifi_err_reason_t)e.flags));
+      else strlcpy(buf, mqttStateName(e.rc), len);
+      break;
+    case CEV_MQTT_FAILED: strlcpy(buf, mqttStateName(e.rc), len); break;
+    case CEV_MQTT_CLOSED:
+      strlcpy(buf, e.rc == CEV_RC_UPDATE ? "closed for a firmware update"
+                                         : "closed to apply saved settings", len);
+      break;
+    case CEV_SETTINGS:
+      snprintf(buf, len, "password %s%s%s%s",
+               (e.flags & CSET_PASS_CHANGED) ? "changed" :
+               (e.flags & CSET_PASS_CLEARED) ? "cleared" :
+               (e.flags & CSET_PASS_KEPT)    ? "kept"    : "unchanged",
+               (e.flags & CSET_HOST)   ? ", broker changed"   : "",
+               (e.flags & CSET_USER)   ? ", username changed" : "",
+               (e.flags & CSET_PREFIX) ? ", prefix changed"   : "");
+      break;
+    default: strlcpy(buf, "?", len); break;
+  }
+}
+
+int connLogCopy(ConnEvent* out, int max, ConnEvent* lastDrop, uint8_t* bootNow) {
+  int n = 0;
+  const uint32_t nowEpoch = (uint32_t)rtcEpochNow();
+  const uint32_t nowUp    = (uint32_t)(millis() / 1000UL);
+  portENTER_CRITICAL(&connLogMux);
+  connLogBackfill(nowEpoch, nowUp);
+  for (int i = 0; i < connLog.count && n < max; i++)
+    out[n++] = connLog.ev[(connLog.head + CONN_LOG_SIZE - 1 - i) % CONN_LOG_SIZE];
+  if (lastDrop) *lastDrop = connLog.lastDrop;
+  if (bootNow)  *bootNow  = connLog.boot;
+  portEXIT_CRITICAL(&connLogMux);
+  return n;
+}
+
 // Called once from setup(). Initialises MQTT settings that allocate heap
 // and must not be called repeatedly.
 void mqttInit() {
@@ -484,19 +658,6 @@ void mqttConnect() {
     }
   } else {
     int st = mqtt.state();
-    const char* why;
-    switch (st) {                       // PubSubClient state codes
-      case -4: why = "timeout";               break;
-      case -3: why = "connection lost";       break;
-      case -2: why = "connect failed (TCP)";  break;
-      case -1: why = "disconnected";          break;
-      case  1: why = "bad protocol";          break;
-      case  2: why = "bad client id";         break;
-      case  3: why = "server unavailable";    break;
-      case  4: why = "bad credentials";       break;
-      case  5: why = "not authorized";        break;
-      default: why = "unknown";               break;
-    }
-    printf("[MQTT] Failed rc=%d (%s)\n", st, why);
+    printf("[MQTT] Failed rc=%d (%s)\n", st, mqttStateName(st));
   }
 }

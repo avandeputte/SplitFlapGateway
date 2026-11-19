@@ -667,3 +667,46 @@ Two rules keep that safe: the waiter accepts a reply only if `gotId` is the id i
 (the restore, which asks by serial, uses `SF_WAIT_ANY` and owns the bus exclusively), and the
 web handlers that use the slot answer 409 while a soak or probe is running.
 
+
+## A password the page cannot show (v4.5)
+
+`GET /api/config` never returns a password, so every password box on the dashboard is empty
+when the page loads. Until 4.5 the save handlers stored whatever the box held. The result for
+MQTT was a fault with a long fuse: "Save MQTT" after changing the prefix (or nothing) stored
+an empty password; the session already running carried on; and the next reconnect — whenever
+the broker or the WiFi next blinked — was refused with rc 4 every 30 s for ever. Seen from
+outside, "it keeps losing the connection and the password field is empty", where the empty
+field was by design and the lost connection would have healed by itself had the password
+still been there.
+
+The rule now, for both `/api/config/mqtt` and `/api/config/wifi`: **a blank password means
+"the one you have"**. It is removed only by something that says so — a blank username (MQTT),
+a different network name (WiFi), or `"clearPass":true`. `/api/mqtt/test` follows the same rule
+for the stored username, because a test that fails on a working configuration is what sends
+people to retype the password in the first place. `/api/config/settings` is different on
+purpose: there a field changes only if it is sent, so an explicit `"mqPass":""` is a clear.
+The page is told *whether* a password is stored (`mqPassSet`, `wifiPassSet`) and says so in
+the box.
+
+### The connection history
+
+The reason for a drop used to go to a serial port nobody had attached. `connLog` (mqtt.cpp)
+is a 24-row ring of what the link did — WiFi up/down, broker session up/lost/failed/closed,
+a restart, and every save of the MQTT settings with the client address and what happened to
+the password — written by `taskNetwork` (the only task that sees those transitions, since it
+alone owns the client) and by the settings handlers on `taskWeb`, under a spinlock.
+
+- It lives in **RTC no-init memory** behind a magic number: it survives any restart that is
+  not a power cut, which matters because a drop followed by a watchdog restart is exactly the
+  case worth reading afterwards.
+- **Repeated connect failures fold into one row** with a count. A broker that is down is
+  retried every 30 s; unfolded, twelve minutes of retries would push the drop that started
+  them out of the ring. The newest `mqtt-lost` is also kept outside the ring.
+- **Rows filed before the clock is set are dated afterwards** (now, less the uptime
+  difference), because the rows at boot — the restart, WiFi coming up — are filed before NTP
+  answers.
+- The WiFi disconnect reason is taken from the stack's event, and only the **first** one after
+  a join: the stack goes on to report "no AP found" for every failed rejoin after it.
+- `mqtt-lost` with rc −10 is the gateway's own code for "WiFi went under it". If the TCP
+  connection then outlives the outage, the next row says the session survived rather than
+  leaving a drop with no reconnect after it.
