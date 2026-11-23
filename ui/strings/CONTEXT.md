@@ -99,6 +99,8 @@ and **Last Seen** are table headings.
 | `Broker connection closed` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
 | `Broker connection lost` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
 | `Broker unreachable` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Broker unreachable and no web request for 5 minutes` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Brownout (the supply voltage dipped)` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Bus Health` | Status tab (diagnostics) | HEADING |
 | `Bus reply-size probe` | — | RUNTIME MESSAGE (shown after an action, in probeSection()) |
 | `Bytes DID arrive while they had the bus and the gateway discarded them (too long, or never terminated), so the reply is being started and not surviving the trip.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
@@ -122,12 +124,14 @@ and **Last Seen** are table headings.
 | `Cancelled. The bus is free again.` | — | RUNTIME MESSAGE (shown after an action, in soakCancel()) |
 | `Cancelled. The bus is still held by:` | — | RUNTIME MESSAGE (shown after an action, in soakCancel()) |
 | `Cancelling...` | — | RUNTIME MESSAGE (shown after an action, in soakCancel()) |
+| `Channel` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Character` | Display tab (send text/characters to the wall) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Character Map` | Calibration tab (tune a module's flap positions) | HEADING (card title -- a noun phrase) |
 | `Character Set` | — | (built at runtime) |
 | `Character Set (order = flap index)` | Modules tab (the module grid) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Character Set (order = flap index, blank = leave unchanged)` | Status tab (diagnostics) | FORM LABEL (names the input below it -- a noun phrase) |
 | `Character set is longer than 64 flaps.` | — | RUNTIME MESSAGE (shown after an action, in saveFlapConfig()) |
+| `Checking that every module reached its blank flap...` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `Checksum Failures` | — | (built at runtime) |
 | `Checksummed frames (module firmware v33 and later): how many were verified, and how many were dropped because the wire had corrupted them. Failures should be zero.` | Status tab (diagnostics) | TOOLTIP |
 | `Checksums OK / Failed` | Status tab (diagnostics) | TEXT |
@@ -138,6 +142,8 @@ and **Last Seen** are table headings.
 | `Clock` | Status tab (diagnostics) | HEADING |
 | `Close` | Status tab (diagnostics) | BUTTON (an action -- use the imperative) |
 | `Closed by the broker or the network` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Closed for a firmware update` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
+| `Closed to apply saved settings` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Columns` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Combined dump (longest)` | — | RUNTIME MESSAGE (shown after an action, in probeLabel()) |
 | `Companion App` | Status tab (diagnostics) | HEADING |
@@ -152,6 +158,7 @@ and **Last Seen** are table headings.
 | `Count Steps` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative); RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Count steps on module` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `Counting...` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
+| `Crash` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Create Backup File` | Settings tab | BUTTON (an action -- use the imperative) |
 | `Current Flap` | — | (built at runtime) |
 | `Current flap set unknown -- click Refresh for a fresh read.` | Status tab (diagnostics) | HELP TEXT (a full sentence) |
@@ -291,6 +298,7 @@ and **Last Seen** are table headings.
 | `Language of this dashboard.` | — | (built at runtime) |
 | `Last Char` | — | (built at runtime) |
 | `Last Seen` | — | (built at runtime) |
+| `Last blanking check:` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `Last drop` | — | RUNTIME MESSAGE (shown after an action, in mqLogLoad()) |
 | `Last flap reached -- click Finish.` | — | RUNTIME MESSAGE (shown after an action, in bmNext()) |
 | `Last restore (` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
@@ -388,6 +396,7 @@ and **Last Seen** are table headings.
 | `Pending` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
 | `Port` | Settings tab | FORM LABEL (names the input below it -- a noun phrase) |
 | `Possible Duplicate ID` | Status tab (diagnostics) | INLINE TEXT |
+| `Power on` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Preserve current module IDs` | — | (built at runtime) |
 | `Prev` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Protects uploads made from the Arduino IDE or the command line. The browser updater above is always available.` | Settings tab | HELP TEXT (a full sentence) |
@@ -422,10 +431,12 @@ and **Last Seen** are table headings.
 | `Reply` | — | RUNTIME MESSAGE (shown after an action, in probeRender()) |
 | `Request failed` | — | RUNTIME MESSAGE (shown after an action, in homeAll()) |
 | `Reset error:` | — | RUNTIME MESSAGE (shown after an action, in calWizReset()) |
+| `Reset pin` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Reset to Default` | Calibration tab (tune a module's flap positions) | BUTTON (an action -- use the imperative) |
 | `Reset to default (` | — | RUNTIME MESSAGE (shown after an action, in calWizReset()) |
 | `Reset to default 2832` | Calibration tab (tune a module's flap positions) | TOOLTIP |
 | `Reset to default 4096` | Calibration tab (tune a module's flap positions) | TOOLTIP |
+| `Restart (an update, or one that was asked for)` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Restore Calibration` | Settings tab | HEADING (card title -- a noun phrase) |
 | `Restore calibration on every boot` | Settings tab | INLINE TEXT |
 | `Restore calibration to every module from the stored backup now? Every other module command is refused until it completes.` | — | RUNTIME MESSAGE (shown after an action, in rbRunNow()) |
@@ -532,7 +543,9 @@ and **Last Seen** are table headings.
 | `The gap between modules when a page is sent as a cascade. The companion uses this as its default. Larger walls need more: about 25 ms is stable for 60 modules.` | Settings tab | HELP TEXT (a full sentence) |
 | `The gateway read every module's calibration before the test started, so it can put the whole wall back. Run the soak again afterwards.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `The name this gateway answers to on your network, so you do not have to remember its IP address. It is also the name the Arduino IDE and` | — | (built at runtime) |
+| `The router stopped answering` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `The saved password was kept.` | — | RUNTIME MESSAGE (shown after an action, in saveMqtt()) |
+| `The session outlived the WiFi outage` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `The shortest reply fails as often as the longest, so frame length is not the problem.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `The stored backup is unusable -- upload a new one.` | — | RUNTIME MESSAGE (shown after an action, in rbFileText()) |
 | `The wizard relies on the measured step count to place each flap. If it is wrong, every flap will be off. Calibrate first if you haven't.` | Calibration tab (tune a module's flap positions) | HELP TEXT (a full sentence) |
@@ -564,6 +577,7 @@ and **Last Seen** are table headings.
 | `US Mountain (UTC-7/-6)` | Settings tab | DROPDOWN OPTION |
 | `US Mountain AZ (UTC-7 no DST)` | Settings tab | DROPDOWN OPTION |
 | `US Pacific (UTC-8/-7)` | Settings tab | DROPDOWN OPTION |
+| `USB reset` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `UTC` | Settings tab | DROPDOWN OPTION |
 | `Unprovisioned` | Status tab (diagnostics) | INLINE TEXT |
 | `Unset in EEPROM -- now uses default (` | — | RUNTIME MESSAGE (shown after an action, in calTuneRevert()) |
@@ -585,12 +599,15 @@ and **Last Seen** are table headings.
 | `Version (shortest)` | — | RUNTIME MESSAGE (shown after an action, in probeLabel()) |
 | `Was` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `Watch the Monitor tab for frames that are not replies to anything the gateway sent.` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `Watchdog restart` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `What to do:` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
+| `When a connect attempt does not reach the broker, the gateway pings the router. If the router answers, the fault is on the broker's side. If the router is silent too, it is the gateway's own WiFi link, and the gateway rejoins WiFi.` | Settings tab | HELP TEXT (a full sentence) |
 | `Whole Wall` | Modules tab (the module grid) | HEADING (card title -- a noun phrase) |
 | `WiFi` | Settings tab | HEADING (card title -- a noun phrase) |
 | `WiFi IP` | Status tab (diagnostics) | TEXT |
 | `WiFi connected` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
 | `WiFi lost` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
+| `WiFi rejoined by the gateway` | — | RUNTIME MESSAGE (shown after an action, in mqKind()) |
 | `WiFi saved - reconnecting...` | — | RUNTIME MESSAGE (shown after an action, in saveWifi()) |
 | `WiFi went down` | — | RUNTIME MESSAGE (shown after an action, in mqWhy()) |
 | `Windows-1252: ASCII plus € and accented letters (é à ü ñ ç …), and the symbol flaps ♥ ↑ ↓ ☺ ← →. Each glyph is one flap, and 'q' is the double-quote flap.` | — | RUNTIME MESSAGE (shown after an action, in flapSetSection()) |
@@ -614,6 +631,7 @@ and **Last Seen** are table headings.
 | `but save failed:` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `cell(s) shown` | — | RUNTIME MESSAGE (shown after an action, in buildWall()) |
 | `color flap` | — | RUNTIME MESSAGE (shown after an action, in calCharName()); RUNTIME MESSAGE (shown after an action, in flapPalette()); RUNTIME MESSAGE (shown after an action, in reelHtml()) |
+| `could not be checked` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `could not start calibration` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
 | `discover.` | — | (built at runtime) |
 | `double-quote flap` | — | RUNTIME MESSAGE (shown after an action, in reelHtml()) |
@@ -639,6 +657,7 @@ and **Last Seen** are table headings.
 | `healthy  ·` | — | (built at runtime) |
 | `home offset was` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `home position` | Calibration tab (tune a module's flap positions) | EMPHASIS |
+| `homed again` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `in a row` | — | RUNTIME MESSAGE (shown after an action, in cell()); RUNTIME MESSAGE (shown after an action, in finding()); RUNTIME MESSAGE (shown after an action, in ids()) |
 | `in one broadcast — including any the list does not know about yet.` | — | (built at runtime) |
 | `in progress...` | — | RUNTIME MESSAGE (shown after an action, in delAction()) |
@@ -656,6 +675,7 @@ and **Last Seen** are table headings.
 | `module(s) left out: another board` | — | RUNTIME MESSAGE (shown after an action, in mfwFmt()) |
 | `module(s),` | — | RUNTIME MESSAGE (shown after an action, in rbFileText()) |
 | `modules into the gateway's flash.` | — | RUNTIME MESSAGE (shown after an action, in cell()) |
+| `modules were blank` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `modules'` | Settings tab | EMPHASIS |
 | `modules,` | — | RUNTIME MESSAGE (shown after an action, in finding()) |
 | `more rotations catch intermittent faults but take longer (5-20)` | — | (built at runtime) |
@@ -664,6 +684,7 @@ and **Last Seen** are table headings.
 | `never answered` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `no response` | — | RUNTIME MESSAGE (shown after an action, in bmCell()) |
 | `no response from module` | — | RUNTIME MESSAGE (shown after an action, in calRefresh()) |
+| `no web request for` | — | RUNTIME MESSAGE (shown after an action, in mqLink()) |
 | `not answering` | — | RUNTIME MESSAGE (shown after an action, in rbStateText()) |
 | `not connected` | — | RUNTIME MESSAGE (shown after an action, in pollStatus()) |
 | `not reported -- module firmware v36 is the first that says, and every board before it is a v4` | — | RUNTIME MESSAGE (shown after an action, in renderInfo()) |
@@ -690,7 +711,11 @@ and **Last Seen** are table headings.
 | `starting in` | — | RUNTIME MESSAGE (shown after an action, in setRestoreUI()) |
 | `step -` | Calibration tab (tune a module's flap positions) | TEXT |
 | `steps/rev. Saving to module...` | — | RUNTIME MESSAGE (shown after an action, in calCountSteps()) |
+| `still not blank` | — | RUNTIME MESSAGE (shown after an action, in g()) |
 | `symbol flap` | — | RUNTIME MESSAGE (shown after an action, in calCharName()); RUNTIME MESSAGE (shown after an action, in reelHtml()) |
+| `the gateway had no IP address` | — | RUNTIME MESSAGE (shown after an action, in mqLink()) |
+| `the router answered` | — | RUNTIME MESSAGE (shown after an action, in mqLink()) |
+| `the router did not answer either` | — | RUNTIME MESSAGE (shown after an action, in mqLink()) |
 | `this gateway` | Settings tab | EMPHASIS |
 | `two modules on this ID` | — | RUNTIME MESSAGE (shown after an action, in ids()) |
 | `uncheck to also reassign IDs from the backup)` | Settings tab | INLINE TEXT |

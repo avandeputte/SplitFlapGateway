@@ -456,7 +456,16 @@ const char* mqttStateName(int rc) {
 // ---- connection history (see mqtt.h) ----
 // RTC memory: kept across any restart that is not a power cut. It is garbage after one, which
 // is what the magic and the range checks in connLogInit() are for.
-#define CONN_LOG_MAGIC 0x434C4731UL   // "CLG1" -- bump when ConnEvent changes shape
+#define CONN_LOG_MAGIC    0x434C4732UL   // "CLG2" -- bump when ConnEvent changes shape
+#define CONN_LOG_MAGIC_V1 0x434C4731UL   // "CLG1" -- 4.5: the same rows without the link evidence
+struct ConnEventV1 {
+  uint32_t epoch, upS, arg; uint16_t n; int16_t rc; int8_t rssi; uint8_t kind, boot, flags;
+};
+struct ConnLogStoreV1 {
+  uint32_t magic; uint8_t head, count, boot, _pad;
+  ConnEventV1 ev[CONN_LOG_SIZE];
+  ConnEventV1 lastDrop;
+};
 struct ConnLogStore {
   uint32_t  magic;
   uint8_t   head;      // next slot to write
@@ -472,7 +481,32 @@ volatile uint32_t gMqttConnects = 0, gMqttDrops = 0, gMqttFails = 0;
 volatile unsigned long gMqttSinceMs = 0;
 volatile uint8_t gWifiDropReason = 0;
 
+static ConnEvent connEventFromV1(const ConnEventV1& o) {
+  ConnEvent e;
+  e.epoch = o.epoch; e.upS = o.upS; e.arg = o.arg; e.n = o.n; e.rc = o.rc; e.rssi = o.rssi;
+  e.kind = o.kind; e.boot = o.boot; e.flags = o.flags;
+  // A 4.5 mqtt-failed row never used its flags; make sure it does not read as "probed".
+  if (e.kind == CEV_MQTT_FAILED) e.flags = 0;
+  e.webIdle = 0xFFFF; e.gwOk = 0; e.gwNo = 0;
+  return e;
+}
+
 void connLogInit() {
+  // An update from 4.5 arrives with the history in the old shape, at the same address (this
+  // is the same variable, and it only grew). Keep it: the rows from before the update are
+  // what the rows after it get compared with. Copied out first -- the new rows are wider, so
+  // converting in place would overwrite old rows not yet read.
+  if (connLog.magic == CONN_LOG_MAGIC_V1) {
+    static ConnLogStoreV1 old;                       // 508 bytes, used once at boot
+    memcpy(&old, &connLog, sizeof(old));
+    memset(&connLog, 0, sizeof(connLog));
+    if (old.head < CONN_LOG_SIZE && old.count <= CONN_LOG_SIZE) {
+      connLog.magic = CONN_LOG_MAGIC;
+      connLog.head = old.head; connLog.count = old.count; connLog.boot = old.boot;
+      for (int i = 0; i < CONN_LOG_SIZE; i++) connLog.ev[i] = connEventFromV1(old.ev[i]);
+      connLog.lastDrop = connEventFromV1(old.lastDrop);
+    }
+  }
   bool ok = (connLog.magic == CONN_LOG_MAGIC && connLog.head < CONN_LOG_SIZE &&
              connLog.count <= CONN_LOG_SIZE);
   if (ok) for (int i = 0; i < connLog.count; i++) {
@@ -502,7 +536,7 @@ static void connLogBackfill(uint32_t nowEpoch, uint32_t nowUp) {
   }
 }
 
-void connLogAdd(uint8_t kind, int rc, uint32_t arg, uint8_t flags) {
+void connLogAdd(uint8_t kind, int rc, uint32_t arg, uint8_t flags, const LinkEvidence* link) {
   ConnEvent e;
   e.epoch = (uint32_t)rtcEpochNow();                     // 0 until the clock has been set
   e.upS   = (uint32_t)(millis() / 1000UL);
@@ -512,6 +546,8 @@ void connLogAdd(uint8_t kind, int rc, uint32_t arg, uint8_t flags) {
   e.rssi  = (WiFi.status() == WL_CONNECTED) ? (int8_t)WiFi.RSSI() : 0;
   e.kind  = kind;
   e.flags = flags;
+  e.webIdle = 0xFFFF; e.gwOk = 0; e.gwNo = 0;
+  if (link) { e.flags |= link->flags; e.webIdle = link->webIdle; e.gwOk = link->gwOk; e.gwNo = link->gwNo; }
   portENTER_CRITICAL(&connLogMux);
   e.boot = connLog.boot;
   connLogBackfill(e.epoch, e.upS);
@@ -523,6 +559,11 @@ void connLogAdd(uint8_t kind, int rc, uint32_t arg, uint8_t flags) {
       last->boot == e.boot) {
     if (last->n < 0xFFFF) last->n++;
     last->epoch = e.epoch; last->upS = e.upS; last->rssi = e.rssi;
+    // The evidence adds up: "the router answered 6 of 7 times" is the row's whole point.
+    last->flags |= e.flags;
+    last->gwOk = (uint8_t)min(255, (int)last->gwOk + e.gwOk);
+    last->gwNo = (uint8_t)min(255, (int)last->gwNo + e.gwNo);
+    if (e.webIdle != 0xFFFF) last->webIdle = e.webIdle;
   } else {
     connLog.ev[connLog.head] = e;
     connLog.head = (uint8_t)((connLog.head + 1) % CONN_LOG_SIZE);
@@ -542,6 +583,7 @@ const char* connEventKind(uint8_t kind) {
     case CEV_MQTT_FAILED: return "mqtt-failed";
     case CEV_MQTT_CLOSED: return "mqtt-closed";
     case CEV_SETTINGS:    return "settings";
+    case CEV_REJOIN:      return "wifi-rejoin";
     default:              return "?";
   }
 }
@@ -590,8 +632,52 @@ void connEventWhy(const ConnEvent& e, char* buf, size_t len) {
                (e.flags & CSET_USER)   ? ", username changed" : "",
                (e.flags & CSET_PREFIX) ? ", prefix changed"   : "");
       break;
+    case CEV_REJOIN:
+      strlcpy(buf, e.rc == CEV_RJ_ROUTER ? "the router stopped answering while WiFi stayed associated"
+                                         : "broker unreachable and no web request for 5 minutes", len);
+      break;
     default: strlcpy(buf, "?", len); break;
   }
+}
+
+// ---- link evidence (see mqtt.h) ----
+// One ICMP echo to the default gateway, a second if the first went unanswered. esp_ping runs
+// the exchange on its own small task and reports through callbacks; the state they write is
+// static because a callback can still be on its way when the caller has stopped waiting.
+#include "ping/ping_sock.h"
+static SemaphoreHandle_t pingDone = NULL;
+static volatile bool     pingGot  = false;
+static volatile uint32_t pingRtt  = 0;
+static void pingOk(esp_ping_handle_t h, void*) {
+  uint32_t ms = 0;
+  esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &ms, sizeof(ms));
+  pingRtt = ms; pingGot = true;
+  esp_ping_stop(h);                       // one answer is the answer: do not send the second
+}
+static void pingEnd(esp_ping_handle_t, void*) { if (pingDone) xSemaphoreGive(pingDone); }
+
+bool linkPingRouter(uint16_t* rttMs) {
+  if (rttMs) *rttMs = 0;
+  const IPAddress gw = WiFi.gatewayIP();
+  if (WiFi.status() != WL_CONNECTED || (uint32_t)gw == 0) return false;
+  if (!pingDone) pingDone = xSemaphoreCreateBinary();
+  if (!pingDone) return false;
+  esp_ping_config_t pc = ESP_PING_DEFAULT_CONFIG();
+  pc.count = 2; pc.interval_ms = 200; pc.timeout_ms = 800; pc.data_size = 32;
+  IP_ADDR4(&pc.target_addr, gw[0], gw[1], gw[2], gw[3]);
+  esp_ping_callbacks_t cb = {};
+  cb.on_ping_success = pingOk;
+  cb.on_ping_end     = pingEnd;
+  esp_ping_handle_t h = NULL;
+  pingGot = false; pingRtt = 0;
+  xSemaphoreTake(pingDone, 0);            // drop a stale signal from a run that overran
+  if (esp_ping_new_session(&pc, &cb, &h) != ESP_OK || !h) return false;
+  esp_ping_start(h);
+  xSemaphoreTake(pingDone, pdMS_TO_TICKS(2500));
+  esp_ping_stop(h);
+  esp_ping_delete_session(h);             // its task frees the session and exits on its next pass
+  if (rttMs) *rttMs = (uint16_t)min((uint32_t)0xFFFF, (uint32_t)pingRtt);
+  return pingGot;
 }
 
 int connLogCopy(ConnEvent* out, int max, ConnEvent* lastDrop, uint8_t* bootNow) {

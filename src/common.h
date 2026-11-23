@@ -132,14 +132,14 @@ static inline uint32_t boardId32() {          // 8 hex digits -- MQTT client id,
 // The companion reads this back as "version" from GET /api/config and stores its
 // settings on the gateway only when that version parses >= 3.1 (a 3.0 gateway
 // omits the field, so it keeps settings local). This firmware clears that floor.
-#define FW_VERSION           "4.5.0"         // gateway firmware version (UI + boot log)
+#define FW_VERSION           "4.6.0"         // gateway firmware version (UI + boot log)
 // What this gateway IS, and which gateway API it speaks. GET /api/capabilities reports both, so
 // a client can tell a real split-flap wall from the Matrix Portal emulation of one without
 // sniffing the firmware version -- they answer the same URLs with the same shape, and the
 // differences that matter (a fixed reel per module vs one shared reel; colours as flaps vs
 // colours as names) are exactly what capabilities describes.
 #define PRODUCT_NAME         "Split-Flap Gateway"
-#define API_VERSION          "3.4.0"
+#define API_VERSION          "3.5.0"
 
 /* ---- Network / service defaults (overridable at runtime via Settings) ---- */
 #define DEFAULT_AP_SSID      "Split-Flap-GW"  // SoftAP SSID when no WiFi configured
@@ -269,6 +269,21 @@ extern char gResetReason[12];   // why the board last rebooted, for /api/status
 #define DUP_ID_REJECT_THRESHOLD 3         // this many within the window -> flag a possible duplicate ID
 
 /* ---- Persisted module-registry file (FFat) ---- */
+
+/* ---- Home check -- v4.6 -------------------------------------------------------
+   Quiet Time blanks the wall with ONE broadcast home, and a broadcast is never answered: a
+   module that missed it (it was mid-move with a full receive ring, or the frame collided)
+   kept its character all night, and nothing noticed -- homes are suppressed while quiet is
+   on, so it could not even be corrected by hand. So the gateway now asks. Once the reels
+   have had time to finish, each module is sent a 'Q' (no motor, ~40 bytes) and the ones that
+   are not on flap 0 are homed again, individually, and asked once more. See sfHomeCheckTick. */
+#define HOMECHK_SETTLE_MS   12000UL   // after the broadcast: a move in flight (<= 1 rev, ~4 s) plus the home itself (<= 1 rev + offset)
+#define HOMECHK_REHOME_MS    8000UL   // after a module's own second home, before asking it again
+#define HOMECHK_GAP_MS        200UL   // between check frames: a 'Q' reply is ~45 ms on the wire after a 30 ms turnaround
+#define HOMECHK_REPLY_MS     1500UL   // no answer in this long: ask again
+#define HOMECHK_MAX_ASKS        3     // then it is counted as silent and left alone -- never homed blind
+#define HOMECHK_MAX_HOMES       2     // a reel that is still not blank after this many is a fault, not a missed frame
+#define HOMECHK_FW_MIN         26     // the module firmware that first answers 'Q'
 
 /* ---- The flap set: what each module can actually show ----
    A module owns its own reel, and since firmware v31 it can be TOLD a different one ('N'), so

@@ -1,5 +1,137 @@
 # Split-Flap Gateway — Release Notes
 
+## v4.6.0 — 2026-11-23
+
+**Two reports, two answers. Quiet Time now checks that the wall really went blank, and homes
+again any module that did not. And when the broker cannot be reached, the gateway now finds
+out whose fault it is — and repairs the one kind it can.**
+
+### Quiet Time: did every flap go blank?
+
+The report was: "when the quiet time schedule blanks the display, from time to time not all
+flaps show blank; with homing everything is correct." Quiet Time has homed the wall since v3.6
+— a real reference run on every module, not a "show blank". But it did so with one broadcast
+frame, and a broadcast is never answered: a module that did not hear it kept its character
+until morning, the gateway never knew, and a home sent to correct it — **Home All** included —
+was suppressed like any other display motion while Quiet Time was on.
+
+#### Added
+
+- **The home check.** About 12 seconds after Quiet Time turns on — long enough for a move in
+  flight and the home itself to finish — the gateway asks each provisioned module where it is
+  (a `Q`, which moves nothing) and homes again, by id, each one that is not on its blank flap.
+  That module is then asked once more.
+  - It runs however Quiet Time was turned on: the schedule, the dashboard switch, REST, MQTT
+    or Home Assistant.
+  - It is one short frame every 200 ms, so a 45-module wall is checked in about 10 seconds.
+  - A module that does not answer is asked three times and then **left alone**: homing it
+    blind would spin a reel that is very likely already blank. A module older than firmware
+    v26 cannot be asked and is skipped.
+  - A reel still off its blank flap after two more homes is reported as a fault — that is a
+    Hall sensor or a jam, not a missed frame.
+  - It stops at once if Quiet Time is turned off, if anything takes a hold on the bus
+    (calibration, a backup, Maintenance mode), or if a firmware update starts.
+- **The result on the dashboard**, under **Settings ▸ Quiet Time Schedule**: e.g. *"Last
+  blanking check: 43 / 45 modules were blank, 2 homed again."* It is also `homeCheck` in
+  `GET /api/quiet`, and on the serial log.
+- **Each module that had to be homed again is filed in the bus incident log** (**Status ▸
+  Recent anomalies**, `GET /api/bus/incidents`) as kind `H`, and as `N` if it is still not blank
+  afterwards — so a module that misses the home night after night shows up by number.
+
+#### Changed
+
+- The check's own `Q` replies are not published as MQTT `diag` events; a `Q` asked for from
+  the dashboard or the API still is.
+
+#### Tested
+
+On a 15-module wall (module firmware v36):
+
+| Case | Result |
+|---|---|
+| Quiet Time on, nothing wrong | 14 confirmed blank in about 6 s of asking; the 15th, a module that answers nothing at all on this wall, counted as silent and not homed |
+| One module moved off its blank flap after the home (a calibration goto) | found, homed again, confirmed blank: `rehomed: 1`, one `H` incident |
+| The same module moved away again after each extra home | two `H` incidents, then `N`: `failed: 1` |
+| Quiet Time turned off 5 s after turning it on | check stopped, nothing sent |
+| Maintenance mode turned on before the check began | check stopped, nothing sent |
+
+Dashboard line checked in English, German and French with no console errors.
+
+Not exercised: a module that genuinely misses the broadcast (it cannot be provoked on demand —
+the test moved a reel instead), modules older than v26, and a wall larger than 15 modules.
+
+### MQTT: whose fault was the drop?
+
+A Connection History sent in from a 4.5 gateway showed the same outage again and again: the
+broker "stopped answering", then seven connect attempts "could not reach the broker", then a
+reconnect — 3 minutes 30 seconds after the drop was noticed, every time, roughly every 6 hours
+40 minutes. No login was ever refused, and WiFi stayed associated throughout at −52 dBm. Two
+causes fit that, and the history could not tell them apart: the broker's machine was away for
+four minutes, or the gateway's own WiFi link was associated and passing nothing.
+
+#### Added
+
+- **Link evidence.** Every connect attempt that does not reach a broker at all now also pings
+  the router, and the row says what came back: *"Broker unreachable – the router answered"* or
+  *"– the router did not answer either"*. Repeats add up, so one row reads "answered 6/7".
+  - The router answered: the gateway's link was fine. Look at the broker's side.
+  - The router was silent too: the fault is between the gateway and its access point.
+  - Also recorded: whether the gateway had an IP address, and how long since a web request
+    last reached it.
+  - In `GET /api/mqtt/log` these are `routerOk`, `routerSilent`, `routerKnown`, `noIp` and
+    `webIdle` on `mqtt-failed` rows.
+- **The gateway rejoins WiFi when the router goes silent.** After two attempts in a row
+  (about 30 seconds) at which the router did not answer while WiFi still claimed to be
+  associated, the gateway leaves the network and joins again, and the history gets a
+  **WiFi rejoined by the gateway** row saying why. It is off the network for a few seconds.
+  - Only if this router has answered a ping before on the same association. Some routers
+    never answer one; for those, silence proves nothing and nothing is done.
+  - Once at once; a second time only after 5 minutes; after that every 30.
+- **The broker is dialled the moment WiFi comes up**, not at the next 30-second mark. After a
+  rejoin that wait was the longest part of the outage; at power-up it was the first 30 seconds.
+
+#### Fixed
+
+- **The Connection History was partly in English on a translated dashboard** — "Last drop",
+  "Broker connect failed ×10", "After 6 h 38 min" — although every one of those had a
+  translation. The dictionary is fetched after the page, and text composed before it arrived
+  stayed as it was built. The history (and the new Quiet Time line) is now drawn again when
+  the dictionary is in.
+- **Reasons the gateway sent as English text are now translated**: the WiFi channel, why the
+  gateway restarted, and why it closed a session itself.
+- **Long reasons were cut off at the right edge** of the history on a wide screen. The event
+  column now wraps.
+
+#### Changed
+
+- **The older rule for rejoining WiFi no longer fires when the router answers.** It rejoined
+  after five failures if no web request had arrived for five minutes; a router that answers
+  is evidence the link is fine, so now it does not.
+- **The history is kept across this update.** Its rows grew by four bytes; the 4.5 history is
+  converted rather than discarded, so the drops from before the update are still there to
+  compare with.
+
+#### Tested
+
+On the wall:
+
+| Case | Result |
+|---|---|
+| Update from the 4.5 history layout | all 24 rows kept, new rows added after them |
+| Broker pointed at a closed port, router answering | `mqtt-failed` ×3 with `routerOk` 3, `routerSilent` 0; no rejoin |
+| The same, with a test build whose "router" was an unused address from 75 s after boot | silent at two attempts 30 s apart, then a `wifi-rejoin` row; WiFi back in 4 s and the broker dialled at once; router marked not known after the rejoin and no second rejoin |
+| Broker settings restored | connected at once |
+| German dashboard with the dictionary delayed 4 s | drawn in English first, redrawn in German when it arrived; French and English also checked, no console errors |
+
+Not exercised: a real access point that stays associated and stops passing traffic (the test
+substituted a silent address for the router), a router that never answers pings, a lost DHCP
+lease, and the 5- and 30-minute limits on repeated rejoins.
+
+### API
+
+- API version **3.5.0**: `homeCheck` in `/api/quiet`, the link fields and the `wifi-rejoin`
+  kind in `/api/mqtt/log`, kinds `H` and `N` in `/api/bus/incidents`.
+
 ## v4.5.0 — 2026-11-19
 
 **Saving the MQTT settings no longer erases the broker password, and the gateway now keeps a

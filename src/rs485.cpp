@@ -15,6 +15,7 @@ static char sfFrameCmd(const uint8_t* data, size_t len, int* outAddr);
 static size_t sfKnownCommandLen(const uint8_t* data, size_t len);
 static uint32_t buildSerialConfig();
 static void sfQuietCapturePending(const uint8_t* data, size_t len);
+static volatile TaskHandle_t quietPass = NULL;   // see rs485SendThroughQuiet
 static void sfTrackFromFrame(const uint8_t* data, size_t len);
 
 // Allocate the monitor ring (PSRAM preferred). Call once from setup() before
@@ -575,7 +576,7 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
   // Quiet Time: swallow normal display-motion frames so the flaps stay still.
   // The request is acknowledged (we return as if sent) and the desired display
   // is remembered for resync; nothing reaches the bus and tracking is unchanged.
-  if (gQuietTime && sfFrameIsDisplayMotion(data, bare)) {
+  if (gQuietTime && quietPass != xTaskGetCurrentTaskHandle() && sfFrameIsDisplayMotion(data, bare)) {
     sfQuietCapturePending(data, bare);
     DBG("[QUIET] suppressed display frame (%u bytes)\n", (unsigned)bare);
     return;
@@ -651,4 +652,13 @@ void rs485Send(const uint8_t* data, size_t len, bool raw) {
 // Send a null-terminated ASCII string on RS485
 void rs485SendStr(const char* s) {
   rs485Send((const uint8_t*)s, strlen(s));
+}
+
+// The one frame allowed to move a reel while Quiet Time is on: the home check's second home
+// for a module that missed the broadcast (modules.cpp). The pass is the CALLING TASK, not a
+// flag, so a display frame another task sends in the same instant is still suppressed.
+void rs485SendThroughQuiet(const char* s) {
+  quietPass = xTaskGetCurrentTaskHandle();
+  rs485SendStr(s);
+  quietPass = NULL;
 }

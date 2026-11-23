@@ -395,6 +395,42 @@ void sfProvision(const char* sn, int newId);
 void sfHomeBySN(const char* sn);
 void sfSendText(int startAddr, const char* text, bool blankUnused);
 void sfSetQuietTime(bool on);
+
+/* The home check (v4.6) -- did every reel actually reach its blank flap?
+ *
+ * Quiet Time blanks the wall with one broadcast home. A broadcast is not answered, so a module
+ * that missed it stayed on its character until morning: nothing asked, and a home sent to
+ * correct it was suppressed like any other display motion. Now, HOMECHK_SETTLE_MS after the
+ * broadcast, the gateway asks each provisioned module where it is ('Q' -- no motor) and homes
+ * again, by id, each one that is not on flap 0, then asks that one once more.
+ *
+ * It is a trickle on taskRS485, one frame per HOMECHK_GAP_MS, never a blocking sweep. A module
+ * that does not answer is asked HOMECHK_MAX_ASKS times and then LEFT ALONE: homing it blind
+ * would spin a reel that is very likely already blank. A module too old to answer 'Q' (before
+ * v26) is not asked at all. A reel still off flap 0 after HOMECHK_MAX_HOMES homes is reported
+ * as a fault -- that is a Hall sensor or a jam, not a missed frame.
+ *
+ * The check stops at once if Quiet Time is turned off (the wall is being restored; a home now
+ * would wipe it), if a firmware update starts, or if anything takes a hold on the bus. */
+enum : uint8_t { HOMECHK_NEVER = 0, HOMECHK_WAITING, HOMECHK_RUNNING, HOMECHK_DONE, HOMECHK_STOPPED };
+struct HomeCheckInfo {
+  volatile uint8_t  state   = HOMECHK_NEVER;
+  volatile uint16_t total   = 0;    // provisioned modules on the wall when the check began
+  volatile uint16_t skipped = 0;    // too old to answer 'Q' -- not asked
+  volatile uint16_t blank   = 0;    // on flap 0 the first time they answered
+  volatile uint16_t rehomed = 0;    // were not, were homed again, and are now
+  volatile uint16_t failed  = 0;    // still not on flap 0 after HOMECHK_MAX_HOMES homes
+  volatile uint16_t silent  = 0;    // never answered
+  volatile unsigned long endMs = 0; // millis() when it finished or stopped
+  volatile uint32_t endEpoch = 0;   // UTC, 0 when the clock was not set
+};
+extern HomeCheckInfo gHomeCheck;
+void sfHomeCheckArm();                         // any task: a broadcast home just went out
+void sfHomeCheckCancel();                      // any task: quiet is over
+void sfHomeCheckTick(unsigned long now);       // taskRS485 only
+bool sfHomeCheckReply(int id, int curIndex);   // taskRS485 only; true if the check asked for it
+// {"state":"done","total":45,"blank":43,"rehomed":2,"failed":0,"silent":0,"skipped":0,"ago":12}
+void sfHomeCheckJson(char* out, size_t outLen);
 void sfParseResponse(const uint8_t* data, size_t len);
 // Start a bus probe on `id`. False if one is already running or the task will not start.
 bool sfProbeStart(int id, int rounds);

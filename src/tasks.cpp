@@ -271,6 +271,10 @@ void taskRS485(void* pv) {
       }
     }
 
+    // The home check: did every reel reach its blank flap when Quiet Time began? One frame
+    // per HOMECHK_GAP_MS, and nothing at all unless a check is armed (see modules.h).
+    sfHomeCheckTick(millis());
+
     // Send any scheduled batch frames now due -- /api/rs485/batch's cascade pacing,
     // moved off taskWeb so the HTTP server never blocks on delay() (see rs485.h).
     rs485PollScheduled(millis());
@@ -402,17 +406,32 @@ void taskNetwork(void* pv) {
     // Connection history (mqtt.h): when the station and the broker session last changed.
     static unsigned long staSinceMs = 0;       // when WiFi last went up or down
     static bool          sessUp     = false;   // a broker session is established
+    // Link evidence (mqtt.h). gwBase: the router has answered a ping on this association, so
+    // its silence later means something. gwSilentRun: failed connects in a row at which it
+    // did not. The rejoin bookkeeping is shared by both reasons to rejoin.
+    static bool          gwBase       = false;
+    static uint8_t       gwSilentRun  = 0;
+    static unsigned long lastRejoinMs = 0;
+    static uint8_t       rejoinsSinceOk = 0;   // rejoins since a broker session last came up
     if (staUp && !staWasUp) {
       connLogAdd(CEV_WIFI_UP, WiFi.channel(), (uint32_t)((millis() - staSinceMs) / 1000UL));
       staSinceMs = millis();
       gWifiDropReason = 0;      // armed for the next drop
       staWasUp = true;
+      // Does this router answer a ping at all? Asked now, while everything works, because
+      // "it is silent" is only evidence later if it is known to speak.
+      gwBase = linkPingRouter();
+      gwSilentRun = 0;
+      // And dial the broker now rather than at the next 30 s mark: after a rejoin the wait
+      // was the longest part of the outage.
+      mqttRetryMs = millis() - 30001UL;
       wifiSetApActive(false);   // station is up -> drop the fallback AP
       if (!ntpSynced) { ntpSynced = rtcNTPSync(); ntpTryMs = millis(); }
       { IPAddress _a = WiFi.localIP();
   printf("[WiFi] Connected IP=%d.%d.%d.%d\n", _a[0],_a[1],_a[2],_a[3]); }
     } else if (!staUp && staWasUp) {
       staWasUp = false;
+      gwBase = false; gwSilentRun = 0;
       staDownSince = millis();
       connLogAdd(CEV_WIFI_DOWN, gWifiDropReason, (uint32_t)((millis() - staSinceMs) / 1000UL));
       printf("[WiFi] Disconnected after %lu s (reason %u)\n",
@@ -497,36 +516,78 @@ void taskNetwork(void* pv) {
         up = mqtt.connected();
         if (!up) {
           gMqttFails++;
-          connLogAdd(CEV_MQTT_FAILED, mqtt.state());
+          const int  st        = mqtt.state();
+          const bool transport = (st == -2 || st == -4);        // connect failed / timed out
+          // A connect that never reached a broker: is it the broker, or is it us? Ask the
+          // router (mqtt.h, "link evidence") and file the answer with the row.
+          LinkEvidence lk;
+          bool rejoinForRouter = false;
+          if (transport) {
+            lk.flags   = CLNK_PROBED;
+            lk.webIdle = (uint16_t)min((uint32_t)0xFFFE, (uint32_t)(perfSinceLastRequestMs() / 1000UL));
+            if ((uint32_t)WiFi.localIP() == 0) lk.flags |= CLNK_NOIP;
+            uint16_t rtt = 0;
+            if (linkPingRouter(&rtt)) {
+              lk.gwOk = 1; gwBase = true; gwSilentRun = 0;
+            } else {
+              lk.gwNo = 1;
+              if (!gwBase) lk.flags |= CLNK_NOBASE;
+              else if (gwSilentRun < 255) gwSilentRun++;
+            }
+            printf("[MQTT] connect failed rc=%d; router %s%s, last web request %u s ago\n", st,
+                   lk.gwOk ? "answered" : "did not answer",
+                   (lk.flags & CLNK_NOBASE) ? " (it never has)" : "", (unsigned)lk.webIdle);
+            // Associated, the router spoke earlier, and now it has been silent at two
+            // attempts running: the link is up in name only. Leaving and joining again is
+            // the cure, and here there is evidence for it, so it need not wait five
+            // failures. Once freely; a second time only after 5 minutes; after that every
+            // 30 -- a rejoin that did not help is not worth repeating at the dashboard's cost.
+            const unsigned long gap = rejoinsSinceOk == 0 ? 0UL :
+                                      rejoinsSinceOk == 1 ? 300000UL : 1800000UL;
+            rejoinForRouter = (gwSilentRun >= 2 && (!lastRejoinMs || millis() - lastRejoinMs > gap));
+          } else {
+            gwSilentRun = 0;
+          }
+          connLogAdd(CEV_MQTT_FAILED, st, 0, 0, transport ? &lk : nullptr);
           mqttFailCount++;
+          bool rejoin = rejoinForRouter;
+          int  rejoinWhy = CEV_RJ_ROUTER;
           // Five consecutive failures USED to mean "the TCP stack is wedged: drop WiFi and
           // rejoin". It usually means nothing of the kind -- the broker is down, Home
           // Assistant is restarting, the password is wrong -- and the cure then took the
           // whole gateway off the network every two and a half minutes for as long as the
           // broker stayed away: the dashboard, the companion and the REST API all paid for
-          // a fault that was not theirs. So the rejoin now needs evidence that it is the
-          // stack: the failure was at the transport (never reached a broker at all), AND
-          // nobody has got a web request through in five minutes either, AND it was not
-          // already tried in the last half hour.
-          if (mqttFailCount >= 5) {
+          // a fault that was not theirs. So without the router's word for it (a router that
+          // never answers pings gives none), the rejoin needs other evidence that it is the
+          // stack: the failure was at the transport, AND nobody has got a web request through
+          // in five minutes either, AND it was not already tried in the last half hour.
+          if (!rejoin && mqttFailCount >= 5) {
             mqttFailCount = 0;
-            const int  st        = mqtt.state();
-            const bool transport = (st == -2 || st == -4);      // connect failed / timed out
-            const bool webIdle   = perfSinceLastRequestMs() > 300000UL;
-            static unsigned long lastRejoinMs = 0;
-            if (transport && webIdle && (!lastRejoinMs || millis() - lastRejoinMs > 1800000UL)) {
-              lastRejoinMs = millis() | 1;
-              printf("[MQTT] broker unreachable and no web traffic for 5 min -- rejoining WiFi\n");
-              WiFi.disconnect(true);
-              delay(500);
-              WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
-              wifiRetryMs = millis();
+            const bool webIdle = perfSinceLastRequestMs() > 300000UL;
+            // The router answering is evidence AGAINST the stack being wedged: do not rejoin.
+            if (transport && webIdle && !lk.gwOk &&
+                (!lastRejoinMs || millis() - lastRejoinMs > 1800000UL)) {
+              rejoin = true; rejoinWhy = CEV_RJ_BLIND;
             } else {
               printf("[MQTT] still failing (rc=%d) -- will keep retrying every 30 s\n", st);
             }
           }
+          if (rejoin) {
+            lastRejoinMs = millis() | 1;
+            if (rejoinsSinceOk < 255) rejoinsSinceOk++;
+            mqttFailCount = 0; gwSilentRun = 0;
+            connLogAdd(CEV_REJOIN, rejoinWhy);
+            printf("[WiFi] rejoining: %s\n", rejoinWhy == CEV_RJ_ROUTER
+                   ? "the router stopped answering while WiFi stayed associated"
+                   : "broker unreachable and no web traffic for 5 min");
+            WiFi.disconnect(true);
+            delay(500);
+            WiFi.begin(cfg.wifiSSID, cfg.wifiPass);
+            wifiRetryMs = millis();
+          }
         } else {
           mqttFailCount = 0;
+          gwSilentRun = 0; rejoinsSinceOk = 0;
           sessUp = true;
           gMqttConnects++;
           connLogAdd(CEV_MQTT_UP, 0, gMqttSinceMs ? (uint32_t)((millis() - gMqttSinceMs) / 1000UL) : 0);

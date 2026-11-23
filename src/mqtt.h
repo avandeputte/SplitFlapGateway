@@ -57,6 +57,7 @@ enum : uint8_t {
   CEV_MQTT_FAILED,   // a connect attempt failed. rc = PubSubClient state. Repeats fold into one row (n)
   CEV_MQTT_CLOSED,   // the gateway closed the session itself. rc = CEV_RC_UPDATE / CEV_RC_SETTINGS
   CEV_SETTINGS,      // MQTT settings were saved. flags = CSET_*, arg = the client's IPv4 address
+  CEV_REJOIN,        // the gateway left WiFi and joined again on purpose. rc = CEV_RJ_*  (v4.6)
   CEV_KIND_MAX
 };
 #define CEV_RC_WIFI      (-10)   // CEV_MQTT_LOST: WiFi went down under it (flags = the WiFi reason)
@@ -68,6 +69,33 @@ enum : uint8_t {
 #define CSET_PASS_CLEARED 0x08   // the stored password was removed
 #define CSET_PASS_KEPT    0x10   // the password field was blank and the stored one was kept
 #define CSET_PREFIX       0x20   // topic prefix changed
+#define CEV_RJ_ROUTER    1       // CEV_REJOIN: associated, but the router stopped answering
+#define CEV_RJ_BLIND     2       // CEV_REJOIN: broker unreachable and no web request for 5 minutes
+
+/* Link evidence (v4.6) -- whose fault was it?
+ *
+ * "Could not reach the broker" has two very different causes, and from a failed TCP connect
+ * alone they look the same: the broker's machine is away, or the gateway's own WiFi link is
+ * associated and passing nothing. So every failed connect that never reached a broker now
+ * asks the one other machine that is certainly on the network -- the router -- with a ping:
+ *
+ *   the router answers       the gateway's link is fine; look at the broker's side
+ *   the router is silent too the fault is between the gateway and its access point
+ *
+ * and the answer is filed with the row. Silence only counts if the router has answered a
+ * ping before on this association (CLNK_NOBASE otherwise): some routers never answer one. */
+#define CLNK_PROBED  0x01   // a probe ran for this row
+#define CLNK_NOIP    0x02   // the gateway had no IP address at the time
+#define CLNK_NOBASE  0x04   // the router has never answered a ping here: its silence proves nothing
+struct LinkEvidence {
+  uint8_t  flags   = 0;     // CLNK_*
+  uint8_t  gwOk    = 0;     // router pings answered
+  uint8_t  gwNo    = 0;     // router pings not answered
+  uint16_t webIdle = 0xFFFF;// seconds since a web request last reached the gateway
+};
+// Ping the router (the default gateway). True if it answered; *rttMs gets the round trip.
+// Blocks the caller: ~0.2 s when it answers, ~1.6 s when it does not. taskNetwork only.
+bool linkPingRouter(uint16_t* rttMs = nullptr);
 
 struct ConnEvent {
   uint32_t epoch;    // wall clock at the (latest) occurrence; 0 if the clock was not set yet
@@ -78,12 +106,17 @@ struct ConnEvent {
   int8_t   rssi;     // dBm when it happened, 0 if not associated
   uint8_t  kind;
   uint8_t  boot;     // which boot it belongs to (a counter, mod 256)
-  uint8_t  flags;
+  uint8_t  flags;    // CSET_* (settings), CLNK_* (mqtt-failed), the WiFi reason (mqtt-lost by WiFi)
+  // v4.6, CEV_MQTT_FAILED only -- see LinkEvidence. Summed over the attempts folded into the row.
+  uint16_t webIdle;  // seconds since the last web request, at the latest attempt; 0xFFFF = n/a
+  uint8_t  gwOk;     // attempts at which the router answered a ping
+  uint8_t  gwNo;     // attempts at which it did not
 };
 #define CONN_LOG_SIZE 24
 
 void connLogInit();                                   // once, from setup(), before the tasks start
-void connLogAdd(uint8_t kind, int rc, uint32_t arg = 0, uint8_t flags = 0);
+void connLogAdd(uint8_t kind, int rc, uint32_t arg = 0, uint8_t flags = 0,
+                const LinkEvidence* link = nullptr);
 // Copies the newest `max` rows, newest first. Returns how many. `lastDrop` (may be NULL) gets
 // the most recent CEV_MQTT_LOST, kept apart so a flood of retries cannot push it out;
 // its kind is 0 if there has been none.

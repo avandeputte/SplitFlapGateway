@@ -74,6 +74,9 @@ void rs485SendChecked(const char* frame);
 extern volatile unsigned long rxCrcOk, rxCrcFail;
 extern volatile bool rxLastChecked;      // was the most recently parsed reply checksummed?
 void rs485SendStr(const char* s);
+// Send a display-motion frame even though Quiet Time is on. For the home check only: it is
+// the gateway finishing the blanking that Quiet Time asked for, not content.
+void rs485SendThroughQuiet(const char* s);
 
 // ---- scheduled (paced) outbound frames ----
 // /api/rs485/batch paces a cascade so modules receive frames staggered (the companion's

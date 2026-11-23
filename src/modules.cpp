@@ -1537,8 +1537,10 @@ void sfSetQuietTime(bool on) {
       xSemaphoreGive(sfMutex);
     }
     sfHome(-1);          // unlocked, and quiet is still off -- so this is not suppressed
+    sfHomeCheckArm();    // a broadcast is never answered: ask, in a moment, who heard it
     printf("[QUIET] on -- wall blanked (home all)\n");
   }
+  if (was && !on) sfHomeCheckCancel();   // BEFORE the flag drops: no late home onto a restored wall
 
   gQuietTime = on;       // only now: the blanking frame above had to get out first
 
@@ -1571,6 +1573,176 @@ void sfSetQuietTime(bool on) {
     if (n) printf("[QUIET] off -- resynced %d module(s) to last requested display\n", n);
   }
   printf("[QUIET] Quiet Time %s\n", on ? "ENABLED" : "disabled");
+}
+
+// ---- The home check (see modules.h) ------------------------------------------------------
+// One slot per module id. Everything in it belongs to taskRS485 -- the tick that sends and
+// the parser that hears the reply are the same task -- so it needs no lock. Other tasks only
+// post a request (arm / cancel) and read the totals.
+enum : uint8_t { HCS_NONE = 0, HCS_ASK, HCS_WAIT, HCS_DONE };
+struct HcSlot {
+  uint32_t ms;       // HCS_ASK: not before this; HCS_WAIT: when it was last asked
+  int8_t   cur;      // the answer: flap index, -1 unknown, -2 released; -99 = none yet
+  uint8_t  st, asks, homes;
+};
+static HcSlot hcSlot[255];
+static bool          hcPending = false, hcActive = false;   // taskRS485 only
+static unsigned long hcStartMs = 0, hcLastTxMs = 0;         // taskRS485 only
+static portMUX_TYPE  hcMux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t       hcReq = 0;                             // 0 none, 1 arm, 2 cancel (under hcMux)
+static unsigned long hcReqMs = 0;
+HomeCheckInfo gHomeCheck;
+
+// The LAST request wins, which is the right answer: on, off, on in quick succession must end
+// armed, and a check must never outlive the Quiet Time that asked for it.
+static void hcPost(uint8_t req) {
+  const unsigned long now = millis();
+  portENTER_CRITICAL(&hcMux);
+  hcReq = req; hcReqMs = now;
+  portEXIT_CRITICAL(&hcMux);
+}
+// The state is shown as "waiting" from this instant, not from the bus task's next pass: the
+// caller that turned Quiet Time on reads it back in the same breath.
+void sfHomeCheckArm()    { hcPost(1); gHomeCheck.state = HOMECHK_WAITING; }
+void sfHomeCheckCancel() { hcPost(2); }
+
+static void hcEnd(uint8_t state, const char* why) {
+  hcPending = hcActive = false;
+  gHomeCheck.endMs    = millis();
+  gHomeCheck.endEpoch = (uint32_t)rtcEpochNow();
+  gHomeCheck.state    = state;
+  if (state == HOMECHK_DONE) {
+    printf("[QUIET] home check: %u module(s), %u blank, %u homed again, %u still not blank, "
+           "%u silent, %u too old to ask\n",
+           (unsigned)gHomeCheck.total, (unsigned)gHomeCheck.blank, (unsigned)gHomeCheck.rehomed,
+           (unsigned)gHomeCheck.failed, (unsigned)gHomeCheck.silent, (unsigned)gHomeCheck.skipped);
+  } else {
+    printf("[QUIET] home check stopped: %s\n", why);
+  }
+}
+
+bool sfHomeCheckReply(int id, int cur) {
+  if (!hcActive || id < 0 || id > 254) return false;
+  HcSlot& s = hcSlot[id];
+  if (s.st == HCS_NONE || !s.asks) return false;      // not one of ours
+  // Only while WAITING. After a second home the slot sits in HCS_ASK until the reel has had
+  // time to finish, and an answer to an EARLIER ask can still be on its way (a module that
+  // was busy answers every queued 'Q' in a row when it is done). Acting on that one would
+  // home the reel a third time for a position it has already left.
+  if (s.st == HCS_WAIT) s.cur = (cur < -2 || cur > 63) ? (int8_t)-1 : (int8_t)cur;
+  return true;
+}
+
+void sfHomeCheckTick(unsigned long now) {
+  uint8_t req; unsigned long reqMs;
+  portENTER_CRITICAL(&hcMux);
+  req = hcReq; reqMs = hcReqMs; hcReq = 0;
+  portEXIT_CRITICAL(&hcMux);
+  if (req == 2) {
+    if (hcPending || hcActive) hcEnd(HOMECHK_STOPPED, "Quiet Time was turned off");
+  } else if (req == 1) {
+    hcPending = true; hcActive = false; hcStartMs = reqMs;
+    gHomeCheck.total = 0; gHomeCheck.skipped = 0; gHomeCheck.blank  = 0;
+    gHomeCheck.rehomed = 0; gHomeCheck.failed = 0; gHomeCheck.silent = 0;
+    gHomeCheck.state = HOMECHK_WAITING;
+  }
+  if (!hcPending && !hcActive) return;
+
+  // Anything that owns the bus, or an image streaming in, outranks this. It is not resumed
+  // afterwards: by then an operator may have moved reels on purpose (calibration moves are
+  // allowed while quiet), and "not on flap 0" would no longer mean "missed the home".
+  if (gOtaInProgress) { hcEnd(HOMECHK_STOPPED, "a firmware update started"); return; }
+  if (busBusy())      { hcEnd(HOMECHK_STOPPED, "the bus was taken for maintenance"); return; }
+  if (!gQuietTime && now - hcStartMs > 2000UL) { hcEnd(HOMECHK_STOPPED, "Quiet Time is off"); return; }
+
+  if (hcPending) {
+    if (now - hcStartMs < HOMECHK_SETTLE_MS) return;
+    if (!sfMutex || xSemaphoreTake(sfMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;   // next pass
+    memset(hcSlot, 0, sizeof(hcSlot));
+    uint16_t total = 0, skipped = 0;
+    for (int i = 0; i < sfModuleCount; i++) {
+      const SFModule& m = sfModules[i];
+      if (!m.provisioned || m.id > 254) continue;
+      total++;
+      const char* v = (m.fwVersion[0] == 'v' || m.fwVersion[0] == 'V') ? m.fwVersion + 1 : m.fwVersion;
+      const int fw = atoi(v);
+      // A version that was never read is not an old one: ask, and let silence be the answer.
+      if (fw > 0 && fw < HOMECHK_FW_MIN) { skipped++; continue; }
+      HcSlot& s = hcSlot[m.id];
+      s.st = HCS_ASK; s.ms = (uint32_t)now; s.cur = -99;
+    }
+    xSemaphoreGive(sfMutex);
+    gHomeCheck.total = total; gHomeCheck.skipped = skipped;
+    hcPending = false; hcActive = true; hcLastTxMs = 0;
+    gHomeCheck.state = HOMECHK_RUNNING;
+  }
+
+  // One frame per gap, whatever it is: an ask, a second ask, or a home.
+  if (hcLastTxMs && now - hcLastTxMs < HOMECHK_GAP_MS) return;
+
+  int  open = 0;
+  char f[16];
+  for (int id = 0; id < 255; id++) {
+    HcSlot& s = hcSlot[id];
+    if (s.st == HCS_WAIT) {
+      if (s.cur != -99) {                                   // it answered
+        if (s.cur == 0) {
+          s.st = HCS_DONE;
+          if (s.homes) gHomeCheck.rehomed = gHomeCheck.rehomed + 1;
+          else         gHomeCheck.blank   = gHomeCheck.blank + 1;
+          continue;
+        }
+        if (s.homes >= HOMECHK_MAX_HOMES) {
+          s.st = HCS_DONE;
+          gHomeCheck.failed = gHomeCheck.failed + 1;
+          incidentLog((uint8_t)id, 'N', 'h', 0);
+          printf("[QUIET] home check: module %d is still not on its blank flap after %d more home(s) "
+                 "(position %d) -- check its Hall sensor\n", id, (int)s.homes, (int)s.cur);
+          continue;
+        }
+        printf("[QUIET] home check: module %d missed the home (position %d) -- homing it again\n",
+               id, (int)s.cur);
+        incidentLog((uint8_t)id, 'H', 'h', 0);
+        snprintf(f, sizeof(f), "m%dh\n", id);
+        rs485SendThroughQuiet(f);
+        s.homes++; s.asks = 0; s.cur = -99;
+        s.st = HCS_ASK; s.ms = (uint32_t)(now + HOMECHK_REHOME_MS);
+        hcLastTxMs = millis();
+        return;
+      }
+      if ((uint32_t)now - s.ms < HOMECHK_REPLY_MS) { open++; continue; }   // still waiting
+      if (s.asks >= HOMECHK_MAX_ASKS) {                                     // it is not going to
+        s.st = HCS_DONE;
+        gHomeCheck.silent = gHomeCheck.silent + 1;
+        continue;
+      }
+      // Ask again, and STAY waiting: a module that was busy answers late, and that answer counts.
+    } else if (s.st == HCS_ASK) {
+      if ((int32_t)((uint32_t)now - s.ms) < 0) { open++; continue; }       // not yet
+    } else {
+      continue;
+    }
+    snprintf(f, sizeof(f), "m%dQ\n", id);
+    sfSendToModule(id, f);                  // checksummed where the module verifies them
+    s.st = HCS_WAIT; s.asks++; s.ms = (uint32_t)millis(); s.cur = -99;
+    hcLastTxMs = millis();
+    return;
+  }
+  if (!open) hcEnd(HOMECHK_DONE, "");
+}
+
+void sfHomeCheckJson(char* out, size_t outLen) {
+  static const char* const kState[] = { "never", "waiting", "running", "done", "stopped" };
+  const uint8_t st = gHomeCheck.state;
+  const bool ended = (st == HOMECHK_DONE || st == HOMECHK_STOPPED);
+  snprintf(out, outLen,
+    "{\"state\":\"%s\",\"total\":%u,\"blank\":%u,\"rehomed\":%u,\"failed\":%u,\"silent\":%u,"
+    "\"skipped\":%u,\"ago\":%lu,\"t\":%lu}",
+    kState[st <= HOMECHK_STOPPED ? st : 0], (unsigned)gHomeCheck.total, (unsigned)gHomeCheck.blank,
+    (unsigned)gHomeCheck.rehomed, (unsigned)gHomeCheck.failed, (unsigned)gHomeCheck.silent,
+    (unsigned)gHomeCheck.skipped,
+    ended ? (unsigned long)((millis() - gHomeCheck.endMs) / 1000UL) : 0UL,
+    ended ? (unsigned long)gHomeCheck.endEpoch : 0UL);
 }
 /* ----------------------------------------------------------
    Parse responses from modules (called from the RS485 receive task)
@@ -2037,16 +2209,22 @@ void sfParseResponse(const uint8_t* data, size_t len) {
     int crcE = (qf[8] && qf[8][0]) ? atoi(qf[8]) : -1;   // v33: checksummed frames it dropped
     DBG("[SF] Module %d diag Q: rc=%d boot=%d vcc=%d ee=%d cur=%d rxOv=%d bcast=%d/%d\n",
         id, rc, boot, vcc, ee, cur, rxOv, bcS, bcL);
-    if (gDiag.q.waitId == (int)id) {
+    const bool asked = (gDiag.q.waitId == (int)id);
+    if (asked) {
       gDiag.q.reset = rc; gDiag.q.boot = boot; gDiag.q.vcc = vcc; gDiag.q.ee = ee; gDiag.q.cur = cur;
       gDiag.q.rxOv = rxOv; gDiag.q.bcSent = bcS; gDiag.q.bcLate = bcL; gDiag.q.crcErr = crcE;
       gDiag.q.ts = millis();
     }
-    char payload[96];
-    snprintf(payload, sizeof(payload),
-      "{\"id\":%d,\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d}",
-      id, rc, boot, vcc, ee, cur);
-    mqttPublishSFEvent("diag", payload);
+    // The home check asks the whole wall in a few seconds. Those answers are its own business:
+    // publishing each as a "diag" event would hand every subscriber 45 of them at bedtime.
+    const bool check = sfHomeCheckReply((int)id, (qf[4] && qf[4][0]) ? cur : -1);
+    if (asked || !check) {
+      char payload[96];
+      snprintf(payload, sizeof(payload),
+        "{\"id\":%d,\"resetCause\":%d,\"bootCount\":%d,\"vcc\":%d,\"eepromOk\":%d,\"curIndex\":%d}",
+        id, rc, boot, vcc, ee, cur);
+      mqttPublishSFEvent("diag", payload);
+    }
   }
   // Mechanical self-test (v26+; v28 appends gate/magnet/per-rev fields):
   // m<id>M:<code>:<min>:<max>:<spread>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,...,<rN>

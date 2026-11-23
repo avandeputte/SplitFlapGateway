@@ -2824,8 +2824,12 @@ static void handleApiQuiet() {
     }
     mqttPublishStateTopics();
   }
-  char out[40];
-  snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s}", gQuietTime ? "true" : "false");
+  // homeCheck: whether every reel reached its blank flap the last time quiet began (modules.h).
+  char chk[176];
+  sfHomeCheckJson(chk, sizeof(chk));
+  char out[232];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s,\"homeCheck\":%s}",
+           gQuietTime ? "true" : "false", chk);
   server.send(200, "application/json", out);
 }
 
@@ -3255,7 +3259,16 @@ static void connEventJson(const ConnEvent& e, uint8_t bootNow, uint32_t nowEpoch
     n += snprintf(out + n, len - n, ",\"ip\":\"%s\",\"password\":\"%s\"", ip.toString().c_str(),
                   (e.flags & CSET_PASS_CHANGED) ? "changed" : (e.flags & CSET_PASS_CLEARED) ? "cleared" :
                   (e.flags & CSET_PASS_KEPT) ? "kept" : "unchanged");
-  } else if (e.kind != CEV_BOOT && e.kind != CEV_MQTT_FAILED) {
+  } else if (e.kind == CEV_MQTT_FAILED) {
+    // Link evidence (mqtt.h): at how many of the folded attempts the router answered a ping,
+    // and how long since a web request last got through. Absent on rows that were not probed.
+    if (e.flags & CLNK_PROBED) {
+      n += snprintf(out + n, len - n, ",\"routerOk\":%u,\"routerSilent\":%u,\"routerKnown\":%s,\"noIp\":%s",
+                    (unsigned)e.gwOk, (unsigned)e.gwNo, (e.flags & CLNK_NOBASE) ? "false" : "true",
+                    (e.flags & CLNK_NOIP) ? "true" : "false");
+      if (e.webIdle != 0xFFFF) n += snprintf(out + n, len - n, ",\"webIdle\":%u", (unsigned)e.webIdle);
+    }
+  } else if (e.kind != CEV_BOOT && e.kind != CEV_REJOIN) {
     // seconds the state that just ended had lasted: the session (lost/closed), the outage
     // (mqtt-up, wifi-up), the association (wifi-down)
     n += snprintf(out + n, len - n, ",\"after\":%lu", (unsigned long)e.arg);

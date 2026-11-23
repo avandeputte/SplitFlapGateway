@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Split-Flap Gateway API
-  version: "3.4.0"
+  version: "3.5.0"
   description: |
     REST API for the ESP32-S3 Split-Flap Gateway firmware. The version above is the
     API version `GET /api/capabilities` reports as `api`; the firmware has its own.
@@ -1376,6 +1376,7 @@ paths:
                 properties:
                   ok: { type: boolean, example: true }
                   on: { type: boolean, example: false }
+                  homeCheck: { $ref: "#/components/schemas/HomeCheck" }
     post:
       tags: [Status]
       summary: Enable or disable quiet time
@@ -1383,6 +1384,14 @@ paths:
         **Enabling blanks the display.** Every reel is homed to its blank flap as quiet
         time is entered -- the same operation as Home All -- so the wall goes empty for
         the duration.
+
+        **The blanking is checked (v4.6).** The home is one broadcast, which no module
+        answers, so about 12 s later the gateway asks each provisioned module where it is
+        and homes again, by id, any that is not on its blank flap. The outcome is
+        `homeCheck` in the reply; a module that had to be homed again is also filed in
+        `/api/bus/incidents` (kind `H`, or `N` if it is still not blank after two more
+        homes). The check stops if quiet time is turned off, if anything takes a hold on
+        the bus, or if a firmware update starts.
 
         While enabled, the gateway still accepts and acknowledges every command, but does
         not transmit normal display-motion frames (show character, show index, home), so
@@ -1415,6 +1424,7 @@ paths:
                 properties:
                   ok: { type: boolean, example: true }
                   on: { type: boolean, example: true }
+                  homeCheck: { $ref: "#/components/schemas/HomeCheck" }
 
   /api/quiet/schedule:
     get:
@@ -1779,7 +1789,7 @@ paths:
                         id:    { type: integer, nullable: true, description: "Module it belongs to; null when it could not be attributed" }
                         kind:
                           type: string
-                          enum: [D, R, L, M, X]
+                          enum: [D, R, L, M, C, F, X, H, N]
                           description: >
                             D a frame was discarded (too long, or never terminated);
                             R a frame arrived complete and would not parse;
@@ -1788,7 +1798,10 @@ paths:
                             C a checksummed frame arrived and its checksum did not match;
                             F a long read failed and a shorter one succeeded in its place
                               -- the module is there, its reply LENGTH is the problem;
-                            X two modules appear to share one id
+                            X two modules appear to share one id;
+                            H (v4.6) a module was not on its blank flap after the Quiet Time
+                              home and was homed again;
+                            N (v4.6) it is still not blank after two more homes
                         cmd:   { type: string, description: "The command in flight (v, Q, d, A, W)" }
                         bytes: { type: integer, description: "Size involved, when known" }
     delete:
@@ -2504,10 +2517,25 @@ paths:
         the keep-alive, -10 WiFi went down under it), `mqtt-failed` (a connect attempt failed:
         rc -2 unreachable, -4 timed out, 4 wrong username or password, 5 not authorised;
         consecutive identical failures fold into one row and `n` counts them), `mqtt-closed`
-        (the gateway closed it itself, for an update or to apply settings) and `settings`
-        (the MQTT settings were saved: from which `ip`, and what it did to the `password`).
+        (the gateway closed it itself, for an update or to apply settings), `settings`
+        (the MQTT settings were saved: from which `ip`, and what it did to the `password`) and
+        `wifi-rejoin` (v4.6: the gateway left WiFi and joined again on purpose; rc 1 the router
+        stopped answering while WiFi stayed associated, rc 2 the broker was unreachable and no
+        web request had arrived for 5 minutes).
 
-        A lost session is retried every 30 s for as long as WiFi is up.
+        **Link evidence (v4.6).** When a connect attempt does not reach a broker at all (rc -2
+        or -4), the gateway pings the router and files the answer with the row: `routerOk` and
+        `routerSilent` count the attempts at which it did and did not answer, and `webIdle` is
+        how long since a web request last reached the gateway. The router answering means the
+        gateway's own link is fine and the fault is on the broker's side; the router silent as
+        well means the fault is between the gateway and its access point. After two attempts
+        in a row with the router silent the gateway rejoins WiFi (once at once, a second time
+        only after 5 minutes, then every 30). `routerKnown: false` marks a router that has
+        never answered a ping on this association -- some do not -- so its silence proves
+        nothing and does not cause a rejoin.
+
+        A lost session is retried every 30 s for as long as WiFi is up, and at once when WiFi
+        comes back.
       responses:
         "200":
           description: The history
@@ -2943,11 +2971,35 @@ components:
             ota:   { type: integer, example: 2400 }
             rtc:   { type: integer, example: 900 }
 
+    HomeCheck:
+      type: object
+      description: >
+        (v4.6) Whether every reel reached its blank flap the last time quiet time was turned
+        on. Kept in memory only: `never` after a restart.
+      properties:
+        state:
+          type: string
+          enum: [never, waiting, running, done, stopped]
+          description: >
+            never: quiet time has not been turned on since the gateway started;
+            waiting: the home went out and the reels are being given time to finish;
+            running: the modules are being asked;
+            done: the counts below are final;
+            stopped: abandoned (quiet time turned off, a bus hold, or a firmware update)
+        total:   { type: integer, description: "Provisioned modules when the check began" }
+        blank:   { type: integer, description: "On the blank flap the first time they answered" }
+        rehomed: { type: integer, description: "Were not, were homed again, and now are" }
+        failed:  { type: integer, description: "Still not on the blank flap after two more homes" }
+        silent:  { type: integer, description: "Never answered; left alone, not homed blind" }
+        skipped: { type: integer, description: "Module firmware older than v26, which cannot be asked" }
+        ago:     { type: integer, description: "Seconds since it finished or stopped (0 while waiting or running)" }
+        t:       { type: integer, description: "UTC epoch when it finished or stopped, 0 if the clock was not set" }
+      example: { state: done, total: 45, blank: 43, rehomed: 2, failed: 0, silent: 0, skipped: 0, ago: 12, t: 1795311362 }
     ConnEvent:
       type: object
       description: One row of the connection history (v4.5)
       properties:
-        kind:     { type: string, enum: [boot, wifi-up, wifi-down, mqtt-up, mqtt-lost, mqtt-failed, mqtt-closed, settings] }
+        kind:     { type: string, enum: [boot, wifi-up, wifi-down, mqtt-up, mqtt-lost, mqtt-failed, mqtt-closed, settings, wifi-rejoin] }
         t:        { type: integer, description: "Unix seconds; 0 if the clock was not set and has not been since" }
         up:       { type: integer, description: "Uptime in seconds when it happened (of the boot it belongs to)" }
         ago:      { type: integer, description: "Seconds ago, or -1 if that cannot be known (an undated row from an earlier boot)" }
@@ -2956,9 +3008,14 @@ components:
         n:        { type: integer, description: "Occurrences folded into this row" }
         rssi:     { type: integer, description: "Signal strength in dBm when it happened; 0 if not associated" }
         why:      { type: string, description: "The reason in English" }
-        after:    { type: integer, description: "Seconds the state that just ended had lasted: the session (mqtt-lost, mqtt-closed), the outage (mqtt-up, wifi-up) or the association (wifi-down). Absent on boot, mqtt-failed and settings" }
+        after:    { type: integer, description: "Seconds the state that just ended had lasted: the session (mqtt-lost, mqtt-closed), the outage (mqtt-up, wifi-up) or the association (wifi-down). Absent on boot, mqtt-failed, settings and wifi-rejoin" }
         ip:       { type: string, description: "settings only: the client that saved them" }
         password: { type: string, enum: [changed, kept, cleared, unchanged], description: "settings only" }
+        routerOk:     { type: integer, description: "v4.6, mqtt-failed with rc -2 or -4 only: attempts at which the router answered a ping" }
+        routerSilent: { type: integer, description: "v4.6: attempts at which it did not" }
+        routerKnown:  { type: boolean, description: "v4.6: false if the router has never answered a ping on this association, so its silence proves nothing" }
+        noIp:         { type: boolean, description: "v4.6: the gateway had no IP address at one of the attempts" }
+        webIdle:      { type: integer, description: "v4.6: seconds since a web request last reached the gateway, at the latest attempt" }
     Config:
       type: object
       properties:

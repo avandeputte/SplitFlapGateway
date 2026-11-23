@@ -710,3 +710,89 @@ alone owns the client) and by the settings handlers on `taskWeb`, under a spinlo
 - `mqtt-lost` with rc −10 is the gateway's own code for "WiFi went under it". If the TCP
   connection then outlives the outage, the next row says the session survived rather than
   leaving a drop with no reconnect after it.
+
+## A broadcast nobody answers: the home check (v4.6)
+
+Quiet Time blanks the wall with `m*h`. That is a real reference run on every module (seek the
+Hall edge, step the offset to flap 0), but it is one unacknowledged frame, and three things
+made a miss permanent:
+
+- a module that is **moving** does not read the bus. Its 128-byte ring fills with the other
+  modules' frames, overflows, and the frame that was cut is discarded — on a wall being
+  updated at the same instant (a clock ticking over on the minute, which is exactly when a
+  schedule fires) that frame can be the home;
+- the gateway **tracked** the home as done for everyone, so nothing downstream disagreed;
+- `rs485Send` **suppresses homes while quiet is on**, so neither the gateway nor an operator
+  pressing Home All could correct it until morning.
+
+So `sfSetQuietTime` arms a check, and `sfHomeCheckTick` (modules.cpp, called from the
+`taskRS485` loop) runs it as a trickle: after `HOMECHK_SETTLE_MS` it snapshots the provisioned
+ids and sends one frame per `HOMECHK_GAP_MS` — a `Q` to a module that has not been asked, a
+second `Q` to one that has not answered, or `m<id>h` to one that answered with anything other
+than `curIndex 0`. The slots (`hcSlot[255]`, 2 KB) belong to `taskRS485` alone: the tick that
+sends and the parser that hears the reply are the same task, so there is no lock. Other tasks
+only post "arm" or "cancel" under a spinlock — the last request wins, so on/off/on ends armed
+and a check never outlives the Quiet Time that asked for it.
+
+Decisions worth keeping:
+
+- **Ask, do not repeat.** Sending the broadcast twice would have been two lines of code, and
+  would have spun every reel that heard the first one through a second full turn, every night.
+- **A silent module is never homed.** No answer is not evidence of a wrong position.
+- **Late answers count, stale ones do not.** A busy module answers every queued `Q` in a row
+  when it is done. A slot keeps waiting through its re-asks, so the late answer is used; but
+  once a second home has gone out the slot ignores replies until the reel has had time to
+  finish, or the answer to an earlier ask would home it a third time for a position it has
+  already left.
+- **The pass through Quiet Time is the calling task, not a flag** (`rs485SendThroughQuiet`),
+  so a display frame another task sends in the same instant is still suppressed.
+- **Any bus hold ends the check, and it is not resumed.** After a hold an operator may have
+  moved reels on purpose — calibration moves are allowed while quiet — and "not on flap 0"
+  would no longer mean "missed the home".
+
+## Whose fault was the drop: link evidence (v4.6)
+
+A field history from 4.5 showed the same outage over and over: `mqtt-lost` rc −4, then exactly
+seven `mqtt-failed` rc −2, then a reconnect 3 min 30 s after the drop was noticed — every
+6 h 40 min or so, with WiFi associated throughout at −52 dBm and no login ever refused. Two
+causes fit, and the history could not tell them apart: the broker's machine was away, or the
+gateway's link was associated and passing nothing. The one time the outage ran long enough
+for the old five-failures-and-no-web-traffic rule to rejoin WiFi, the broker connected on the
+next try — suggestive, not proof.
+
+So a failed connect that never reached a broker (rc −2 / −4) now asks a third party.
+`linkPingRouter()` (mqtt.cpp) sends one ICMP echo to the default gateway through `esp_ping`,
+a second if the first went unanswered, and the result is filed in the row (`gwOk`, `gwNo`,
+`webIdle`, `CLNK_*`); folded rows add up, so a row reads "the router answered 7 of 7".
+
+- **The router answers** → the link is fine; the fault is the broker's side. No rejoin — and
+  the old blind rule no longer fires in that case either, because it now has evidence against.
+- **The router is silent at two attempts running** → rejoin WiFi (`CEV_REJOIN`), then dial
+  the broker the moment the station is back (`mqttRetryMs` is made stale on WiFi up; before,
+  the wait for the next 30 s mark was the longest part of the outage).
+- **Silence only counts from a router known to speak.** `gwBase` is set by a ping at WiFi up
+  and at any later answer; without it the row is marked `CLNK_NOBASE` and nothing is done.
+  Some routers do not answer ICMP, and for those this would otherwise be the old bug again:
+  the whole gateway leaving the network every time the broker went away.
+- **A rejoin that did not help is not repeated freely**: once at once, a second only after
+  5 minutes, then every 30, reset when a broker session comes up.
+
+The probe blocks `taskNetwork` for about 0.2 s when the router answers and 1.6 s when it does
+not, once per failed attempt — next to a 5 s connect timeout that was already there. Its
+callback state is static: `esp_ping` reports from its own task, and a callback can still be
+on its way when the caller has stopped waiting.
+
+`ConnEvent` grew by four bytes for this. The store is the same RTC variable at the same
+address, so `connLogInit()` recognises the 4.5 magic, copies the old store aside and rebuilds
+it in the new shape rather than discarding it: the rows from before the update are what the
+rows after it get compared with.
+
+### The dictionary arrives after the page
+
+The same screenshot was half English on a German dashboard, although every string had a
+translation. The dictionary is fetched after the page loads; anything composed with `t()`
+before it arrives is built in English, and the DOM walk that runs afterwards only rescues text
+nodes that are exactly one key — "Broker connect failed ×10" and "Last drop: …" are not. The
+loader now fires `sf-lang` when the dictionary is in, and the panes built from `t()` render
+again. Reasons the gateway used to send as English text (the channel, why it restarted, why a
+session was closed) are now built in the page from the row's code.
